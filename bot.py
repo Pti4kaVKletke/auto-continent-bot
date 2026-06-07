@@ -102,7 +102,6 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
-    await update.message.reply_text("🤔 Думаю...")
 
     result = await agent.process_message(user_text)
 
