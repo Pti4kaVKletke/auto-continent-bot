@@ -1,55 +1,305 @@
 import os
+import subprocess
 import tempfile
 from pathlib import Path
 from datetime import datetime
 from docx import Document
-from docx.shared import Pt, Cm, RGBColor
+from docx.shared import Pt, Cm
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_TABLE_ALIGNMENT
+import openpyxl
+from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
 
 
 class DocumentBuilder:
     def __init__(self):
-        # Папка с вашими шаблонами (если есть)
         self.templates_dir = Path(os.environ.get("TEMPLATES_DIR", "./templates"))
         self.output_dir = Path(tempfile.gettempdir()) / "tg_agent_docs"
         self.output_dir.mkdir(exist_ok=True)
 
-    async def build_contract(self, data: dict, contract_number: str, date: str) -> str:
-        """Создаём договор. Если есть шаблон — заполняем его, иначе генерируем."""
-        template_path = self.templates_dir / "contract_template.docx"
+    # ─── АГЕНТСКИЙ ДОГОВОР ────────────────────────────────────────────────
 
-        if template_path.exists():
-            return await self._fill_template(template_path, data, contract_number, date, "contract")
-        else:
-            return await self._generate_contract(data, contract_number, date)
+    async def build_contract(self, data: dict, number: str, date: str, commission_pct: float = 1.0) -> str:
+        template = self.templates_dir / "contract_template.docx"
+        if template.exists():
+            return await self._fill_template(template, data, number, date, f"АГ_Договор_{number}")
+        return await self._generate_contract(data, number, date, commission_pct)
 
-    async def build_invoice(self, data: dict, invoice_number: str, date: str) -> str:
-        """Создаём счёт."""
-        template_path = self.templates_dir / "invoice_template.docx"
+    async def _generate_contract(self, data: dict, number: str, date: str, commission_pct: float = 1.0) -> str:
+        doc = Document()
+        self._setup_page(doc)
 
-        if template_path.exists():
-            return await self._fill_template(template_path, data, invoice_number, date, "invoice")
-        else:
-            return await self._generate_invoice(data, invoice_number, date)
+        t = doc.add_paragraph()
+        t.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        r = t.add_run(f"АГЕНТСКИЙ ДОГОВОР № {number}")
+        r.bold = True; r.font.size = Pt(13)
 
-    async def _fill_template(self, template_path: Path, data: dict,
-                              number: str, date: str, doc_type: str) -> str:
-        """Заполняем шаблон .docx — заменяем плейсхолдеры на данные"""
+        s = doc.add_paragraph()
+        s.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        s.add_run("на осуществление платежа в пользу третьего лица")
+
+        doc.add_paragraph(f"г. Бишкек  «{date[:2]}» {self._month_name(date[3:5])} {date[6:]} г.")
+        doc.add_paragraph()
+
+        buyer = data.get("company_name", "____________")
+        doc.add_paragraph(
+            f"ОсОО «Авто Континент», именуемое в дальнейшем «Агент», в лице "
+            f"Генерального директора Колотовкина Ильи Валерьевича, действующего на основании Устава, "
+            f"с одной стороны, и {buyer}, именуемый(ая) в дальнейшем «Принципал», "
+            f"с другой стороны, заключили настоящий Агентский договор о нижеследующем:"
+        )
+
+        sections = [
+            ("1. ПРЕДМЕТ ДОГОВОРА", [
+                "1.1. Агент обязуется за вознаграждение совершить от своего имени, но за счёт "
+                "Принципала действия по передаче денежных средств продавцу транспортного средства.",
+                "1.2. Принципал перечисляет денежные средства Агенту безналичным путём, "
+                "после чего Агент передаёт их Получателю наличными.",
+            ]),
+            ("2. ВОЗНАГРАЖДЕНИЕ АГЕНТА", [
+                f"2.1. Вознаграждение Агента составляет {commission_pct}% от суммы перевода.",
+                "2.2. Вознаграждение уплачивается одновременно с перечислением основной суммы.",
+            ]),
+            ("3. ОТВЕТСТВЕННОСТЬ СТОРОН", [
+                "3.1. Стороны несут ответственность в соответствии с законодательством КР.",
+                "3.2. Агент не несёт ответственности за качество приобретаемого ТС.",
+            ]),
+            ("4. РЕКВИЗИТЫ СТОРОН", [
+                "Агент: ОсОО «Авто Континент», ИНН: 01905202610324, "
+                "г. Бишкек, Октябрьский район, ул. Матросова, д. 58, Неж.Пом. 2",
+                f"Принципал: {buyer}" +
+                (f", ИНН: {data['inn']}" if data.get("inn") else "") +
+                (f", адрес: {data['address']}" if data.get("address") else ""),
+            ]),
+        ]
+
+        for title, items in sections:
+            h = doc.add_paragraph()
+            h.add_run(title).bold = True
+            for item in items:
+                doc.add_paragraph(item)
+
+        doc.add_paragraph()
+        self._add_signature_table(doc)
+
+        path = self.output_dir / f"АГ_Договор_{number}.docx"
+        doc.save(str(path))
+        return str(path)
+
+    # ─── ДКП ТС ───────────────────────────────────────────────────────────
+
+    async def build_dkp(self, data: dict, number: str, date: str) -> str:
+        template = self.templates_dir / "dkp_template.docx"
+        if template.exists():
+            return await self._fill_template(template, data, number, date, f"ДКП_ТС_{number}")
+        return await self._generate_dkp(data, number, date)
+
+    async def _generate_dkp(self, data: dict, number: str, date: str) -> str:
+        doc = Document()
+        self._setup_page(doc)
+
+        t = doc.add_paragraph()
+        t.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        r = t.add_run(f"ДОГОВОР КУПЛИ-ПРОДАЖИ ТРАНСПОРТНОГО СРЕДСТВА № {number}")
+        r.bold = True; r.font.size = Pt(13)
+
+        doc.add_paragraph(f"«{date[:2]}» {self._month_name(date[3:5])} {date[6:]} г.  г. Бишкек")
+        doc.add_paragraph()
+
+        seller = data.get("seller_name", "____________")
+        buyer  = data.get("company_name", "____________")
+        car    = data.get("car_model", "____________")
+        vin    = data.get("car_vin", "____________")
+        year   = data.get("car_year", "____")
+        color  = data.get("car_color", "____________")
+        price  = data.get("car_price", "____________")
+        currency = data.get("currency", "RUB")
+
+        doc.add_paragraph(
+            f"Гражданин(ка) Кыргызской Республики {seller}, именуемый(ая) в дальнейшем «Продавец», "
+            f"с одной стороны, и {buyer}, именуемый(ая) в дальнейшем «Покупатель», "
+            f"с другой стороны, заключили настоящий Договор о нижеследующем:"
+        )
+
+        items = [
+            f"1. Продавец передаёт в собственность Покупателя транспортное средство:\n"
+            f"   Марка, модель: {car};\n"
+            f"   Идентификационный номер (VIN): {vin};\n"
+            f"   Год выпуска: {year};\n"
+            f"   № кузова: {vin};\n"
+            f"   Цвет: {color}.",
+            f"2. Стоимость ТС составляет: {price} {currency}.",
+            f"3. Со слов Продавца ТС никому не продано, не заложено, под арестом не состоит.",
+            f"4. Покупатель производит оплату через платёжного агента — "
+            f"ОсОО «Авто Континент» (ИНН: 01905202610324) — "
+            f"в соответствии с Агентским договором № {number} от «{date}».",
+            f"5. Право собственности переходит к Покупателю с момента подписания Договора.",
+            f"6. Договор составлен в трёх экземплярах.",
+        ]
+        for item in items:
+            doc.add_paragraph(item)
+
+        doc.add_paragraph()
+        self._add_signature_table(doc)
+
+        path = self.output_dir / f"ДКП_ТС_{number}.docx"
+        doc.save(str(path))
+        return str(path)
+
+    # ─── СЧЁТ (XLSX) ──────────────────────────────────────────────────────
+
+    async def build_invoice(self, data: dict, number: str, date: str, commission_pct: float = 1.0) -> str:
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Счёт"
+
+        # Ширина колонок
+        ws.column_dimensions["A"].width = 5
+        ws.column_dimensions["B"].width = 50
+        ws.column_dimensions["C"].width = 10
+        ws.column_dimensions["D"].width = 8
+        ws.column_dimensions["E"].width = 18
+        ws.column_dimensions["F"].width = 18
+
+        bold = Font(bold=True)
+        center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        left = Alignment(horizontal="left", vertical="center", wrap_text=True)
+        thin = Side(style="thin")
+        border = Border(left=thin, right=thin, top=thin, bottom=thin)
+        header_fill = PatternFill("solid", fgColor="D9E1F2")
+
+        # Заголовок
+        ws.merge_cells("A1:F1")
+        ws["A1"] = f"СЧЁТ НА ОПЛАТУ № {number} от {date} г."
+        ws["A1"].font = Font(bold=True, size=13)
+        ws["A1"].alignment = center
+        ws.row_dimensions[1].height = 30
+
+        # Поставщик / покупатель
+        ws.merge_cells("A2:F2")
+        ws["A2"] = "Поставщик: ОсОО «Авто Континент», ИНН: 01905202610324, г. Бишкек, ул. Матросова 58"
+        ws["A2"].alignment = left
+        ws.row_dimensions[2].height = 20
+
+        ws.merge_cells("A3:F3")
+        ws["A3"] = f"Покупатель: {data.get('company_name', '')}"
+        ws["A3"].alignment = left
+        ws.row_dimensions[3].height = 20
+
+        # Шапка таблицы
+        headers = ["№", "Наименование товара (работы, услуги)", "Кол-во", "Ед.", "Цена", "Сумма"]
+        for col, h in enumerate(headers, 1):
+            cell = ws.cell(row=5, column=col, value=h)
+            cell.font = bold
+            cell.alignment = center
+            cell.border = border
+            cell.fill = header_fill
+        ws.row_dimensions[5].height = 30
+
+        # Строка с автомобилем
+        car = f"{data.get('car_model', 'Автомобиль')} {data.get('car_year', '')} VIN: {data.get('car_vin', '')}".strip()
+        price_str = data.get("car_price", "0").replace(" ", "").replace(",", ".")
+        try:
+            price_val = float(price_str)
+        except Exception:
+            price_val = 0
+
+        currency = data.get("currency", "RUB")
+        row_data = ["1", f"Оплата по Агентскому договору № {number} — {car}", "1", "шт.", price_val, price_val]
+        for col, val in enumerate(row_data, 1):
+            cell = ws.cell(row=6, column=col, value=val)
+            cell.border = border
+            cell.alignment = center if col != 2 else left
+        ws.row_dimensions[6].height = 40
+
+        # Комиссия
+        commission = round(price_val * commission_pct / 100, 2)
+        comm_data = ["2", f"Комиссия {commission_pct}% по Агентскому договору № {number}", "1", "шт.", commission, commission]
+        for col, val in enumerate(comm_data, 1):
+            cell = ws.cell(row=7, column=col, value=val)
+            cell.border = border
+            cell.alignment = center if col != 2 else left
+        ws.row_dimensions[7].height = 30
+
+        # Итого
+        total = price_val + commission
+        ws.merge_cells("A9:E9")
+        ws["A9"] = "ИТОГО К ОПЛАТЕ:"
+        ws["A9"].font = bold
+        ws["A9"].alignment = Alignment(horizontal="right")
+        ws["F9"] = total
+        ws["F9"].font = bold
+        ws["F9"].border = border
+
+        ws.merge_cells("A10:F10")
+        ws["A10"] = f"Валюта: {currency}"
+        ws["A10"].alignment = left
+
+        # Подписи
+        ws.merge_cells("A12:C12")
+        ws["A12"] = "Руководитель: Колотовкин Илья Валерьевич"
+        ws.merge_cells("D12:F12")
+        ws["D12"] = "Подпись: ________________"
+
+        path = self.output_dir / f"Счёт_{number}.xlsx"
+        wb.save(str(path))
+        return str(path)
+
+    # ─── КОНВЕРТАЦИЯ В PDF ────────────────────────────────────────────────
+
+    async def convert_to_pdf(self, filepath: str) -> str:
+        """Конвертируем docx/xlsx в PDF через LibreOffice"""
+        try:
+            result = subprocess.run(
+                ["libreoffice", "--headless", "--convert-to", "pdf",
+                 "--outdir", str(self.output_dir), filepath],
+                capture_output=True, timeout=60
+            )
+            pdf_path = str(filepath).rsplit(".", 1)[0] + ".pdf"
+            if Path(pdf_path).exists():
+                return pdf_path
+        except Exception as e:
+            print(f"Ошибка конвертации PDF: {e}")
+        return filepath  # fallback — возвращаем оригинал
+
+    # ─── ВСПОМОГАТЕЛЬНЫЕ ─────────────────────────────────────────────────
+
+    def _setup_page(self, doc):
+        section = doc.sections[0]
+        section.page_width  = Cm(21)
+        section.page_height = Cm(29.7)
+        section.left_margin   = Cm(3)
+        section.right_margin  = Cm(1.5)
+        section.top_margin    = Cm(2)
+        section.bottom_margin = Cm(2)
+
+    def _add_signature_table(self, doc):
+        table = doc.add_table(rows=3, cols=2)
+        table.alignment = WD_TABLE_ALIGNMENT.CENTER
+        table.cell(0, 0).text = "Продавец (Агент):"
+        table.cell(0, 1).text = "Покупатель (Принципал):"
+        table.cell(1, 0).text = "ОсОО «Авто Континент»"
+        table.cell(2, 0).text = "\n_________________ / Колотовкин И.В. /"
+        table.cell(2, 1).text = "\n_________________ /____________/"
+
+    def _month_name(self, month_num: str) -> str:
+        months = {
+            "01": "января", "02": "февраля", "03": "марта",
+            "04": "апреля", "05": "мая", "06": "июня",
+            "07": "июля", "08": "августа", "09": "сентября",
+            "10": "октября", "11": "ноября", "12": "декабря"
+        }
+        return months.get(month_num, month_num)
+
+    async def _fill_template(self, template_path, data, number, date, output_name) -> str:
         doc = Document(str(template_path))
-
-        # Словарь замен — добавьте свои плейсхолдеры из шаблона
         replacements = {
-            "{{НОМЕР}}": number,
-            "{{ДАТА}}": date,
+            "{{НОМЕР}}": number, "{{ДАТА}}": date,
             "{{КОМПАНИЯ}}": data.get("company_name", ""),
             "{{ИНН}}": data.get("inn", ""),
-            "{{КПП}}": data.get("kpp", ""),
             "{{АДРЕС}}": data.get("address", ""),
-            "{{ТЕЛЕФОН}}": data.get("phone", ""),
             "{{БАНК}}": data.get("bank_name", ""),
             "{{РАСЧ_СЧЕТ}}": data.get("bank_account", ""),
-            "{{КОРР_СЧЕТ}}": data.get("correspondent_account", ""),
             "{{БИК}}": data.get("bik", ""),
             "{{МОДЕЛЬ_АВТО}}": data.get("car_model", ""),
             "{{VIN}}": data.get("car_vin", ""),
@@ -57,195 +307,20 @@ class DocumentBuilder:
             "{{ЦВЕТ}}": data.get("car_color", ""),
             "{{ЦЕНА}}": data.get("car_price", ""),
             "{{ВАЛЮТА}}": data.get("currency", "RUB"),
-            "{{КОНТАКТ}}": data.get("contact_person", ""),
         }
-
-        # Заменяем во всех параграфах
-        for paragraph in doc.paragraphs:
-            for placeholder, value in replacements.items():
-                if placeholder in paragraph.text:
-                    for run in paragraph.runs:
-                        if placeholder in run.text:
-                            run.text = run.text.replace(placeholder, value)
-
-        # Заменяем в таблицах
+        for para in doc.paragraphs:
+            for ph, val in replacements.items():
+                if ph in para.text:
+                    for run in para.runs:
+                        run.text = run.text.replace(ph, val)
         for table in doc.tables:
             for row in table.rows:
                 for cell in row.cells:
-                    for paragraph in cell.paragraphs:
-                        for placeholder, value in replacements.items():
-                            if placeholder in paragraph.text:
-                                for run in paragraph.runs:
-                                    if placeholder in run.text:
-                                        run.text = run.text.replace(placeholder, value)
-
-        output_path = self.output_dir / f"{doc_type}_{number}.docx"
-        doc.save(str(output_path))
-        return str(output_path)
-
-    async def _generate_contract(self, data: dict, contract_number: str, date: str) -> str:
-        """Генерируем договор с нуля (если нет шаблона)"""
-        doc = Document()
-
-        # Настройка страницы
-        section = doc.sections[0]
-        section.page_width = Cm(21)
-        section.page_height = Cm(29.7)
-        section.left_margin = Cm(3)
-        section.right_margin = Cm(1.5)
-        section.top_margin = Cm(2)
-        section.bottom_margin = Cm(2)
-
-        # Заголовок
-        title = doc.add_paragraph()
-        title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        run = title.add_run(f"ДОГОВОР КУПЛИ-ПРОДАЖИ АВТОМОБИЛЯ")
-        run.bold = True
-        run.font.size = Pt(14)
-
-        subtitle = doc.add_paragraph()
-        subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        subtitle.add_run(f"№ {contract_number} от {date} г.")
-
-        doc.add_paragraph()
-
-        # Стороны
-        buyer = data.get("company_name", "____________")
-        inn = data.get("inn", "")
-        address = data.get("address", "")
-
-        intro = doc.add_paragraph()
-        intro.add_run("ООО «Авто Континент»").bold = True
-        intro.add_run(f', именуемое в дальнейшем «Продавец», с одной стороны, и ')
-        intro.add_run(f'{buyer}').bold = True
-        if inn:
-            intro.add_run(f', ИНН {inn}')
-        intro.add_run(f', именуемое в дальнейшем «Покупатель», с другой стороны, заключили настоящий договор о следующем:')
-
-        doc.add_paragraph()
-
-        # Секции договора
-        sections_data = [
-            ("1. ПРЕДМЕТ ДОГОВОРА", [
-                f"1.1. Продавец обязуется передать в собственность Покупателя, а Покупатель обязуется принять и оплатить следующий автомобиль:",
-                f"Марка/модель: {data.get('car_model', '_____________')}",
-                f"VIN: {data.get('car_vin', '_____________')}",
-                f"Год выпуска: {data.get('car_year', '_____')}",
-                f"Цвет: {data.get('car_color', '_____________')}",
-            ]),
-            ("2. ЦЕНА И ПОРЯДОК РАСЧЁТОВ", [
-                f"2.1. Цена автомобиля составляет {data.get('car_price', '_____________')} {data.get('currency', 'RUB')}.",
-                "2.2. Оплата производится в течение 3 (трёх) банковских дней с момента подписания договора.",
-                "2.3. Датой оплаты считается дата поступления денежных средств на расчётный счёт Продавца.",
-            ]),
-            ("3. ПЕРЕДАЧА АВТОМОБИЛЯ", [
-                "3.1. Продавец обязуется передать автомобиль Покупателю в течение 5 (пяти) рабочих дней после получения оплаты.",
-                "3.2. Передача автомобиля оформляется актом приёма-передачи.",
-            ]),
-            ("4. ОТВЕТСТВЕННОСТЬ СТОРОН", [
-                "4.1. За неисполнение или ненадлежащее исполнение обязательств по настоящему договору стороны несут ответственность в соответствии с действующим законодательством.",
-            ]),
-            ("5. РЕКВИЗИТЫ СТОРОН", [
-                "Продавец: ООО «Авто Континент»",
-                f"Покупатель: {buyer}" + (f"\nИНН: {inn}" if inn else "") + (f"\nАдрес: {address}" if address else ""),
-                f"Банк Покупателя: {data.get('bank_name', '')}",
-                f"Р/с: {data.get('bank_account', '')}",
-                f"БИК: {data.get('bik', '')}",
-            ]),
-        ]
-
-        for section_title, items in sections_data:
-            h = doc.add_paragraph()
-            h.add_run(section_title).bold = True
-            for item in items:
-                p = doc.add_paragraph(item)
-                p.paragraph_format.space_after = Pt(3)
-
-        doc.add_paragraph()
-
-        # Подписи
-        sig_table = doc.add_table(rows=2, cols=2)
-        sig_table.alignment = WD_TABLE_ALIGNMENT.CENTER
-
-        sig_table.cell(0, 0).text = "Продавец:"
-        sig_table.cell(0, 1).text = "Покупатель:"
-        sig_table.cell(1, 0).text = "\n\n_________________ /____________/"
-        sig_table.cell(1, 1).text = "\n\n_________________ /____________/"
-
-        output_path = self.output_dir / f"contract_{contract_number}.docx"
-        doc.save(str(output_path))
-        return str(output_path)
-
-    async def _generate_invoice(self, data: dict, invoice_number: str, date: str) -> str:
-        """Генерируем счёт с нуля"""
-        doc = Document()
-
-        section = doc.sections[0]
-        section.page_width = Cm(21)
-        section.page_height = Cm(29.7)
-        section.left_margin = Cm(2)
-        section.right_margin = Cm(2)
-        section.top_margin = Cm(2)
-        section.bottom_margin = Cm(2)
-
-        # Заголовок
-        title = doc.add_paragraph()
-        title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        run = title.add_run(f"СЧЁТ НА ОПЛАТУ № {invoice_number}")
-        run.bold = True
-        run.font.size = Pt(14)
-
-        doc.add_paragraph(f"от {date} г.")
-        doc.add_paragraph()
-
-        # Реквизиты
-        doc.add_paragraph(f"Поставщик: ООО «Авто Континент»")
-        doc.add_paragraph(f"Покупатель: {data.get('company_name', '_____________')}")
-        if data.get("inn"):
-            doc.add_paragraph(f"ИНН: {data['inn']}")
-        if data.get("address"):
-            doc.add_paragraph(f"Адрес: {data['address']}")
-        doc.add_paragraph()
-
-        # Таблица товаров
-        table = doc.add_table(rows=2, cols=5)
-        table.style = "Table Grid"
-
-        headers = ["№", "Наименование", "Кол-во", "Цена", "Сумма"]
-        for i, h in enumerate(headers):
-            cell = table.cell(0, i)
-            cell.text = h
-            cell.paragraphs[0].runs[0].bold = True
-
-        # Строка с автомобилем
-        row = table.rows[1]
-        car_name = f"{data.get('car_model', 'Автомобиль')} {data.get('car_year', '')} VIN: {data.get('car_vin', '')}".strip()
-        price = data.get("car_price", "0")
-        currency = data.get("currency", "RUB")
-
-        row.cells[0].text = "1"
-        row.cells[1].text = car_name
-        row.cells[2].text = "1 шт."
-        row.cells[3].text = f"{price} {currency}"
-        row.cells[4].text = f"{price} {currency}"
-
-        doc.add_paragraph()
-        total_p = doc.add_paragraph()
-        total_p.add_run(f"ИТОГО: {price} {currency}").bold = True
-        doc.add_paragraph()
-
-        # Банковские реквизиты
-        if any([data.get("bank_name"), data.get("bank_account"), data.get("bik")]):
-            doc.add_paragraph("Банковские реквизиты для оплаты:").runs[0].bold = True
-            if data.get("bank_name"):
-                doc.add_paragraph(f"Банк: {data['bank_name']}")
-            if data.get("bank_account"):
-                doc.add_paragraph(f"Р/с: {data['bank_account']}")
-            if data.get("bik"):
-                doc.add_paragraph(f"БИК: {data['bik']}")
-            if data.get("correspondent_account"):
-                doc.add_paragraph(f"К/с: {data['correspondent_account']}")
-
-        output_path = self.output_dir / f"invoice_{invoice_number}.docx"
-        doc.save(str(output_path))
-        return str(output_path)
+                    for para in cell.paragraphs:
+                        for ph, val in replacements.items():
+                            if ph in para.text:
+                                for run in para.runs:
+                                    run.text = run.text.replace(ph, val)
+        path = self.output_dir / f"{output_name}.docx"
+        doc.save(str(path))
+        return str(path)

@@ -21,7 +21,7 @@ class DocumentAgent:
 
     def _build_system_prompt(self) -> str:
         """Системный промпт с инструкциями и реквизитами из памяти"""
-        base = """Тебя зовут Александра. Ты автоматизированный агент директора компании ОсОО «Авто Континент» (г. Бишкек, Кыргызстан).
+        base = """Ты автоматизированный агент директора компании ОсОО «Авто Континент» (г. Бишкек, Кыргызстан).
 Компания занимается продажей автомобилей из Китая, выступает платёжным агентом между покупателями из России и местными продавцами.
 
 У тебя есть РЕАЛЬНЫЕ ИНСТРУМЕНТЫ которые ты ОБЯЗАН использовать:
@@ -96,14 +96,15 @@ class DocumentAgent:
         return [
             {
                 "name": "create_contract",
-                "description": "Создать договор купли-продажи автомобиля",
+                "description": "Создать полный пакет документов по сделке (АГ договор, ДКП ТС, Счёт). ВСЕГДА спрашивай размер комиссии в процентах перед вызовом если он не указан.",
                 "input_schema": {
                     "type": "object",
                     "properties": {
-                        "data": {"type": "object", "description": "Данные для заполнения договора"},
-                        "contract_number": {"type": "string", "description": "Номер договора (опционально)"}
+                        "data": {"type": "object", "description": "Данные для заполнения документов"},
+                        "contract_number": {"type": "string", "description": "Номер договора (опционально)"},
+                        "commission_pct": {"type": "number", "description": "Комиссия агента в процентах, например 1.5"}
                     },
-                    "required": ["data"]
+                    "required": ["data", "commission_pct"]
                 }
             },
             {
@@ -163,22 +164,65 @@ class DocumentAgent:
 
     async def _execute_tool(self, tool_name: str, tool_input: dict) -> dict:
         if tool_name == "create_contract":
-            number = tool_input.get("contract_number") or f"АК-{datetime.now().strftime('%d%m%y-%H%M')}"
+            number = tool_input.get("contract_number") or datetime.now().strftime("%d%m%y") + "001"
             date = datetime.now().strftime("%d.%m.%Y")
-            filepath = await self.builder.build_contract(tool_input["data"], number, date)
-            filename = f"Договор_{number}.docx"
-            drive_link = await self.drive.upload_file(filepath, filename, folder="Договоры")
-            return {"file": filepath, "filename": filename, "drive_link": drive_link,
-                    "message": f"Договор {number} создан и сохранён на Drive"}
+            commission_pct = float(tool_input.get("commission_pct", 1.0))
+
+            # Создаём папку сделки
+            deal_folder_id = await self.drive.get_or_create_deal_folder(number)
+
+            results = []
+
+            # 1. Агентский договор docx + pdf
+            ag_path = await self.builder.build_contract(tool_input["data"], number, date, commission_pct)
+            ag_filename_docx = f"АГ_Договор_{number}.docx"
+            ag_filename_pdf  = f"АГ_Договор_{number}.pdf"
+            ag_pdf_path = await self.builder.convert_to_pdf(ag_path)
+
+            await self.drive.upload_file(ag_path,     ag_filename_docx, deal_folder_id)
+            ag_link = await self.drive.upload_file(ag_pdf_path, ag_filename_pdf,  deal_folder_id)
+
+            # 2. ДКП ТС docx + pdf
+            dkp_path = await self.builder.build_dkp(tool_input["data"], number, date)
+            dkp_filename_docx = f"ДКП_ТС_{number}.docx"
+            dkp_filename_pdf  = f"ДКП_ТС_{number}.pdf"
+            dkp_pdf_path = await self.builder.convert_to_pdf(dkp_path)
+
+            await self.drive.upload_file(dkp_path,     dkp_filename_docx, deal_folder_id)
+            await self.drive.upload_file(dkp_pdf_path, dkp_filename_pdf,  deal_folder_id)
+
+            # 3. Счёт xlsx + pdf
+            invoice_path = await self.builder.build_invoice(tool_input["data"], number, date, commission_pct)
+            inv_filename_xlsx = f"Счёт_{number}.xlsx"
+            inv_filename_pdf  = f"Счёт_{number}.pdf"
+            inv_pdf_path = await self.builder.convert_to_pdf(invoice_path)
+
+            await self.drive.upload_file(invoice_path,  inv_filename_xlsx, deal_folder_id)
+            await self.drive.upload_file(inv_pdf_path,  inv_filename_pdf,  deal_folder_id)
+
+            return {
+                "file": ag_path,
+                "filename": ag_filename_docx,
+                "extra_files": [ag_pdf_path, dkp_path, dkp_pdf_path, invoice_path, inv_pdf_path],
+                "extra_names": [ag_filename_pdf, dkp_filename_docx, dkp_filename_pdf,
+                                inv_filename_xlsx, inv_filename_pdf],
+                "drive_link": ag_link,
+                "message": f"Сделка {number} создана — 6 файлов сохранено на Drive"
+            }
 
         elif tool_name == "create_invoice":
-            number = tool_input.get("invoice_number") or f"СЧ-{datetime.now().strftime('%d%m%y-%H%M')}"
+            number = tool_input.get("invoice_number") or datetime.now().strftime("%d%m%y") + "001"
             date = datetime.now().strftime("%d.%m.%Y")
-            filepath = await self.builder.build_invoice(tool_input["data"], number, date)
-            filename = f"Счёт_{number}.docx"
-            drive_link = await self.drive.upload_file(filepath, filename, folder="Счета")
-            return {"file": filepath, "filename": filename, "drive_link": drive_link,
-                    "message": f"Счёт {number} создан и сохранён на Drive"}
+            deal_folder_id = await self.drive.get_or_create_deal_folder(number)
+
+            invoice_path = await self.builder.build_invoice(tool_input["data"], number, date)
+            inv_pdf_path = await self.builder.convert_to_pdf(invoice_path)
+
+            await self.drive.upload_file(invoice_path, f"Счёт_{number}.xlsx", deal_folder_id)
+            link = await self.drive.upload_file(inv_pdf_path, f"Счёт_{number}.pdf", deal_folder_id)
+
+            return {"file": invoice_path, "filename": f"Счёт_{number}.xlsx",
+                    "drive_link": link, "message": f"Счёт {number} создан и сохранён на Drive"}
 
         elif tool_name == "save_company":
             memory.save_company(tool_input["name"], tool_input["data"])
