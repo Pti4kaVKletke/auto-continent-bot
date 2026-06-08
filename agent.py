@@ -247,13 +247,28 @@ class DocumentAgent:
             await self.drive.upload_file(invoice_path, inv_xlsx, deal_folder_id)
             await self.drive.upload_file(inv_pdf_path, inv_pdf, deal_folder_id)
 
+            # Собираем список файлов для отправки в Telegram (только существующие)
+            extra_files = []
+            extra_names = []
+            for fpath, fname in [
+                (ag_pdf_path,   ag_pdf),
+                (dkp_path,      dkp_docx),
+                (dkp_pdf_path,  dkp_pdf),
+                (invoice_path,  inv_xlsx),
+                (inv_pdf_path,  inv_pdf),
+            ]:
+                if Path(fpath).exists() and Path(fpath).stat().st_size > 0:
+                    extra_files.append(fpath)
+                    extra_names.append(fname)
+
+            uploaded = 1 + len(extra_files)  # АГ docx + остальные
             return {
                 "file": ag_path,
                 "filename": ag_docx,
-                "extra_files": [ag_pdf_path, dkp_path, dkp_pdf_path, invoice_path, inv_pdf_path],
-                "extra_names": [ag_pdf, dkp_docx, dkp_pdf, inv_xlsx, inv_pdf],
+                "extra_files": extra_files,
+                "extra_names": extra_names,
                 "drive_link": ag_link,
-                "message": f"Сделка {number} создана — 6 файлов сохранено на Drive"
+                "message": f"Сделка {number} создана — {uploaded} файлов сохранено на Drive"
             }
 
         elif tool_name == "create_invoice":

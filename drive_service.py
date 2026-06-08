@@ -1,8 +1,12 @@
 import os
 import json
+import logging
+from pathlib import Path
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
+
+logger = logging.getLogger(__name__)
 
 MONTHS_RU = {
     "01": "Январь", "02": "Февраль", "03": "Март",
@@ -25,24 +29,15 @@ class GoogleDriveService:
         self.root_folder_id = os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "")
 
     async def get_or_create_deal_folder(self, contract_number: str) -> str:
-        """
-        Создаёт цепочку папок:
-        Авто Континент / Договоры / 2026 / 06-Июнь / 080626001 / 
-        и подпапку Сканы внутри.
-        Возвращает ID папки сделки.
-        """
-        # Парсим дату из номера ДДММГГ + NNN
         day   = contract_number[0:2]
         month = contract_number[2:4]
         year  = "20" + contract_number[4:6]
         month_name = f"{month}-{MONTHS_RU.get(month, month)}"
 
-        contracts_id = await self._get_or_create_folder("Договоры",   self.root_folder_id)
-        year_id      = await self._get_or_create_folder(year,          contracts_id)
-        month_id     = await self._get_or_create_folder(month_name,    year_id)
+        contracts_id = await self._get_or_create_folder("Договоры", self.root_folder_id)
+        year_id      = await self._get_or_create_folder(year, contracts_id)
+        month_id     = await self._get_or_create_folder(month_name, year_id)
         deal_id      = await self._get_or_create_folder(contract_number, month_id)
-
-        # Создаём подпапку Сканы
         await self._get_or_create_folder("Сканы", deal_id)
 
         return deal_id
@@ -50,6 +45,18 @@ class GoogleDriveService:
     async def upload_file(self, filepath: str, filename: str, folder_id: str,
                           mime_type: str = None) -> str:
         """Загружает файл в указанную папку, возвращает ссылку."""
+
+        # Проверяем что файл существует и не пустой
+        path = Path(filepath)
+        if not path.exists():
+            logger.error(f"Файл не существует: {filepath}")
+            return ""
+        if path.stat().st_size == 0:
+            logger.error(f"Файл пустой: {filepath}")
+            return ""
+
+        logger.info(f"Загружаю '{filename}' ({path.stat().st_size} байт) в папку {folder_id}")
+
         try:
             if mime_type is None:
                 ext = filepath.rsplit(".", 1)[-1].lower()
@@ -74,10 +81,11 @@ class GoogleDriveService:
                 body={"type": "anyone", "role": "reader"}
             ).execute()
 
+            logger.info(f"Загружено: {filename} → {file.get('webViewLink', '')}")
             return file.get("webViewLink", "")
 
         except Exception as e:
-            print(f"Ошибка загрузки '{filename}': {e}")
+            logger.error(f"Ошибка загрузки '{filename}': {e}", exc_info=True)
             return ""
 
     async def _get_or_create_folder(self, name: str, parent_id: str) -> str:
@@ -100,8 +108,9 @@ class GoogleDriveService:
                 },
                 fields="id"
             ).execute()
+            logger.info(f"Создана папка: {name}")
             return folder["id"]
 
         except Exception as e:
-            print(f"Ошибка создания папки '{name}': {e}")
+            logger.error(f"Ошибка создания папки '{name}': {e}", exc_info=True)
             return parent_id
