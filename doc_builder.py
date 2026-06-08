@@ -239,7 +239,13 @@ class DocumentBuilder:
 
     # ─── КОНВЕРТАЦИЯ В PDF ────────────────────────────────────────────────
 
-    async def convert_to_pdf(self, filepath: str) -> str:
+    async def convert_to_pdf(self, filepath: str) -> str | None:
+        """
+        Конвертирует файл в PDF через LibreOffice.
+        Возвращает путь к PDF или None если LibreOffice недоступен.
+        FIX: раньше возвращал исходный путь при неудаче — agent.py
+        думал что PDF создан и пытался загрузить docx как PDF.
+        """
         try:
             result = subprocess.run(
                 ["libreoffice", "--headless", "--convert-to", "pdf",
@@ -247,18 +253,20 @@ class DocumentBuilder:
                 capture_output=True, timeout=60
             )
             pdf_path = str(filepath).rsplit(".", 1)[0] + ".pdf"
-            if Path(pdf_path).exists():
+            if Path(pdf_path).exists() and Path(pdf_path).stat().st_size > 0:
                 return pdf_path
+        except FileNotFoundError:
+            logger.warning("LibreOffice не установлен — PDF конвертация недоступна")
         except Exception as e:
-            print(f"Ошибка конвертации PDF: {e}")
-        return filepath
+            logger.error(f"Ошибка конвертации PDF: {e}")
+        return None  # FIX: None вместо исходного пути — вызывающий код должен проверять
 
     # ─── ВСПОМОГАТЕЛЬНЫЕ ─────────────────────────────────────────────────
 
     def _setup_page(self, doc):
         section = doc.sections[0]
-        section.page_width  = Cm(21)
-        section.page_height = Cm(29.7)
+        section.page_width    = Cm(21)
+        section.page_height   = Cm(29.7)
         section.left_margin   = Cm(3)
         section.right_margin  = Cm(1.5)
         section.top_margin    = Cm(2)
@@ -284,6 +292,9 @@ class DocumentBuilder:
 
     async def _fill_template(self, template_path, data, number, date, output_name,
                               commission_pct: float = 1.0) -> str:
+        from lxml import etree
+        from copy import deepcopy
+
         doc = Document(str(template_path))
 
         day   = date[0:2]
@@ -298,8 +309,13 @@ class DocumentBuilder:
             price_fmt = price_str
             price_val = 0
 
-        commission = round(price_val * commission_pct / 100, 2)
-        cash_fmt = f"{price_val:,.0f}".replace(",", " ")
+        # FIX: {{СУММА_НАЛИЧНЫМИ}} должна брать cash_amount (доллары для поручения),
+        # а не car_price (рубли для ДКП). Раньше cash_fmt = f"{price_val:,.0f}" — НЕВЕРНО.
+        cash_amount_raw = str(data.get("cash_amount", ""))
+        try:
+            cash_fmt = f"{float(cash_amount_raw.replace(' ', '')):,.0f}".replace(",", " ")
+        except Exception:
+            cash_fmt = cash_amount_raw
 
         replacements = {
             "{{НОМЕР}}":                    number,
@@ -330,7 +346,8 @@ class DocumentBuilder:
             "{{ПРОДАВЕЦ_ПОЛНЫЕ_ДАННЫЕ}}":   data.get("seller_full_details", data.get("seller_name", "")),
 
             # Идентификационная карта продавца (КР)
-            "{{ПРОДАВЕЦ_ID}}":              data.get("seller_id", ""),
+            # FIX: был data.get("seller_id") — но ключ в data всегда seller_id_number
+            "{{ПРОДАВЕЦ_ID}}":              data.get("seller_id_number", data.get("seller_id", "")),
             "{{ПРОДАВЕЦ_ID_НОМЕР}}":        data.get("seller_id_number", data.get("seller_id", "")),
             "{{ПРОДАВЕЦ_ID_ВЫДАНА}}":       data.get("seller_id_issued_by", ""),
             "{{ПРОДАВЕЦ_ID_ДАТА}}":         data.get("seller_id_issued_date", ""),
@@ -350,8 +367,9 @@ class DocumentBuilder:
             "{{ЦЕНА_ЦИФРАМИ}}":            price_fmt,
             "{{ЦЕНА_ПРОПИСЬЮ}}":           data.get("car_price_words", ""),
             "{{ВАЛЮТА}}":                  data.get("currency", "рублей"),
-            "{{СУММА_НАЛИЧНЫМИ}}":         cash_fmt,
-            "{{СУММА_ПРОПИСЬЮ}}":          data.get("cash_amount_words", data.get("car_price_words", "")),
+            "{{СУММА_НАЛИЧНЫМИ}}":         cash_fmt,                              # FIX: теперь cash_amount
+            # FIX: был {{СУММА_ПРОПИСЬЮ}} — не совпадало с плейсхолдером в шаблоне
+            "{{СУММА_НАЛИЧНЫМИ_ПРОПИСЬЮ}}": data.get("cash_amount_words", ""),
             "{{ВАЛЮТА_НАЛИЧНЫМИ}}":        data.get("cash_currency", data.get("currency", "рублей")),
 
             # Банковские реквизиты
@@ -364,79 +382,82 @@ class DocumentBuilder:
             "{{СЧЕТ_НОМЕР}}":              data.get("account_number", ""),
         }
 
-        def _merge_runs_text(para) -> str:
-            return "".join(run.text for run in para.runs)
+        W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 
-        def _apply_replacements_to_para(para):
-            if not para.runs:
-                return
-            full_text = _merge_runs_text(para)
-            new_text = full_text
-            for ph, val in replacements.items():
-                if ph in new_text:
-                    new_text = new_text.replace(ph, str(val) if val is not None else "")
-            if new_text == full_text:
-                return
-            para.runs[0].text = new_text
-            for run in para.runs[1:]:
-                run.text = ""
+        def replace_in_para(para):
+            """
+            FIX: Заменяем плейсхолдеры через XML напрямую.
 
-        def _process_paragraph_xml(para):
-            """XML-метод — страхует когда Word разбил плейсхолдер между runs."""
-            from lxml import etree
-            from copy import deepcopy
+            Проблема старого кода: _apply_replacements_to_para() запускалась первой
+            и меняла runs[0].text. После этого _process_paragraph_xml() не находила
+            плейсхолдеров (они уже заменены) и ничего не делала — XML-метод был мёртвым.
+            Но если _apply_replacements_to_para() не срабатывала (Word дробил {{НОМЕР}}
+            на несколько runs с разным форматированием), текст вообще не заменялся.
 
-            W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+            Решение: только XML-метод. Он:
+            1. Собирает полный текст из ВСЕХ w:r → w:t элементов
+            2. Выполняет замену
+            3. Удаляет все старые runs
+            4. Вставляет один новый run с нужным текстом НА МЕСТО первого удалённого
+               (не в конец параграфа через SubElement!)
+            """
             p_elem = para._element
             runs = p_elem.findall(f"{{{W}}}r")
             if not runs:
                 return
 
+            # Полный текст параграфа (объединяем все w:t внутри w:r)
             full_text = "".join(
                 t.text or ""
                 for r in runs
                 for t in r.findall(f"{{{W}}}t")
             )
-            has_placeholder = any(ph in full_text for ph in replacements)
-            if not has_placeholder:
+            if not any(ph in full_text for ph in replacements):
                 return
 
+            # Запоминаем форматирование и позицию первого run
             first_rpr = runs[0].find(f"{{{W}}}rPr")
+            children = list(p_elem)
+            insert_idx = children.index(runs[0])
 
+            # Выполняем замену
             new_text = full_text
             for ph, val in replacements.items():
-                if ph in new_text:
-                    new_text = new_text.replace(ph, str(val) if val is not None else "")
+                new_text = new_text.replace(ph, str(val) if val is not None else "")
 
+            # Удаляем все старые runs
             for r in runs:
                 p_elem.remove(r)
 
-            new_run = etree.SubElement(p_elem, f"{{{W}}}r")
+            # Создаём новый run
+            new_run = etree.Element(f"{{{W}}}r")
             if first_rpr is not None:
-                new_run.insert(0, deepcopy(first_rpr))
+                new_run.append(deepcopy(first_rpr))
             new_t = etree.SubElement(new_run, f"{{{W}}}t")
             new_t.text = new_text
-            if new_text.startswith(" ") or new_text.endswith(" "):
+            if new_text and (new_text[0] == " " or new_text[-1] == " "):
                 new_t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
 
-        def process_para(para):
-            _apply_replacements_to_para(para)
-            _process_paragraph_xml(para)
+            # FIX: вставляем на место первого удалённого run, а не в конец (SubElement)
+            p_elem.insert(insert_idx, new_run)
 
+        # Основной текст документа
         for para in doc.paragraphs:
-            process_para(para)
+            replace_in_para(para)
 
+        # Таблицы
         for table in doc.tables:
             for row in table.rows:
                 for cell in row.cells:
                     for para in cell.paragraphs:
-                        process_para(para)
+                        replace_in_para(para)
 
+        # Колонтитулы
         for section in doc.sections:
             for para in section.header.paragraphs:
-                process_para(para)
+                replace_in_para(para)
             for para in section.footer.paragraphs:
-                process_para(para)
+                replace_in_para(para)
 
         path = self.output_dir / f"{output_name}.docx"
         doc.save(str(path))

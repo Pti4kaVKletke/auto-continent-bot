@@ -217,7 +217,6 @@ class DocumentAgent:
 
         messages.append({"role": "user", "content": current_content})
 
-        # Retry при сетевых ошибках
         for attempt in range(3):
             try:
                 response = await self.client.with_options(timeout=120.0).messages.create(
@@ -310,7 +309,6 @@ class DocumentAgent:
                         "drive_link": tool_result.get("drive_link", "")
                     })
 
-                # Дополнительные файлы (ДКП, Счёт, PDF)
                 extra_files = tool_result.get("extra_files", [])
                 extra_names = tool_result.get("extra_names", [])
                 for f_path, f_name in zip(extra_files, extra_names):
@@ -328,73 +326,110 @@ class DocumentAgent:
 
     async def _execute_tool(self, tool_name: str, tool_input: dict) -> dict:
         if tool_name == "create_contract":
-            number = tool_input.get("contract_number") or datetime.now().strftime("%d%m%y") + "001"
+            # Номер ДДММГГ+NNN: берём из Drive следующий свободный порядковый номер за сегодня
+            number = tool_input.get("contract_number") or await self.drive.get_next_contract_number()
             logger.info("=== DATA KEYS: " + str(list(tool_input.get("data", {}).keys())))
-            logger.info("=== BANK FIELDS: corr1=" + repr(tool_input.get("data", {}).get("bank_corr_line1")) + " pol1=" + repr(tool_input.get("data", {}).get("bank_ben_line1")))
+            logger.info("=== BANK FIELDS: corr1=" + repr(tool_input.get("data", {}).get("bank_corr_line1"))
+                        + " pol1=" + repr(tool_input.get("data", {}).get("bank_ben_line1")))
             date = datetime.now().strftime("%d.%m.%Y")
             commission_pct = float(tool_input.get("commission_pct", 1.0))
 
             deal_folder_id = await self.drive.get_or_create_deal_folder(number)
 
-            # 1. Агентский договор
-            ag_path = await self.builder.build_contract(tool_input["data"], number, date, commission_pct)
-            ag_docx = f"АГ_Договор_{number}.docx"
-            ag_pdf  = f"АГ_Договор_{number}.pdf"
-            ag_pdf_path = await self.builder.convert_to_pdf(ag_path)
-            await self.drive.upload_file(ag_path, ag_docx, deal_folder_id)
-            ag_link = await self.drive.upload_file(ag_pdf_path, ag_pdf, deal_folder_id)
+            # ── 1. Агентский договор ──────────────────────────────────────
+            ag_path  = await self.builder.build_contract(tool_input["data"], number, date, commission_pct)
+            ag_docx  = f"АГ_Договор_{number}.docx"
+            ag_pdf   = f"АГ_Договор_{number}.pdf"
 
-            # 2. ДКП ТС
+            await self.drive.upload_file(ag_path, ag_docx, deal_folder_id)
+
+            # FIX: convert_to_pdf теперь возвращает None если LibreOffice недоступен
+            ag_pdf_path = await self.builder.convert_to_pdf(ag_path)
+            if ag_pdf_path:
+                await self.drive.upload_file(ag_pdf_path, ag_pdf, deal_folder_id)
+                ag_link = await self.drive.upload_file(ag_pdf_path, ag_pdf, deal_folder_id)
+            else:
+                ag_link = ""
+
+            # ── 2. ДКП ТС ────────────────────────────────────────────────
             dkp_path = await self.builder.build_dkp(tool_input["data"], number, date)
             dkp_docx = f"ДКП_ТС_{number}.docx"
             dkp_pdf  = f"ДКП_ТС_{number}.pdf"
-            dkp_pdf_path = await self.builder.convert_to_pdf(dkp_path)
-            await self.drive.upload_file(dkp_path, dkp_docx, deal_folder_id)
-            await self.drive.upload_file(dkp_pdf_path, dkp_pdf, deal_folder_id)
 
-            # 3. Счёт
+            await self.drive.upload_file(dkp_path, dkp_docx, deal_folder_id)
+
+            dkp_pdf_path = await self.builder.convert_to_pdf(dkp_path)
+            if dkp_pdf_path:
+                await self.drive.upload_file(dkp_pdf_path, dkp_pdf, deal_folder_id)
+
+            # ── 3. Счёт ──────────────────────────────────────────────────
             invoice_path = await self.builder.build_invoice(tool_input["data"], number, date, commission_pct)
             inv_xlsx = f"Счёт_{number}.xlsx"
             inv_pdf  = f"Счёт_{number}.pdf"
-            inv_pdf_path = await self.builder.convert_to_pdf(invoice_path)
-            await self.drive.upload_file(invoice_path, inv_xlsx, deal_folder_id)
-            await self.drive.upload_file(inv_pdf_path, inv_pdf, deal_folder_id)
 
-            # Собираем список файлов для отправки в Telegram (только существующие)
+            await self.drive.upload_file(invoice_path, inv_xlsx, deal_folder_id)
+
+            inv_pdf_path = await self.builder.convert_to_pdf(invoice_path)
+            if inv_pdf_path:
+                await self.drive.upload_file(inv_pdf_path, inv_pdf, deal_folder_id)
+
+            # ── Собираем файлы для Telegram ───────────────────────────────
+            # FIX: раньше при неудаче convert_to_pdf возвращал исходный путь,
+            # и ag_docx отправлялся дважды (как docx и как "pdf").
+            # Теперь None означает "PDF нет" — добавляем только реальные файлы.
             extra_files = []
             extra_names = []
-            for fpath, fname in [
-                (ag_pdf_path,   ag_pdf),
-                (dkp_path,      dkp_docx),
-                (dkp_pdf_path,  dkp_pdf),
-                (invoice_path,  inv_xlsx),
-                (inv_pdf_path,  inv_pdf),
-            ]:
-                if Path(fpath).exists() and Path(fpath).stat().st_size > 0:
-                    extra_files.append(fpath)
-                    extra_names.append(fname)
 
-            uploaded = 1 + len(extra_files)  # АГ docx + остальные
+            # PDF агентского договора (если создан)
+            if ag_pdf_path and Path(ag_pdf_path).exists():
+                extra_files.append(ag_pdf_path)
+                extra_names.append(ag_pdf)
+
+            # ДКП docx — всегда есть
+            if Path(dkp_path).exists():
+                extra_files.append(dkp_path)
+                extra_names.append(dkp_docx)
+
+            # PDF ДКП (если создан)
+            if dkp_pdf_path and Path(dkp_pdf_path).exists():
+                extra_files.append(dkp_pdf_path)
+                extra_names.append(dkp_pdf)
+
+            # Счёт xlsx — всегда есть
+            if Path(invoice_path).exists():
+                extra_files.append(invoice_path)
+                extra_names.append(inv_xlsx)
+
+            # PDF счёта (если создан)
+            if inv_pdf_path and Path(inv_pdf_path).exists():
+                extra_files.append(inv_pdf_path)
+                extra_names.append(inv_pdf)
+
+            total_files = 1 + len(extra_files)  # ag_docx + остальные
+            pdf_note = "" if ag_pdf_path else " (PDF недоступен — LibreOffice не установлен)"
             return {
                 "file": ag_path,
                 "filename": ag_docx,
                 "extra_files": extra_files,
                 "extra_names": extra_names,
                 "drive_link": ag_link,
-                "message": f"Сделка {number} создана — {uploaded} файлов сохранено на Drive"
+                "message": f"Сделка {number}: {total_files} файлов отправлено{pdf_note}"
             }
 
         elif tool_name == "create_invoice":
-            number = tool_input.get("invoice_number") or datetime.now().strftime("%d%m%y") + "001"
+            number = tool_input.get("invoice_number") or await self.drive.get_next_contract_number()
             date = datetime.now().strftime("%d.%m.%Y")
             deal_folder_id = await self.drive.get_or_create_deal_folder(number)
             invoice_path = await self.builder.build_invoice(tool_input["data"], number, date)
+            inv_xlsx = f"Счёт_{number}.xlsx"
+            await self.drive.upload_file(invoice_path, inv_xlsx, deal_folder_id)
             inv_pdf_path = await self.builder.convert_to_pdf(invoice_path)
-            await self.drive.upload_file(invoice_path, f"Счёт_{number}.xlsx", deal_folder_id)
-            link = await self.drive.upload_file(inv_pdf_path, f"Счёт_{number}.pdf", deal_folder_id)
+            link = ""
+            if inv_pdf_path:
+                link = await self.drive.upload_file(inv_pdf_path, f"Счёт_{number}.pdf", deal_folder_id)
             return {
                 "file": invoice_path,
-                "filename": f"Счёт_{number}.xlsx",
+                "filename": inv_xlsx,
                 "drive_link": link,
                 "message": f"Счёт {number} создан и сохранён на Drive"
             }
