@@ -5,7 +5,9 @@ import re
 import tempfile
 from pathlib import Path
 from datetime import datetime
+import logging
 import anthropic
+logger = logging.getLogger(__name__)
 import memory
 from drive_service import GoogleDriveService
 from doc_builder import DocumentBuilder
@@ -277,6 +279,9 @@ class DocumentAgent:
     async def _execute_tool(self, tool_name: str, tool_input: dict) -> dict:
         if tool_name == "create_contract":
             number = tool_input.get("contract_number") or datetime.now().strftime("%d%m%y") + "001"
+            import json as _json
+            logger.info("=== DATA KEYS: " + str(list(tool_input.get("data", {}).keys())))
+            logger.info("=== BANK FIELDS: corr1=" + repr(tool_input.get("data", {}).get("bank_corr_line1")) + " pol1=" + repr(tool_input.get("data", {}).get("bank_ben_line1")))
             date = datetime.now().strftime("%d.%m.%Y")
             commission_pct = float(tool_input.get("commission_pct", 1.0))
 
