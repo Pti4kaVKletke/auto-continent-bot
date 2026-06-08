@@ -42,7 +42,7 @@ class DocumentBuilder:
         doc.add_paragraph(f"г. Бишкек  «{date[:2]}» {self._month_name(date[3:5])} {date[6:]} г.")
         doc.add_paragraph()
 
-        buyer = data.get("company_name", "____________")
+        buyer = data.get("buyer_name", data.get("company_name", "____________"))
         doc.add_paragraph(
             f"ОсОО «Авто Континент», именуемое в дальнейшем «Агент», в лице "
             f"Генерального директора Колотовкина Ильи Валерьевича, действующего на основании Устава, "
@@ -68,9 +68,7 @@ class DocumentBuilder:
             ("4. РЕКВИЗИТЫ СТОРОН", [
                 "Агент: ОсОО «Авто Континент», ИНН: 01905202610324, "
                 "г. Бишкек, Октябрьский район, ул. Матросова, д. 58, Неж.Пом. 2",
-                f"Принципал: {buyer}" +
-                (f", ИНН: {data['inn']}" if data.get("inn") else "") +
-                (f", адрес: {data['address']}" if data.get("address") else ""),
+                f"Принципал: {buyer}",
             ]),
         ]
 
@@ -107,13 +105,13 @@ class DocumentBuilder:
         doc.add_paragraph(f"«{date[:2]}» {self._month_name(date[3:5])} {date[6:]} г.  г. Бишкек")
         doc.add_paragraph()
 
-        seller = data.get("seller_name", "____________")
-        buyer  = data.get("company_name", "____________")
-        car    = data.get("car_model", "____________")
-        vin    = data.get("car_vin", "____________")
-        year   = data.get("car_year", "____")
-        color  = data.get("car_color", "____________")
-        price  = data.get("car_price", "____________")
+        seller   = data.get("seller_name", "____________")
+        buyer    = data.get("buyer_name", data.get("company_name", "____________"))
+        car      = data.get("car_model", "____________")
+        vin      = data.get("car_vin", "____________")
+        year     = data.get("car_year", "____")
+        color    = data.get("car_color", "____________")
+        price    = data.get("car_price", "____________")
         currency = data.get("currency", "RUB")
 
         doc.add_paragraph(
@@ -179,8 +177,9 @@ class DocumentBuilder:
         ws["A2"].alignment = left
         ws.row_dimensions[2].height = 20
 
+        buyer = data.get("buyer_name", data.get("company_name", ""))
         ws.merge_cells("A3:F3")
-        ws["A3"] = f"Покупатель: {data.get('company_name', '')}"
+        ws["A3"] = f"Покупатель: {buyer}"
         ws["A3"].alignment = left
         ws.row_dimensions[3].height = 20
 
@@ -287,12 +286,10 @@ class DocumentBuilder:
                               commission_pct: float = 1.0) -> str:
         doc = Document(str(template_path))
 
-        # Разбираем дату ДД.ММ.ГГГГ
         day   = date[0:2]
         month = date[3:5]
         year  = date[6:10]
 
-        # Цена
         price_str = data.get("car_price", "0").replace(" ", "").replace(",", ".")
         try:
             price_val = float(price_str)
@@ -302,8 +299,7 @@ class DocumentBuilder:
             price_val = 0
 
         commission = round(price_val * commission_pct / 100, 2)
-        cash_amount = price_val
-        cash_fmt = f"{cash_amount:,.0f}".replace(",", " ")
+        cash_fmt = f"{price_val:,.0f}".replace(",", " ")
 
         replacements = {
             "{{НОМЕР}}":                    number,
@@ -314,18 +310,30 @@ class DocumentBuilder:
 
             # Покупатель (гражданин РФ)
             "{{ПОКУПАТЕЛЬ_ФИО}}":           data.get("buyer_name", ""),
+            "{{ПОКУПАТЕЛЬ_ДАТА_РОЖДЕНИЯ}}": data.get("buyer_birth_date", ""),
+            "{{ПОКУПАТЕЛЬ_АДРЕС}}":         data.get("buyer_address", ""),
+            "{{ПОКУПАТЕЛЬ_ИНИЦИАЛЫ}}":      data.get("buyer_initials", ""),
+            "{{ПОКУПАТЕЛЬ_ПОЛНЫЕ_ДАННЫЕ}}": data.get("buyer_full_details", data.get("buyer_name", "")),
+
+            # Паспорт покупателя (РФ)
             "{{ПАСПОРТ_СЕРИЯ}}":            data.get("passport_series", ""),
             "{{ПАСПОРТ_НОМЕР}}":            data.get("passport_number", ""),
             "{{ПАСПОРТ_ВЫДАН}}":            data.get("passport_issued_by", ""),
             "{{ПАСПОРТ_КОД}}":              data.get("passport_code", ""),
-            "{{ПОКУПАТЕЛЬ_ПОЛНЫЕ_ДАННЫЕ}}": data.get("buyer_full_details", data.get("buyer_name", "")),
-            "{{ПОКУПАТЕЛЬ_ИНИЦИАЛЫ}}":      data.get("buyer_initials", ""),
+            "{{ПАСПОРТ_ДАТА_ВЫДАЧИ}}":      data.get("passport_issued_date", ""),
 
             # Продавец (гражданин КР)
             "{{ПРОДАВЕЦ_ФИО}}":             data.get("seller_name", ""),
-            "{{ПРОДАВЕЦ_ID}}":              data.get("seller_id", ""),
-            "{{ПРОДАВЕЦ_ПОЛНЫЕ_ДАННЫЕ}}":   data.get("seller_full_details", data.get("seller_name", "")),
+            "{{ПРОДАВЕЦ_ДАТА_РОЖДЕНИЯ}}":   data.get("seller_birth_date", ""),
+            "{{ПРОДАВЕЦ_АДРЕС}}":           data.get("seller_address", ""),
             "{{ПРОДАВЕЦ_ИНИЦИАЛЫ}}":        data.get("seller_initials", ""),
+            "{{ПРОДАВЕЦ_ПОЛНЫЕ_ДАННЫЕ}}":   data.get("seller_full_details", data.get("seller_name", "")),
+
+            # Идентификационная карта продавца (КР)
+            "{{ПРОДАВЕЦ_ID}}":              data.get("seller_id", ""),
+            "{{ПРОДАВЕЦ_ID_НОМЕР}}":        data.get("seller_id_number", data.get("seller_id", "")),
+            "{{ПРОДАВЕЦ_ID_ВЫДАНА}}":       data.get("seller_id_issued_by", ""),
+            "{{ПРОДАВЕЦ_ID_ДАТА}}":         data.get("seller_id_issued_date", ""),
 
             # Авто
             "{{МАРКА_МОДЕЛЬ}}":             data.get("car_model", ""),
@@ -374,7 +382,7 @@ class DocumentBuilder:
                 run.text = ""
 
         def _process_paragraph_xml(para):
-            """XML-метод для случаев когда Word разбил плейсхолдер между runs."""
+            """XML-метод — страхует когда Word разбил плейсхолдер между runs."""
             from lxml import etree
             from copy import deepcopy
 
@@ -415,18 +423,15 @@ class DocumentBuilder:
             _apply_replacements_to_para(para)
             _process_paragraph_xml(para)
 
-        # Параграфы документа
         for para in doc.paragraphs:
             process_para(para)
 
-        # Таблицы
         for table in doc.tables:
             for row in table.rows:
                 for cell in row.cells:
                     for para in cell.paragraphs:
                         process_para(para)
 
-        # Колонтитулы
         for section in doc.sections:
             for para in section.header.paragraphs:
                 process_para(para)

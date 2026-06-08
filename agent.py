@@ -16,11 +16,10 @@ class DocumentAgent:
         self.client = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
         self.drive = GoogleDriveService()
         self.builder = DocumentBuilder()
-        self.model = "claude-opus-4-5"
+        self.model = "claude-haiku-4-5-20251001"
         memory.init_db()
 
     def _build_system_prompt(self) -> str:
-        """Системный промпт с инструкциями и реквизитами из памяти"""
         base = """Ты автоматизированный агент директора компании ОсОО «Авто Континент» (г. Бишкек, Кыргызстан).
 Компания занимается продажей автомобилей из Китая, выступает платёжным агентом между покупателями из России и местными продавцами.
 
@@ -34,14 +33,12 @@ class DocumentAgent:
 
 Отвечай на русском языке. Будь краток и по делу."""
 
-        # Добавляем активные инструкции
         instructions = memory.get_instructions()
         if instructions:
             base += "\n\nТВОИ ПОСТОЯННЫЕ ИНСТРУКЦИИ (всегда выполняй):\n"
             for i in instructions:
                 base += f"- {i['text']}\n"
 
-        # Добавляем сохранённые реквизиты
         companies = memory.list_companies()
         if companies:
             base += "\n\nСОХРАНЁННЫЕ РЕКВИЗИТЫ КОМПАНИЙ:\n"
@@ -55,19 +52,14 @@ class DocumentAgent:
         return base
 
     async def process_message(self, user_text: str, filepath: str = None, filename: str = None) -> dict:
-        """Основной метод — обрабатываем любое сообщение"""
-
-        # Сохраняем в историю
         memory.add_to_history("user", user_text if not filepath else f"[файл: {filename}] {user_text}")
 
-        # Формируем сообщения для Claude
         history = memory.get_history(limit=15)
         messages = []
 
-        for h in history[:-1]:  # всё кроме последнего (текущего)
+        for h in history[:-1]:
             messages.append({"role": h["role"], "content": h["content"]})
 
-        # Текущее сообщение — возможно с файлом
         if filepath:
             current_content = await self._build_file_message(filepath, filename, user_text)
         else:
@@ -75,7 +67,6 @@ class DocumentAgent:
 
         messages.append({"role": "user", "content": current_content})
 
-        # Вызываем Claude с инструментами
         response = await self.client.messages.create(
             model=self.model,
             max_tokens=2000,
@@ -84,12 +75,8 @@ class DocumentAgent:
             messages=messages
         )
 
-        # Обрабатываем ответ
         result = await self._handle_response(response)
-
-        # Сохраняем ответ в историю
         memory.add_to_history("assistant", result.get("text", ""))
-
         return result
 
     def _get_tools(self) -> list:
@@ -154,10 +141,26 @@ class DocumentAgent:
             elif block.type == "tool_use":
                 tool_result = await self._execute_tool(block.name, block.input)
 
+                # Основной файл
                 if tool_result.get("file"):
-                    result["files"].append(tool_result)
-                    result["text"] += f"\n✅ {tool_result.get('message', '')}"
-                elif tool_result.get("message"):
+                    result["files"].append({
+                        "file": tool_result["file"],
+                        "filename": tool_result["filename"],
+                        "drive_link": tool_result.get("drive_link", "")
+                    })
+
+                # Дополнительные файлы (ДКП, Счёт, PDF версии)
+                extra_files = tool_result.get("extra_files", [])
+                extra_names = tool_result.get("extra_names", [])
+                for f_path, f_name in zip(extra_files, extra_names):
+                    if Path(f_path).exists():
+                        result["files"].append({
+                            "file": f_path,
+                            "filename": f_name,
+                            "drive_link": ""
+                        })
+
+                if tool_result.get("message"):
                     result["text"] += f"\n✅ {tool_result['message']}"
 
         return result
@@ -168,44 +171,40 @@ class DocumentAgent:
             date = datetime.now().strftime("%d.%m.%Y")
             commission_pct = float(tool_input.get("commission_pct", 1.0))
 
-            # Создаём папку сделки
             deal_folder_id = await self.drive.get_or_create_deal_folder(number)
 
-            results = []
-
-            # 1. Агентский договор docx + pdf
+            # 1. Агентский договор
             ag_path = await self.builder.build_contract(tool_input["data"], number, date, commission_pct)
-            ag_filename_docx = f"АГ_Договор_{number}.docx"
-            ag_filename_pdf  = f"АГ_Договор_{number}.pdf"
+            ag_docx = f"АГ_Договор_{number}.docx"
+            ag_pdf  = f"АГ_Договор_{number}.pdf"
             ag_pdf_path = await self.builder.convert_to_pdf(ag_path)
 
-            await self.drive.upload_file(ag_path,     ag_filename_docx, deal_folder_id)
-            ag_link = await self.drive.upload_file(ag_pdf_path, ag_filename_pdf,  deal_folder_id)
+            await self.drive.upload_file(ag_path,     ag_docx, deal_folder_id)
+            ag_link = await self.drive.upload_file(ag_pdf_path, ag_pdf, deal_folder_id)
 
-            # 2. ДКП ТС docx + pdf
+            # 2. ДКП ТС
             dkp_path = await self.builder.build_dkp(tool_input["data"], number, date)
-            dkp_filename_docx = f"ДКП_ТС_{number}.docx"
-            dkp_filename_pdf  = f"ДКП_ТС_{number}.pdf"
+            dkp_docx = f"ДКП_ТС_{number}.docx"
+            dkp_pdf  = f"ДКП_ТС_{number}.pdf"
             dkp_pdf_path = await self.builder.convert_to_pdf(dkp_path)
 
-            await self.drive.upload_file(dkp_path,     dkp_filename_docx, deal_folder_id)
-            await self.drive.upload_file(dkp_pdf_path, dkp_filename_pdf,  deal_folder_id)
+            await self.drive.upload_file(dkp_path,     dkp_docx, deal_folder_id)
+            await self.drive.upload_file(dkp_pdf_path, dkp_pdf,  deal_folder_id)
 
-            # 3. Счёт xlsx + pdf
+            # 3. Счёт
             invoice_path = await self.builder.build_invoice(tool_input["data"], number, date, commission_pct)
-            inv_filename_xlsx = f"Счёт_{number}.xlsx"
-            inv_filename_pdf  = f"Счёт_{number}.pdf"
+            inv_xlsx = f"Счёт_{number}.xlsx"
+            inv_pdf  = f"Счёт_{number}.pdf"
             inv_pdf_path = await self.builder.convert_to_pdf(invoice_path)
 
-            await self.drive.upload_file(invoice_path,  inv_filename_xlsx, deal_folder_id)
-            await self.drive.upload_file(inv_pdf_path,  inv_filename_pdf,  deal_folder_id)
+            await self.drive.upload_file(invoice_path,  inv_xlsx, deal_folder_id)
+            await self.drive.upload_file(inv_pdf_path,  inv_pdf,  deal_folder_id)
 
             return {
                 "file": ag_path,
-                "filename": ag_filename_docx,
+                "filename": ag_docx,
                 "extra_files": [ag_pdf_path, dkp_path, dkp_pdf_path, invoice_path, inv_pdf_path],
-                "extra_names": [ag_filename_pdf, dkp_filename_docx, dkp_filename_pdf,
-                                inv_filename_xlsx, inv_filename_pdf],
+                "extra_names": [ag_pdf,      dkp_docx, dkp_pdf,      inv_xlsx,     inv_pdf],
                 "drive_link": ag_link,
                 "message": f"Сделка {number} создана — 6 файлов сохранено на Drive"
             }
@@ -221,8 +220,12 @@ class DocumentAgent:
             await self.drive.upload_file(invoice_path, f"Счёт_{number}.xlsx", deal_folder_id)
             link = await self.drive.upload_file(inv_pdf_path, f"Счёт_{number}.pdf", deal_folder_id)
 
-            return {"file": invoice_path, "filename": f"Счёт_{number}.xlsx",
-                    "drive_link": link, "message": f"Счёт {number} создан и сохранён на Drive"}
+            return {
+                "file": invoice_path,
+                "filename": f"Счёт_{number}.xlsx",
+                "drive_link": link,
+                "message": f"Счёт {number} создан и сохранён на Drive"
+            }
 
         elif tool_name == "save_company":
             memory.save_company(tool_input["name"], tool_input["data"])
