@@ -6,6 +6,8 @@ import tempfile
 from pathlib import Path
 from datetime import datetime
 import logging
+import httpx
+import asyncio
 import anthropic
 logger = logging.getLogger(__name__)
 import memory
@@ -22,7 +24,7 @@ class DocumentAgent:
         memory.init_db()
 
     def _build_system_prompt(self) -> str:
-        base = """Ты автоматизированный агент директора компании ОсОО «Авто Континент» (г. Бишкек, Кыргызстан).
+        base = """Ты Александра, автоматизированный агент директора компании ОсОО «Авто Континент» (г. Бишкек, Кыргызстан).
 Компания занимается продажей автомобилей из Китая, выступает платёжным агентом между покупателями из России и местными продавцами.
 
 У тебя есть РЕАЛЬНЫЕ ИНСТРУМЕНТЫ которые ты ОБЯЗАН использовать:
@@ -72,7 +74,7 @@ class DocumentAgent:
   car_price_words         — цена ДКП прописью (Четыре миллиона двести тысяч рублей)
   currency                — валюта ДКП (рублей)
   cash_amount             — сумма наличных в Поручении цифрами (например: 54900). Это ДРУГАЯ сумма — в долларах!
-  cash_amount_words       — сумма наличных прописью (Пятьдесят четыре тысячи девятьсот долларов)
+  cash_amount_words       — сумма наличных прописью БЕЗ валюты (Пятьдесят четыре тысячи девятьсот)
   cash_currency           — валюта наличных (долларов / сом)
   account_currency        — валюта счёта для банковского перевода
   account_number          — номер счёта
@@ -88,13 +90,14 @@ class DocumentAgent:
 Если хотя бы одно обязательное поле пустое — НЕ создавай договор, а спроси все недостающие данные ОДНИМ сообщением.
 
 ОБЯЗАТЕЛЬНЫЕ поля (без них договор создавать НЕЛЬЗЯ):
-  Покупатель: buyer_name, buyer_birth_date, buyer_address, passport_series, passport_number, passport_issued_by, passport_issued_date, passport_code
-  Продавец: seller_name, seller_birth_date, seller_address, seller_id_number, seller_id_issued_by
-  Автомобиль: car_model, car_vin, car_year, car_color
-  Финансы: car_price, car_price_words, currency, cash_amount, cash_amount_words, cash_currency, commission_pct
+  Покупатель: buyer_name, buyer_initials, buyer_birth_date, buyer_address, passport_series, passport_number, passport_issued_by, passport_issued_date, passport_code
+  Продавец: seller_name, seller_initials, seller_id_issued_date, seller_birth_date, seller_address, seller_id_number, seller_id_issued_by
+  Автомобиль: car_model, car_vin, car_year, car_color, tpo_number, tpo_day, tpo_month, tpo_year,
+  Финансы: car_price, car_price_words, currency, cash_amount, cash_amount_words, cash_currency, account_currency, account_number, bank_corr_line1, bank_corr_line2, bank_corr_line3, bank_ben_line1, bank_ben_line2
+  Комиссия: commission_pct передаётся как отдельный параметр инструмента, НЕ внутри data
 
 НЕОБЯЗАТЕЛЬНЫЕ поля (оставь пустыми если нет):
-  car_body_number, tpo_number, tpo_day, tpo_month, tpo_year, buyer_initials, seller_initials, seller_id_issued_date, account_currency, account_number, bank_corr_line1, bank_corr_line2, bank_corr_line3, bank_ben_line1, bank_ben_line2
+  car_body_number,  
 
 ПРАВИЛА:
 1. car_price и cash_amount — РАЗНЫЕ суммы:
@@ -133,6 +136,12 @@ class DocumentAgent:
   Сумма наличными агенту (долларов): ...
   Сумма наличными прописью (без валюты): ...
   Комиссия: ...%
+
+🏦 БАНКОВСКИЕ РЕКВИЗИТЫ:
+  Валюта счёта: ...
+  Номер счёта: ...
+  Банк-корреспондент: ...
+  Банк получателя: ...
 
 Всё верно? Создаю договоры?
 
@@ -175,23 +184,20 @@ class DocumentAgent:
         messages.append({"role": "user", "content": current_content})
 
         # Retry при сетевых ошибках
-        import httpx
         for attempt in range(3):
             try:
-                response = await self.client.messages.create(
+                response = await self.client.with_options(timeout=120.0).messages.create(
                     model=self.model,
                     max_tokens=1024,
                     system=self._build_system_prompt(),
                     tools=self._get_tools(),
-                    messages=messages,
-                    timeout=120.0
+                    messages=messages
                 )
                 break
             except (httpx.RemoteProtocolError, httpx.ReadTimeout, httpx.ConnectTimeout) as e:
                 logger.warning(f"Сетевая ошибка (попытка {attempt+1}/3): {e}")
                 if attempt == 2:
                     return {"text": "⚠️ Ошибка соединения с AI. Попробуйте ещё раз.", "files": [], "success": False}
-                import asyncio
                 await asyncio.sleep(2)
 
         result = await self._handle_response(response)
@@ -289,7 +295,6 @@ class DocumentAgent:
     async def _execute_tool(self, tool_name: str, tool_input: dict) -> dict:
         if tool_name == "create_contract":
             number = tool_input.get("contract_number") or datetime.now().strftime("%d%m%y") + "001"
-            import json as _json
             logger.info("=== DATA KEYS: " + str(list(tool_input.get("data", {}).keys())))
             logger.info("=== BANK FIELDS: corr1=" + repr(tool_input.get("data", {}).get("bank_corr_line1")) + " pol1=" + repr(tool_input.get("data", {}).get("bank_ben_line1")))
             date = datetime.now().strftime("%d.%m.%Y")
