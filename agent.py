@@ -29,8 +29,57 @@ class DocumentAgent:
 - save_company — сохранить реквизиты компании/клиента в постоянную память
 - save_instruction — сохранить инструкцию для себя
 
-ВАЖНО: Когда пользователь просит создать договор или счёт — ВСЕГДА вызывай соответствующий инструмент. Не говори что не можешь — у тебя есть все возможности. Документы автоматически сохраняются на Google Drive.
+ВАЖНО: Когда пользователь просит создать договор или счёт — ВСЕГДА вызывай соответствующий инструмент.
 
+=== ОБЯЗАТЕЛЬНЫЕ КЛЮЧИ В ПОЛЕ data ===
+При вызове create_contract ты ОБЯЗАН передать data со СТРОГО ЭТИМИ ключами (используй только эти, никакие другие):
+
+ПОКУПАТЕЛЬ (гражданин РФ):
+  buyer_name              — ФИО полностью
+  buyer_birth_date        — дата рождения (ДД.ММ.ГГГГ)
+  buyer_address           — адрес регистрации
+  buyer_initials          — инициалы (Иванов И.И.)
+  passport_series         — серия паспорта
+  passport_number         — номер паспорта
+  passport_issued_by      — кем выдан
+  passport_issued_date    — дата выдачи (ДД.ММ.ГГГГ)
+  passport_code           — код подразделения
+
+ПРОДАВЕЦ (гражданин КР):
+  seller_name             — ФИО полностью
+  seller_birth_date       — дата рождения (ДД.ММ.ГГГГ)
+  seller_address          — адрес регистрации
+  seller_initials         — инициалы (Иванов И.И.)
+  seller_id_number        — номер идентификационной карты
+  seller_id_issued_by     — кем выдана карта
+  seller_id_issued_date   — дата выдачи карты (ДД.ММ.ГГГГ)
+
+АВТОМОБИЛЬ:
+  car_model               — марка и модель (Toyota RAV4)
+  car_vin                 — VIN номер
+  car_year                — год выпуска
+  car_color               — цвет
+  car_body_number         — номер кузова (если есть, иначе VIN)
+  tpo_number              — номер ТПО
+  tpo_day                 — день выдачи ТПО
+  tpo_month               — месяц выдачи ТПО (прописью: января, февраля...)
+  tpo_year                — год выдачи ТПО
+
+ФИНАНСЫ:
+  car_price               — цена автомобиля цифрами (только число, без пробелов)
+  car_price_words         — цена прописью (Четыре миллиона двести тысяч рублей)
+  currency                — валюта ДКП (рублей / долларов)
+  cash_currency           — валюта наличных (сом / долларов)
+  cash_amount_words       — сумма наличными прописью
+  account_currency        — валюта счёта для банковского перевода
+  account_number          — номер счёта
+  bank_corr_line1         — реквизиты банка-корреспондента строка 1
+  bank_corr_line2         — реквизиты банка-корреспондента строка 2
+  bank_corr_line3         — реквизиты банка-корреспондента строка 3
+  bank_ben_line1          — реквизиты банка получателя строка 1
+  bank_ben_line2          — реквизиты банка получателя строка 2
+
+Если каких-то данных нет — оставь значение пустой строкой "".
 Отвечай на русском языке. Будь краток и по делу."""
 
         instructions = memory.get_instructions()
@@ -56,7 +105,6 @@ class DocumentAgent:
 
         history = memory.get_history(limit=15)
         messages = []
-
         for h in history[:-1]:
             messages.append({"role": h["role"], "content": h["content"]})
 
@@ -83,13 +131,16 @@ class DocumentAgent:
         return [
             {
                 "name": "create_contract",
-                "description": "Создать полный пакет документов по сделке (АГ договор, ДКП ТС, Счёт). ВСЕГДА спрашивай размер комиссии в процентах перед вызовом если он не указан.",
+                "description": "Создать полный пакет документов по сделке (АГ договор, ДКП ТС, Счёт на оплату). ВСЕГДА спрашивай размер комиссии в процентах перед вызовом если он не указан.",
                 "input_schema": {
                     "type": "object",
                     "properties": {
-                        "data": {"type": "object", "description": "Данные для заполнения документов"},
+                        "data": {
+                            "type": "object",
+                            "description": "Данные для заполнения документов — строго по ключам из системного промпта"
+                        },
                         "contract_number": {"type": "string", "description": "Номер договора (опционально)"},
-                        "commission_pct": {"type": "number", "description": "Комиссия агента в процентах, например 1.5"}
+                        "commission_pct": {"type": "number", "description": "Комиссия агента в процентах, например 2.0"}
                     },
                     "required": ["data", "commission_pct"]
                 }
@@ -112,8 +163,8 @@ class DocumentAgent:
                 "input_schema": {
                     "type": "object",
                     "properties": {
-                        "name": {"type": "string", "description": "Название компании"},
-                        "data": {"type": "object", "description": "Реквизиты компании"}
+                        "name": {"type": "string"},
+                        "data": {"type": "object"}
                     },
                     "required": ["name", "data"]
                 }
@@ -124,7 +175,7 @@ class DocumentAgent:
                 "input_schema": {
                     "type": "object",
                     "properties": {
-                        "text": {"type": "string", "description": "Текст инструкции"}
+                        "text": {"type": "string"}
                     },
                     "required": ["text"]
                 }
@@ -141,7 +192,6 @@ class DocumentAgent:
             elif block.type == "tool_use":
                 tool_result = await self._execute_tool(block.name, block.input)
 
-                # Основной файл
                 if tool_result.get("file"):
                     result["files"].append({
                         "file": tool_result["file"],
@@ -149,7 +199,7 @@ class DocumentAgent:
                         "drive_link": tool_result.get("drive_link", "")
                     })
 
-                # Дополнительные файлы (ДКП, Счёт, PDF версии)
+                # Дополнительные файлы (ДКП, Счёт, PDF)
                 extra_files = tool_result.get("extra_files", [])
                 extra_names = tool_result.get("extra_names", [])
                 for f_path, f_name in zip(extra_files, extra_names):
@@ -178,8 +228,7 @@ class DocumentAgent:
             ag_docx = f"АГ_Договор_{number}.docx"
             ag_pdf  = f"АГ_Договор_{number}.pdf"
             ag_pdf_path = await self.builder.convert_to_pdf(ag_path)
-
-            await self.drive.upload_file(ag_path,     ag_docx, deal_folder_id)
+            await self.drive.upload_file(ag_path, ag_docx, deal_folder_id)
             ag_link = await self.drive.upload_file(ag_pdf_path, ag_pdf, deal_folder_id)
 
             # 2. ДКП ТС
@@ -187,24 +236,22 @@ class DocumentAgent:
             dkp_docx = f"ДКП_ТС_{number}.docx"
             dkp_pdf  = f"ДКП_ТС_{number}.pdf"
             dkp_pdf_path = await self.builder.convert_to_pdf(dkp_path)
-
-            await self.drive.upload_file(dkp_path,     dkp_docx, deal_folder_id)
-            await self.drive.upload_file(dkp_pdf_path, dkp_pdf,  deal_folder_id)
+            await self.drive.upload_file(dkp_path, dkp_docx, deal_folder_id)
+            await self.drive.upload_file(dkp_pdf_path, dkp_pdf, deal_folder_id)
 
             # 3. Счёт
             invoice_path = await self.builder.build_invoice(tool_input["data"], number, date, commission_pct)
             inv_xlsx = f"Счёт_{number}.xlsx"
             inv_pdf  = f"Счёт_{number}.pdf"
             inv_pdf_path = await self.builder.convert_to_pdf(invoice_path)
-
-            await self.drive.upload_file(invoice_path,  inv_xlsx, deal_folder_id)
-            await self.drive.upload_file(inv_pdf_path,  inv_pdf,  deal_folder_id)
+            await self.drive.upload_file(invoice_path, inv_xlsx, deal_folder_id)
+            await self.drive.upload_file(inv_pdf_path, inv_pdf, deal_folder_id)
 
             return {
                 "file": ag_path,
                 "filename": ag_docx,
                 "extra_files": [ag_pdf_path, dkp_path, dkp_pdf_path, invoice_path, inv_pdf_path],
-                "extra_names": [ag_pdf,      dkp_docx, dkp_pdf,      inv_xlsx,     inv_pdf],
+                "extra_names": [ag_pdf, dkp_docx, dkp_pdf, inv_xlsx, inv_pdf],
                 "drive_link": ag_link,
                 "message": f"Сделка {number} создана — 6 файлов сохранено на Drive"
             }
@@ -213,13 +260,10 @@ class DocumentAgent:
             number = tool_input.get("invoice_number") or datetime.now().strftime("%d%m%y") + "001"
             date = datetime.now().strftime("%d.%m.%Y")
             deal_folder_id = await self.drive.get_or_create_deal_folder(number)
-
             invoice_path = await self.builder.build_invoice(tool_input["data"], number, date)
             inv_pdf_path = await self.builder.convert_to_pdf(invoice_path)
-
             await self.drive.upload_file(invoice_path, f"Счёт_{number}.xlsx", deal_folder_id)
             link = await self.drive.upload_file(inv_pdf_path, f"Счёт_{number}.pdf", deal_folder_id)
-
             return {
                 "file": invoice_path,
                 "filename": f"Счёт_{number}.xlsx",
@@ -249,7 +293,6 @@ class DocumentAgent:
                 "type": "image",
                 "source": {"type": "base64", "media_type": media_map.get(ext.strip("."), "image/jpeg"), "data": data}
             })
-
         elif ext == ".pdf":
             with open(filepath, "rb") as f:
                 data = base64.standard_b64encode(f.read()).decode("utf-8")
@@ -257,7 +300,6 @@ class DocumentAgent:
                 "type": "document",
                 "source": {"type": "base64", "media_type": "application/pdf", "data": data}
             })
-
         else:
             try:
                 with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
