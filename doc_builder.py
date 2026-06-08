@@ -148,90 +148,248 @@ class DocumentBuilder:
     # ─── СЧЁТ (XLSX) ──────────────────────────────────────────────────────
 
     async def build_invoice(self, data: dict, number: str, date: str, commission_pct: float = 1.0) -> str:
+        """
+        Формирует счёт на оплату в формате, соответствующем шаблону компании.
+        Структура: блок банковских реквизитов → заголовок → стороны → таблица → итоги → подписи.
+        Колонки: A=№(4) B=описание(48) C=кол-во(8) D=ед.(6) E=цена(16) F=сумма(16)
+        """
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = "Счёт"
 
-        ws.column_dimensions["A"].width = 5
-        ws.column_dimensions["B"].width = 50
-        ws.column_dimensions["C"].width = 10
-        ws.column_dimensions["D"].width = 8
-        ws.column_dimensions["E"].width = 18
-        ws.column_dimensions["F"].width = 18
+        # ── Ширина колонок ────────────────────────────────────────────────
+        ws.column_dimensions["A"].width = 4
+        ws.column_dimensions["B"].width = 48
+        ws.column_dimensions["C"].width = 8
+        ws.column_dimensions["D"].width = 6
+        ws.column_dimensions["E"].width = 16
+        ws.column_dimensions["F"].width = 16
 
-        bold = Font(bold=True)
-        center = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        left = Alignment(horizontal="left", vertical="center", wrap_text=True)
-        thin = Side(style="thin")
-        border = Border(left=thin, right=thin, top=thin, bottom=thin)
-        header_fill = PatternFill("solid", fgColor="D9E1F2")
+        # ── Стили ─────────────────────────────────────────────────────────
+        bold        = Font(bold=True, size=10)
+        bold_lg     = Font(bold=True, size=12)
+        normal      = Font(size=10)
+        small       = Font(size=8)
+        center      = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        left        = Alignment(horizontal="left",   vertical="center", wrap_text=True)
+        left_top    = Alignment(horizontal="left",   vertical="top",    wrap_text=True)
+        right       = Alignment(horizontal="right",  vertical="center", wrap_text=True)
+        thin        = Side(style="thin")
+        medium_side = Side(style="medium")
+        brd         = Border(left=thin, right=thin, top=thin, bottom=thin)
+        brd_med     = Border(left=medium_side, right=medium_side,
+                             top=medium_side,  bottom=medium_side)
+        fill_hdr    = PatternFill("solid", fgColor="DCE6F1")
+        fill_gray   = PatternFill("solid", fgColor="F2F2F2")
 
-        ws.merge_cells("A1:F1")
-        ws["A1"] = f"СЧЁТ НА ОПЛАТУ № {number} от {date} г."
-        ws["A1"].font = Font(bold=True, size=13)
-        ws["A1"].alignment = center
-        ws.row_dimensions[1].height = 30
+        def cell(row, col, value="", font=None, align=None, border=None, fill=None, num_fmt=None):
+            c = ws.cell(row=row, column=col, value=value)
+            if font:   c.font   = font
+            if align:  c.alignment = align
+            if border: c.border = border
+            if fill:   c.fill   = fill
+            if num_fmt: c.number_format = num_fmt
+            return c
 
-        ws.merge_cells("A2:F2")
-        ws["A2"] = "Поставщик: ОсОО «Авто Континент», ИНН: 01905202610324, г. Бишкек, ул. Матросова 58"
-        ws["A2"].alignment = left
-        ws.row_dimensions[2].height = 20
+        def merge(r1, c1, r2, c2, value="", font=None, align=None, border=None, fill=None):
+            ws.merge_cells(start_row=r1, start_column=c1, end_row=r2, end_column=c2)
+            c = ws.cell(row=r1, column=c1, value=value)
+            if font:   c.font   = font
+            if align:  c.alignment = align
+            if border: c.border = border
+            if fill:   c.fill   = fill
+            return c
 
-        buyer = data.get("buyer_name", data.get("company_name", ""))
-        ws.merge_cells("A3:F3")
-        ws["A3"] = f"Покупатель: {buyer}"
-        ws["A3"].alignment = left
-        ws.row_dimensions[3].height = 20
-
-        headers = ["№", "Наименование товара (работы, услуги)", "Кол-во", "Ед.", "Цена", "Сумма"]
-        for col, h in enumerate(headers, 1):
-            cell = ws.cell(row=5, column=col, value=h)
-            cell.font = bold
-            cell.alignment = center
-            cell.border = border
-            cell.fill = header_fill
-        ws.row_dimensions[5].height = 30
-
-        car = f"{data.get('car_model', 'Автомобиль')} {data.get('car_year', '')} VIN: {data.get('car_vin', '')}".strip()
-        price_str = data.get("car_price", "0").replace(" ", "").replace(",", ".")
+        # ── Данные ────────────────────────────────────────────────────────
+        price_str = str(data.get("car_price", "0")).replace(" ", "").replace(",", ".")
         try:
             price_val = float(price_str)
         except Exception:
-            price_val = 0
+            price_val = 0.0
 
-        currency = data.get("currency", "RUB")
-        row_data = ["1", f"Оплата по Агентскому договору № {number} — {car}", "1", "шт.", price_val, price_val]
-        for col, val in enumerate(row_data, 1):
-            cell = ws.cell(row=6, column=col, value=val)
-            cell.border = border
-            cell.alignment = center if col != 2 else left
-        ws.row_dimensions[6].height = 40
+        commission  = round(price_val * commission_pct / 100, 2)
+        total       = round(price_val + commission, 2)
+        currency    = data.get("currency", "RUB")
+        buyer       = data.get("buyer_name", data.get("company_name", ""))
+        car         = (f"{data.get('car_model', '')} год выпуска {data.get('car_year', '')} "
+                       f"VIN {data.get('car_vin', '')}").strip()
 
-        commission = round(price_val * commission_pct / 100, 2)
-        comm_data = ["2", f"Комиссия {commission_pct}% по Агентскому договору № {number}", "1", "шт.", commission, commission]
-        for col, val in enumerate(comm_data, 1):
-            cell = ws.cell(row=7, column=col, value=val)
-            cell.border = border
-            cell.alignment = center if col != 2 else left
-        ws.row_dimensions[7].height = 30
+        # Дата прописью для заголовка: "02 июня 2026"
+        day_n  = date[0:2]
+        mon_n  = date[3:5]
+        year_n = date[6:10]
+        date_str = f"{day_n} {self._month_name(mon_n)} {year_n}"
 
-        total = price_val + commission
-        ws.merge_cells("A9:E9")
-        ws["A9"] = "ИТОГО К ОПЛАТЕ:"
-        ws["A9"].font = bold
-        ws["A9"].alignment = Alignment(horizontal="right")
-        ws["F9"] = total
-        ws["F9"].font = bold
-        ws["F9"].border = border
+        # Банковские реквизиты из data
+        corr_name = data.get("bank_corr_line1", "")
+        corr_bik  = data.get("bank_corr_line2", "")
+        corr_acc  = data.get("bank_corr_line3", "")
+        ben_name  = data.get("bank_ben_line1", "")
+        ben_bik   = data.get("bank_ben_line2", "")
+        acc_num   = data.get("account_number", "")
+        acc_cur   = data.get("account_currency", currency)
 
-        ws.merge_cells("A10:F10")
-        ws["A10"] = f"Валюта: {currency}"
-        ws["A10"].alignment = left
+        # ══ БЛОК 1: БАНКОВСКИЕ РЕКВИЗИТЫ (строки 1–9) ════════════════════
+        r = 1
+        # Банк-корреспондент
+        merge(r, 1, r, 4, corr_name, font=normal, align=left)
+        ws.row_dimensions[r].height = 15; r += 1
+        merge(r, 1, r, 3, "БИК", font=small, align=left)
+        cell(r, 4, corr_bik, font=normal, align=left)
+        ws.row_dimensions[r].height = 14; r += 1
+        merge(r, 1, r, 4, "Банк-корреспондент", font=small, align=left)
+        ws.row_dimensions[r].height = 13; r += 1
 
-        ws.merge_cells("A12:C12")
-        ws["A12"] = "Руководитель: Колотовкин Илья Валерьевич"
-        ws.merge_cells("D12:F12")
-        ws["D12"] = "Подпись: ________________"
+        # Банк получателя
+        merge(r, 1, r, 4, ben_name, font=normal, align=left)
+        ws.row_dimensions[r].height = 15; r += 1
+        merge(r, 1, r, 3, "БИК", font=small, align=left)
+        cell(r, 4, ben_bik, font=normal, align=left)
+        ws.row_dimensions[r].height = 14; r += 1
+
+        merge(r, 1, r, 3, "Сч. №", font=small, align=left)
+        cell(r, 4, corr_acc, font=normal, align=left)
+        ws.row_dimensions[r].height = 14; r += 1
+
+        merge(r, 1, r, 4, "Банк получателя", font=small, align=left)
+        ws.row_dimensions[r].height = 13; r += 1
+
+        # Получатель — Авто Континент
+        merge(r, 1, r, 2, f"ИНН  01905202610324", font=normal, align=left)
+        merge(r, 3, r, 3, "Сч. №", font=small, align=right)
+        cell(r, 4, acc_num, font=normal, align=left)
+        ws.row_dimensions[r].height = 15; r += 1
+
+        merge(r, 1, r, 4, 'ОсОО "Авто Континент"', font=bold, align=left)
+        ws.row_dimensions[r].height = 15; r += 1
+
+        merge(r, 1, r, 4, "Получатель", font=small, align=left)
+        ws.row_dimensions[r].height = 13; r += 1
+
+        # Разделитель
+        ws.row_dimensions[r].height = 4; r += 1
+
+        # ══ БЛОК 2: ЗАГОЛОВОК ════════════════════════════════════════════
+        merge(r, 1, r, 6,
+              f"Счёт на оплату № {number} от {date_str} г.",
+              font=bold_lg, align=center, border=brd_med)
+        ws.row_dimensions[r].height = 28; r += 1
+
+        # ══ БЛОК 3: СТОРОНЫ ══════════════════════════════════════════════
+        merge(r, 1, r, 2, "Поставщик:\n(Исполнитель)", font=small, align=left_top, border=brd)
+        merge(r, 3, r, 6,
+              'ОсОО "Авто Континент", ИНН: 01905202610324, ОКПО: 34942535, '
+              'Кыргызская Республика, г. Бишкек, Октябрьский район, ул. Матросова, д. 58, Неж.Пом. 2',
+              font=normal, align=left_top, border=brd)
+        ws.row_dimensions[r].height = 40; r += 1
+
+        merge(r, 1, r, 2, "Покупатель:\n(Заказчик)", font=small, align=left_top, border=brd)
+        merge(r, 3, r, 6, buyer, font=normal, align=left_top, border=brd)
+        ws.row_dimensions[r].height = 22; r += 1
+
+        # Разделитель
+        ws.row_dimensions[r].height = 4; r += 1
+
+        # ══ БЛОК 4: ТАБЛИЦА ══════════════════════════════════════════════
+        # Заголовки
+        hrow = r
+        for col, (txt, w) in enumerate([
+            ("№", 4), ("Товары (работы, услуги)", 48),
+            ("Кол-во", 8), ("Ед.", 6), ("Цена", 16), ("Сумма", 16)
+        ], 1):
+            c = ws.cell(row=hrow, column=col, value=txt)
+            c.font = bold; c.alignment = center
+            c.border = brd; c.fill = fill_hdr
+        ws.row_dimensions[hrow].height = 30; r += 1
+
+        # Строка 1: оплата за авто
+        item_desc = (f"Оплата по Агентскому договору {number} от {date_str} г. "
+                     f"на оплату автомобиля {car}")
+        num_fmt = '#,##0.00'
+        for col, val in enumerate([1, item_desc, 1, "шт", price_val, price_val], 1):
+            c = ws.cell(row=r, column=col, value=val)
+            c.border = brd
+            c.alignment = left_top if col == 2 else center
+            c.font = normal
+            if col in (5, 6): c.number_format = num_fmt
+        ws.row_dimensions[r].height = 45; r += 1
+
+        # Строка 2: комиссия
+        for col, val in enumerate([2, f"Комиссия по Агентскому договору {number} от {date_str} г.",
+                                    1, "шт", commission, commission], 1):
+            c = ws.cell(row=r, column=col, value=val)
+            c.border = brd
+            c.alignment = left_top if col == 2 else center
+            c.font = normal
+            if col in (5, 6): c.number_format = num_fmt
+        ws.row_dimensions[r].height = 28; r += 1
+
+        # ══ БЛОК 5: ИТОГИ ════════════════════════════════════════════════
+        for label, value, is_total in [
+            ("Итого:",           total,  False),
+            ("В том числе НДС:", "-",    False),
+            ("Всего к оплате:",  total,  True),
+        ]:
+            merge(r, 1, r, 5, label,
+                  font=bold if is_total else normal, align=right,
+                  border=Border(right=thin, bottom=thin))
+            c = ws.cell(row=r, column=6, value=value)
+            c.font = bold if is_total else normal
+            c.alignment = center
+            c.border = brd
+            if isinstance(value, float): c.number_format = num_fmt
+            ws.row_dimensions[r].height = 18; r += 1
+
+        # ══ БЛОК 6: ИТОГОВАЯ СТРОКА ══════════════════════════════════════
+        ws.row_dimensions[r].height = 5; r += 1  # отступ
+
+        total_fmt = f"{total:,.2f}".replace(",", " ")
+        price_words = data.get("car_price_words", "")
+        merge(r, 1, r, 6,
+              f"Всего наименований 2, на сумму {total_fmt} {acc_cur}",
+              font=bold, align=left)
+        ws.row_dimensions[r].height = 18; r += 1
+
+        merge(r, 1, r, 6, price_words, font=normal, align=left)
+        ws.row_dimensions[r].height = 18; r += 1
+
+        ws.row_dimensions[r].height = 8; r += 1  # отступ
+
+        # ══ БЛОК 7: ПОДПИСИ ══════════════════════════════════════════════
+        # Руководитель
+        cell(r, 1, "Руководитель", font=normal, align=left)
+        merge(r, 2, r, 3, "", border=Border(bottom=thin))   # место подписи
+        merge(r, 4, r, 6, "Колотовкин Илья Валерьевич", font=normal, align=center)
+        ws.row_dimensions[r].height = 22; r += 1
+
+        merge(r, 2, r, 3, "подпись", font=small, align=center)
+        merge(r, 4, r, 6, "расшифровка подписи", font=small, align=center)
+        ws.row_dimensions[r].height = 12; r += 1
+
+        ws.row_dimensions[r].height = 10; r += 1  # отступ
+
+        # Бухгалтер
+        cell(r, 1, "Бухгалтер", font=normal, align=left)
+        merge(r, 2, r, 3, "", border=Border(bottom=thin))
+        merge(r, 4, r, 6, "", border=Border(bottom=thin))
+        ws.row_dimensions[r].height = 22; r += 1
+
+        merge(r, 2, r, 3, "подпись", font=small, align=center)
+        merge(r, 4, r, 6, "расшифровка подписи", font=small, align=center)
+        ws.row_dimensions[r].height = 12; r += 1
+
+        ws.row_dimensions[r].height = 10; r += 1
+        merge(r, 2, r, 3, "М.П.", font=normal, align=center)
+        ws.row_dimensions[r].height = 18
+
+        # ── Параметры страницы ────────────────────────────────────────────
+        ws.page_setup.orientation = "portrait"
+        ws.page_setup.paperSize   = ws.PAPERSIZE_A4
+        ws.page_margins.left      = 0.5
+        ws.page_margins.right     = 0.3
+        ws.page_margins.top       = 0.5
+        ws.page_margins.bottom    = 0.5
+        ws.print_area             = f"A1:F{r}"
 
         path = self.output_dir / f"Счёт_{number}.xlsx"
         wb.save(str(path))
