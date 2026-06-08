@@ -154,7 +154,6 @@ class DocumentBuilder:
         ws = wb.active
         ws.title = "Счёт"
 
-        # Ширина колонок
         ws.column_dimensions["A"].width = 5
         ws.column_dimensions["B"].width = 50
         ws.column_dimensions["C"].width = 10
@@ -169,14 +168,12 @@ class DocumentBuilder:
         border = Border(left=thin, right=thin, top=thin, bottom=thin)
         header_fill = PatternFill("solid", fgColor="D9E1F2")
 
-        # Заголовок
         ws.merge_cells("A1:F1")
         ws["A1"] = f"СЧЁТ НА ОПЛАТУ № {number} от {date} г."
         ws["A1"].font = Font(bold=True, size=13)
         ws["A1"].alignment = center
         ws.row_dimensions[1].height = 30
 
-        # Поставщик / покупатель
         ws.merge_cells("A2:F2")
         ws["A2"] = "Поставщик: ОсОО «Авто Континент», ИНН: 01905202610324, г. Бишкек, ул. Матросова 58"
         ws["A2"].alignment = left
@@ -187,7 +184,6 @@ class DocumentBuilder:
         ws["A3"].alignment = left
         ws.row_dimensions[3].height = 20
 
-        # Шапка таблицы
         headers = ["№", "Наименование товара (работы, услуги)", "Кол-во", "Ед.", "Цена", "Сумма"]
         for col, h in enumerate(headers, 1):
             cell = ws.cell(row=5, column=col, value=h)
@@ -197,7 +193,6 @@ class DocumentBuilder:
             cell.fill = header_fill
         ws.row_dimensions[5].height = 30
 
-        # Строка с автомобилем
         car = f"{data.get('car_model', 'Автомобиль')} {data.get('car_year', '')} VIN: {data.get('car_vin', '')}".strip()
         price_str = data.get("car_price", "0").replace(" ", "").replace(",", ".")
         try:
@@ -213,7 +208,6 @@ class DocumentBuilder:
             cell.alignment = center if col != 2 else left
         ws.row_dimensions[6].height = 40
 
-        # Комиссия
         commission = round(price_val * commission_pct / 100, 2)
         comm_data = ["2", f"Комиссия {commission_pct}% по Агентскому договору № {number}", "1", "шт.", commission, commission]
         for col, val in enumerate(comm_data, 1):
@@ -222,7 +216,6 @@ class DocumentBuilder:
             cell.alignment = center if col != 2 else left
         ws.row_dimensions[7].height = 30
 
-        # Итого
         total = price_val + commission
         ws.merge_cells("A9:E9")
         ws["A9"] = "ИТОГО К ОПЛАТЕ:"
@@ -236,7 +229,6 @@ class DocumentBuilder:
         ws["A10"] = f"Валюта: {currency}"
         ws["A10"].alignment = left
 
-        # Подписи
         ws.merge_cells("A12:C12")
         ws["A12"] = "Руководитель: Колотовкин Илья Валерьевич"
         ws.merge_cells("D12:F12")
@@ -249,7 +241,6 @@ class DocumentBuilder:
     # ─── КОНВЕРТАЦИЯ В PDF ────────────────────────────────────────────────
 
     async def convert_to_pdf(self, filepath: str) -> str:
-        """Конвертируем docx/xlsx в PDF через LibreOffice"""
         try:
             result = subprocess.run(
                 ["libreoffice", "--headless", "--convert-to", "pdf",
@@ -261,7 +252,7 @@ class DocumentBuilder:
                 return pdf_path
         except Exception as e:
             print(f"Ошибка конвертации PDF: {e}")
-        return filepath  # fallback — возвращаем оригинал
+        return filepath
 
     # ─── ВСПОМОГАТЕЛЬНЫЕ ─────────────────────────────────────────────────
 
@@ -301,64 +292,146 @@ class DocumentBuilder:
         month = date[3:5]
         year  = date[6:10]
 
-        # Цена прописью — базовая (можно расширить)
+        # Цена
         price_str = data.get("car_price", "0").replace(" ", "").replace(",", ".")
         try:
             price_val = float(price_str)
             price_fmt = f"{price_val:,.0f}".replace(",", " ")
         except Exception:
             price_fmt = price_str
+            price_val = 0
+
+        commission = round(price_val * commission_pct / 100, 2)
+        cash_amount = price_val
+        cash_fmt = f"{cash_amount:,.0f}".replace(",", " ")
 
         replacements = {
-            "{{НОМЕР}}":                   number,
-            "{{ДЕНЬ}}":                    day,
-            "{{МЕСЯЦ}}":                   self._month_name(month),
-            "{{ГОД}}":                     year,
-            "{{КОМИССИЯ}}":                str(commission_pct),
+            "{{НОМЕР}}":                    number,
+            "{{ДЕНЬ}}":                     day,
+            "{{МЕСЯЦ}}":                    self._month_name(month),
+            "{{ГОД}}":                      year,
+            "{{КОМИССИЯ}}":                 str(commission_pct),
 
             # Покупатель (гражданин РФ)
-            "{{ПОКУПАТЕЛЬ_ФИО}}":          data.get("buyer_name", ""),
+            "{{ПОКУПАТЕЛЬ_ФИО}}":           data.get("buyer_name", ""),
+            "{{ПАСПОРТ_СЕРИЯ}}":            data.get("passport_series", ""),
+            "{{ПАСПОРТ_НОМЕР}}":            data.get("passport_number", ""),
+            "{{ПАСПОРТ_ВЫДАН}}":            data.get("passport_issued_by", ""),
+            "{{ПАСПОРТ_КОД}}":              data.get("passport_code", ""),
             "{{ПОКУПАТЕЛЬ_ПОЛНЫЕ_ДАННЫЕ}}": data.get("buyer_full_details", data.get("buyer_name", "")),
-            "{{ПОКУПАТЕЛЬ_ИНИЦИАЛЫ}}":     data.get("buyer_initials", ""),
+            "{{ПОКУПАТЕЛЬ_ИНИЦИАЛЫ}}":      data.get("buyer_initials", ""),
 
             # Продавец (гражданин КР)
-            "{{ПРОДАВЕЦ_ФИО}}":            data.get("seller_name", ""),
-            "{{ПРОДАВЕЦ_ПОЛНЫЕ_ДАННЫЕ}}":  data.get("seller_full_details", data.get("seller_name", "")),
-            "{{ПРОДАВЕЦ_ИНИЦИАЛЫ}}":       data.get("seller_initials", ""),
+            "{{ПРОДАВЕЦ_ФИО}}":             data.get("seller_name", ""),
+            "{{ПРОДАВЕЦ_ID}}":              data.get("seller_id", ""),
+            "{{ПРОДАВЕЦ_ПОЛНЫЕ_ДАННЫЕ}}":   data.get("seller_full_details", data.get("seller_name", "")),
+            "{{ПРОДАВЕЦ_ИНИЦИАЛЫ}}":        data.get("seller_initials", ""),
 
             # Авто
-            "{{МАРКА_МОДЕЛЬ}}":            data.get("car_model", ""),
-            "{{VIN}}":                     data.get("car_vin", ""),
-            "{{ГОД_ВЫП}}":                data.get("car_year", ""),
-            "{{ЦВЕТ}}":                    data.get("car_color", ""),
-            "{{НОМ_ТПО}}":                data.get("tpo_number", ""),
-            "{{ДЕНЬ_ТПО}}":               data.get("tpo_day", ""),
-            "{{МЕС_ТПО}}":                data.get("tpo_month", ""),
-            "{{ГОД_ТПО}}":                data.get("tpo_year", ""),
+            "{{МАРКА_МОДЕЛЬ}}":             data.get("car_model", ""),
+            "{{VIN}}":                      data.get("car_vin", ""),
+            "{{ГОД_ВЫП}}":                 data.get("car_year", ""),
+            "{{ЦВЕТ}}":                     data.get("car_color", ""),
+            "{{НОМ_КУЗОВА}}":              data.get("car_body_number", data.get("car_vin", "")),
+            "{{НОМ_ТПО}}":                 data.get("tpo_number", ""),
+            "{{ДЕНЬ_ТПО}}":                data.get("tpo_day", ""),
+            "{{МЕС_ТПО}}":                 data.get("tpo_month", ""),
+            "{{ГОД_ТПО}}":                 data.get("tpo_year", ""),
 
-            # Цена
-            "{{ЦЕНА_ЦИФРАМИ}}":           price_fmt,
-            "{{ЦЕНА_ПРОПИСЬЮ}}":          data.get("car_price_words", ""),
-            "{{ВАЛЮТА}}":                 data.get("currency", "рублей"),
+            # Цена и оплата
+            "{{ЦЕНА_ЦИФРАМИ}}":            price_fmt,
+            "{{ЦЕНА_ПРОПИСЬЮ}}":           data.get("car_price_words", ""),
+            "{{ВАЛЮТА}}":                  data.get("currency", "рублей"),
+            "{{СУММА_НАЛИЧНЫМИ}}":         cash_fmt,
+            "{{СУММА_ПРОПИСЬЮ}}":          data.get("cash_amount_words", data.get("car_price_words", "")),
+            "{{ВАЛЮТА_НАЛИЧНЫМИ}}":        data.get("cash_currency", data.get("currency", "рублей")),
+
+            # Банковские реквизиты
+            "{{БАНК_КОРР_СТРОКА1}}":       data.get("bank_corr_line1", ""),
+            "{{БАНК_КОРР_СТРОКА2}}":       data.get("bank_corr_line2", ""),
+            "{{БАНК_КОРР_СТРОКА3}}":       data.get("bank_corr_line3", ""),
+            "{{БАНК_ПОЛ_СТРОКА1}}":        data.get("bank_ben_line1", ""),
+            "{{БАНК_ПОЛ_СТРОКА2}}":        data.get("bank_ben_line2", ""),
+            "{{СЧЕТ_ВАЛЮТА}}":             data.get("account_currency", ""),
+            "{{СЧЕТ_НОМЕР}}":              data.get("account_number", ""),
         }
 
-        def replace_in_para(para):
-            full_text = para.text
+        def _merge_runs_text(para) -> str:
+            return "".join(run.text for run in para.runs)
+
+        def _apply_replacements_to_para(para):
+            if not para.runs:
+                return
+            full_text = _merge_runs_text(para)
             new_text = full_text
             for ph, val in replacements.items():
-                new_text = new_text.replace(ph, str(val))
-            if new_text != full_text and para.runs:
-                for run in para.runs:
-                    run.text = ""
-                para.runs[0].text = new_text
+                if ph in new_text:
+                    new_text = new_text.replace(ph, str(val) if val is not None else "")
+            if new_text == full_text:
+                return
+            para.runs[0].text = new_text
+            for run in para.runs[1:]:
+                run.text = ""
 
+        def _process_paragraph_xml(para):
+            """XML-метод для случаев когда Word разбил плейсхолдер между runs."""
+            from lxml import etree
+            from copy import deepcopy
+
+            W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+            p_elem = para._element
+            runs = p_elem.findall(f"{{{W}}}r")
+            if not runs:
+                return
+
+            full_text = "".join(
+                t.text or ""
+                for r in runs
+                for t in r.findall(f"{{{W}}}t")
+            )
+            has_placeholder = any(ph in full_text for ph in replacements)
+            if not has_placeholder:
+                return
+
+            first_rpr = runs[0].find(f"{{{W}}}rPr")
+
+            new_text = full_text
+            for ph, val in replacements.items():
+                if ph in new_text:
+                    new_text = new_text.replace(ph, str(val) if val is not None else "")
+
+            for r in runs:
+                p_elem.remove(r)
+
+            new_run = etree.SubElement(p_elem, f"{{{W}}}r")
+            if first_rpr is not None:
+                new_run.insert(0, deepcopy(first_rpr))
+            new_t = etree.SubElement(new_run, f"{{{W}}}t")
+            new_t.text = new_text
+            if new_text.startswith(" ") or new_text.endswith(" "):
+                new_t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+
+        def process_para(para):
+            _apply_replacements_to_para(para)
+            _process_paragraph_xml(para)
+
+        # Параграфы документа
         for para in doc.paragraphs:
-            replace_in_para(para)
+            process_para(para)
+
+        # Таблицы
         for table in doc.tables:
             for row in table.rows:
                 for cell in row.cells:
                     for para in cell.paragraphs:
-                        replace_in_para(para)
+                        process_para(para)
+
+        # Колонтитулы
+        for section in doc.sections:
+            for para in section.header.paragraphs:
+                process_para(para)
+            for para in section.footer.paragraphs:
+                process_para(para)
 
         path = self.output_dir / f"{output_name}.docx"
         doc.save(str(path))
