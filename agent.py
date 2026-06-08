@@ -93,10 +93,8 @@ class DocumentAgent:
   Автомобиль: car_model, car_vin, car_year, car_color
   Финансы: car_price, car_price_words, currency, cash_amount, cash_amount_words, cash_currency, commission_pct
 
-НЕОБЯЗАТЕЛЬНЫЕ поля (можно оставить пустыми):
-  car_body_number, tpo_number, tpo_day, tpo_month, tpo_year
-  buyer_initials, seller_initials, seller_id_issued_date
-  account_currency, account_number, bank_corr_line1, bank_corr_line2, bank_corr_line3, bank_ben_line1, bank_ben_line2
+НЕОБЯЗАТЕЛЬНЫЕ поля (оставь пустыми если нет):
+  car_body_number, tpo_number, tpo_day, tpo_month, tpo_year, buyer_initials, seller_initials, seller_id_issued_date, account_currency, account_number, bank_corr_line1, bank_corr_line2, bank_corr_line3, bank_ben_line1, bank_ben_line2
 
 ПРАВИЛА:
 1. car_price и cash_amount — РАЗНЫЕ суммы:
@@ -176,13 +174,25 @@ class DocumentAgent:
 
         messages.append({"role": "user", "content": current_content})
 
-        response = await self.client.messages.create(
-            model=self.model,
-            max_tokens=2000,
-            system=self._build_system_prompt(),
-            tools=self._get_tools(),
-            messages=messages
-        )
+        # Retry при сетевых ошибках
+        import httpx
+        for attempt in range(3):
+            try:
+                response = await self.client.messages.create(
+                    model=self.model,
+                    max_tokens=1024,
+                    system=self._build_system_prompt(),
+                    tools=self._get_tools(),
+                    messages=messages,
+                    timeout=120.0
+                )
+                break
+            except (httpx.RemoteProtocolError, httpx.ReadTimeout, httpx.ConnectTimeout) as e:
+                logger.warning(f"Сетевая ошибка (попытка {attempt+1}/3): {e}")
+                if attempt == 2:
+                    return {"text": "⚠️ Ошибка соединения с AI. Попробуйте ещё раз.", "files": [], "success": False}
+                import asyncio
+                await asyncio.sleep(2)
 
         result = await self._handle_response(response)
         memory.add_to_history("assistant", result.get("text", ""))
