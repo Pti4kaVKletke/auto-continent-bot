@@ -22,7 +22,8 @@ class DocumentBuilder:
     async def build_contract(self, data: dict, number: str, date: str, commission_pct: float = 1.0) -> str:
         template = self.templates_dir / "contract_template.docx"
         if template.exists():
-            return await self._fill_template(template, data, number, date, f"АГ_Договор_{number}")
+            return await self._fill_template(template, data, number, date,
+                                             f"АГ_Договор_{number}", commission_pct)
         return await self._generate_contract(data, number, date, commission_pct)
 
     async def _generate_contract(self, data: dict, number: str, date: str, commission_pct: float = 1.0) -> str:
@@ -291,36 +292,74 @@ class DocumentBuilder:
         }
         return months.get(month_num, month_num)
 
-    async def _fill_template(self, template_path, data, number, date, output_name) -> str:
+    async def _fill_template(self, template_path, data, number, date, output_name,
+                              commission_pct: float = 1.0) -> str:
         doc = Document(str(template_path))
+
+        # Разбираем дату ДД.ММ.ГГГГ
+        day   = date[0:2]
+        month = date[3:5]
+        year  = date[6:10]
+
+        # Цена прописью — базовая (можно расширить)
+        price_str = data.get("car_price", "0").replace(" ", "").replace(",", ".")
+        try:
+            price_val = float(price_str)
+            price_fmt = f"{price_val:,.0f}".replace(",", " ")
+        except Exception:
+            price_fmt = price_str
+
         replacements = {
-            "{{НОМЕР}}": number, "{{ДАТА}}": date,
-            "{{КОМПАНИЯ}}": data.get("company_name", ""),
-            "{{ИНН}}": data.get("inn", ""),
-            "{{АДРЕС}}": data.get("address", ""),
-            "{{БАНК}}": data.get("bank_name", ""),
-            "{{РАСЧ_СЧЕТ}}": data.get("bank_account", ""),
-            "{{БИК}}": data.get("bik", ""),
-            "{{МОДЕЛЬ_АВТО}}": data.get("car_model", ""),
-            "{{VIN}}": data.get("car_vin", ""),
-            "{{ГОД}}": data.get("car_year", ""),
-            "{{ЦВЕТ}}": data.get("car_color", ""),
-            "{{ЦЕНА}}": data.get("car_price", ""),
-            "{{ВАЛЮТА}}": data.get("currency", "RUB"),
+            "{{НОМЕР}}":                   number,
+            "{{ДЕНЬ}}":                    day,
+            "{{МЕСЯЦ}}":                   self._month_name(month),
+            "{{ГОД}}":                     year,
+            "{{КОМИССИЯ}}":                str(commission_pct),
+
+            # Покупатель (гражданин РФ)
+            "{{ПОКУПАТЕЛЬ_ФИО}}":          data.get("buyer_name", ""),
+            "{{ПОКУПАТЕЛЬ_ПОЛНЫЕ_ДАННЫЕ}}": data.get("buyer_full_details", data.get("buyer_name", "")),
+            "{{ПОКУПАТЕЛЬ_ИНИЦИАЛЫ}}":     data.get("buyer_initials", ""),
+
+            # Продавец (гражданин КР)
+            "{{ПРОДАВЕЦ_ФИО}}":            data.get("seller_name", ""),
+            "{{ПРОДАВЕЦ_ПОЛНЫЕ_ДАННЫЕ}}":  data.get("seller_full_details", data.get("seller_name", "")),
+            "{{ПРОДАВЕЦ_ИНИЦИАЛЫ}}":       data.get("seller_initials", ""),
+
+            # Авто
+            "{{МАРКА_МОДЕЛЬ}}":            data.get("car_model", ""),
+            "{{VIN}}":                     data.get("car_vin", ""),
+            "{{ГОД_ВЫП}}":                data.get("car_year", ""),
+            "{{ЦВЕТ}}":                    data.get("car_color", ""),
+            "{{НОМ_ТПО}}":                data.get("tpo_number", ""),
+            "{{ДЕНЬ_ТПО}}":               data.get("tpo_day", ""),
+            "{{МЕС_ТПО}}":                data.get("tpo_month", ""),
+            "{{ГОД_ТПО}}":                data.get("tpo_year", ""),
+
+            # Цена
+            "{{ЦЕНА_ЦИФРАМИ}}":           price_fmt,
+            "{{ЦЕНА_ПРОПИСЬЮ}}":          data.get("car_price_words", ""),
+            "{{ВАЛЮТА}}":                 data.get("currency", "рублей"),
         }
-        for para in doc.paragraphs:
+
+        def replace_in_para(para):
+            full_text = para.text
+            new_text = full_text
             for ph, val in replacements.items():
-                if ph in para.text:
-                    for run in para.runs:
-                        run.text = run.text.replace(ph, val)
+                new_text = new_text.replace(ph, str(val))
+            if new_text != full_text and para.runs:
+                for run in para.runs:
+                    run.text = ""
+                para.runs[0].text = new_text
+
+        for para in doc.paragraphs:
+            replace_in_para(para)
         for table in doc.tables:
             for row in table.rows:
                 for cell in row.cells:
                     for para in cell.paragraphs:
-                        for ph, val in replacements.items():
-                            if ph in para.text:
-                                for run in para.runs:
-                                    run.text = run.text.replace(ph, val)
+                        replace_in_para(para)
+
         path = self.output_dir / f"{output_name}.docx"
         doc.save(str(path))
         return str(path)
