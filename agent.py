@@ -215,11 +215,17 @@ VIN: ...
     async def process_message(self, user_text: str, filepath: str = None, filename: str = None) -> dict:
         memory.add_to_history("user", user_text if not filepath else f"[файл: {filename}] {user_text}")
 
-        history  = memory.get_history(limit=15)
-        messages = []
+        history = memory.get_history(limit=15)
 
-        for h in history[:-1]:
-            messages.append({"role": h["role"], "content": h["content"]})
+        # Anthropic требует строгого чередования user/assistant.
+        # После краша в истории могут остаться два подряд user-сообщения — ошибка 400.
+        raw = [{"role": h["role"], "content": h["content"]} for h in history[:-1]]
+        messages = []
+        for msg in raw:
+            if messages and messages[-1]["role"] == msg["role"]:
+                messages[-1]["content"] += "\n" + msg["content"]
+            else:
+                messages.append(msg)
 
         if filepath:
             current_content = await self._build_file_message(filepath, filename, user_text)
@@ -228,24 +234,48 @@ VIN: ...
 
         messages.append({"role": "user", "content": current_content})
 
+        response = None
         for attempt in range(3):
             try:
                 response = await self.client.with_options(timeout=120.0).messages.create(
                     model=self.model,
-                    max_tokens=1024,
+                    max_tokens=4096,
                     system=self._build_system_prompt(),
                     tools=self._get_tools(),
                     messages=messages,
                 )
+                break
+            except anthropic.BadRequestError as e:
+                logger.warning(f"BadRequestError — очищаю историю и повторяю: {e}")
+                memory.clear_history()
+                memory.add_to_history("user", user_text)
+                messages = [{"role": "user", "content": current_content}]
+                try:
+                    response = await self.client.with_options(timeout=120.0).messages.create(
+                        model=self.model,
+                        max_tokens=4096,
+                        system=self._build_system_prompt(),
+                        tools=self._get_tools(),
+                        messages=messages,
+                    )
+                except Exception as e2:
+                    logger.error(f"Ошибка после очистки истории: {e2}")
+                    return {"text": f"❌ Ошибка API: {e2}", "files": [], "success": False}
                 break
             except (httpx.RemoteProtocolError, httpx.ReadTimeout, httpx.ConnectTimeout) as e:
                 logger.warning(f"Сетевая ошибка (попытка {attempt+1}/3): {e}")
                 if attempt == 2:
                     return {"text": "⚠️ Ошибка соединения с AI. Попробуйте ещё раз.", "files": [], "success": False}
                 await asyncio.sleep(2)
+            except Exception as e:
+                logger.error(f"Неожиданная ошибка Anthropic API: {e}", exc_info=True)
+                return {"text": f"❌ Ошибка: {e}", "files": [], "success": False}
+
+        if response is None:
+            return {"text": "⚠️ Не удалось получить ответ от AI.", "files": [], "success": False}
 
         result = await self._handle_response(response)
-        memory.add_to_history("assistant", result.get("text", ""))
+        memory.add_to_history("assistant", result.get("text", "✅"))
         return result
 
     def _get_tools(self) -> list:
