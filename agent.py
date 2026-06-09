@@ -349,12 +349,15 @@ VIN: ...
             commission_pct = float(tool_input.get("commission_pct", 1.0))
             deal_folder_id = await self.drive.get_or_create_deal_folder(number)
 
-            # ── 1. Строим все три документа параллельно ───────────────────
-            ag_path, dkp_path, invoice_path = await asyncio.gather(
-                self.builder.build_contract(tool_input["data"], number, date, commission_pct),
-                self.builder.build_dkp(tool_input["data"], number, date),
-                self.builder.build_invoice(tool_input["data"], number, date, commission_pct),
-            )
+            # ── 1. Строим документы ПОСЛЕДОВАТЕЛЬНО (не параллельно — меньше памяти) ──
+            logger.info("Строю АГ договор...")
+            ag_path = await self.builder.build_contract(tool_input["data"], number, date, commission_pct)
+
+            logger.info("Строю ДКП...")
+            dkp_path = await self.builder.build_dkp(tool_input["data"], number, date)
+
+            logger.info("Строю счёт...")
+            invoice_path = await self.builder.build_invoice(tool_input["data"], number, date, commission_pct)
 
             ag_docx  = f"АГ_Договор_{number}.docx"
             dkp_docx = f"ДКП_ТС_{number}.docx"
@@ -363,36 +366,35 @@ VIN: ...
             dkp_pdf  = f"ДКП_ТС_{number}.pdf"
             inv_pdf  = f"Счёт_{number}.pdf"
 
-            # ── 2. Загружаем docx/xlsx на Drive параллельно ───────────────
+            # ── 2. Загружаем docx/xlsx на Drive ───────────────────────────
+            logger.info("Загружаю на Drive...")
             await asyncio.gather(
                 self.drive.upload_file(ag_path,      ag_docx,  deal_folder_id),
                 self.drive.upload_file(dkp_path,     dkp_docx, deal_folder_id),
                 self.drive.upload_file(invoice_path, inv_xlsx,  deal_folder_id),
             )
 
-            # ── 3. Конвертируем в PDF параллельно (неблокирующий asyncio) ─
-            ag_pdf_path, dkp_pdf_path, inv_pdf_path = await asyncio.gather(
-                self.builder.convert_to_pdf(ag_path),
-                self.builder.convert_to_pdf(dkp_path),
-                self.builder.convert_to_pdf(invoice_path),
-            )
-
-            # ── 4. Загружаем PDF на Drive (если созданы) ──────────────────
+            # ── 3. PDF только если не отключён через SKIP_PDF=1 ───────────
+            skip_pdf = os.environ.get("SKIP_PDF", "0") == "1"
+            ag_pdf_path = dkp_pdf_path = inv_pdf_path = None
             ag_link = ""
-            upload_tasks = []
-            if ag_pdf_path:
-                upload_tasks.append(self.drive.upload_file(ag_pdf_path, ag_pdf, deal_folder_id))
-            if dkp_pdf_path:
-                upload_tasks.append(self.drive.upload_file(dkp_pdf_path, dkp_pdf, deal_folder_id))
-            if inv_pdf_path:
-                upload_tasks.append(self.drive.upload_file(inv_pdf_path, inv_pdf, deal_folder_id))
 
-            if upload_tasks:
-                upload_results = await asyncio.gather(*upload_tasks)
+            if not skip_pdf:
+                logger.info("Конвертирую в PDF...")
+                ag_pdf_path  = await self.builder.convert_to_pdf(ag_path)
+                dkp_pdf_path = await self.builder.convert_to_pdf(dkp_path)
+                inv_pdf_path = await self.builder.convert_to_pdf(invoice_path)
+
                 if ag_pdf_path:
-                    ag_link = upload_results[0]
+                    ag_link = await self.drive.upload_file(ag_pdf_path, ag_pdf, deal_folder_id)
+                if dkp_pdf_path:
+                    await self.drive.upload_file(dkp_pdf_path, dkp_pdf, deal_folder_id)
+                if inv_pdf_path:
+                    await self.drive.upload_file(inv_pdf_path, inv_pdf, deal_folder_id)
+            else:
+                logger.info("PDF пропущен (SKIP_PDF=1)")
 
-            # ── 5. Собираем файлы для отправки в Telegram ─────────────────
+            # ── 4. Собираем файлы для отправки в Telegram ─────────────────
             extra_files = []
             extra_names = []
 
@@ -410,7 +412,7 @@ VIN: ...
                 extra_files.append(inv_pdf_path);  extra_names.append(inv_pdf)
 
             total_files = 1 + len(extra_files)
-            pdf_note    = "" if ag_pdf_path else " (PDF недоступен — LibreOffice не установлен)"
+            pdf_note = " (PDF отключён)" if skip_pdf else ("" if ag_pdf_path else " (LibreOffice недоступен)")
 
             return {
                 "file":        ag_path,
@@ -431,10 +433,12 @@ VIN: ...
 
             await self.drive.upload_file(invoice_path, inv_xlsx, deal_folder_id)
 
-            inv_pdf_path = await self.builder.convert_to_pdf(invoice_path)
+            skip_pdf = os.environ.get("SKIP_PDF", "0") == "1"
             link = ""
-            if inv_pdf_path:
-                link = await self.drive.upload_file(inv_pdf_path, f"Счёт_{number}.pdf", deal_folder_id)
+            if not skip_pdf:
+                inv_pdf_path = await self.builder.convert_to_pdf(invoice_path)
+                if inv_pdf_path:
+                    link = await self.drive.upload_file(inv_pdf_path, f"Счёт_{number}.pdf", deal_folder_id)
 
             return {
                 "file":       invoice_path,
