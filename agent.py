@@ -458,7 +458,7 @@ VIN: ...
             date   = datetime.now().strftime("%d.%m.%Y")
             deal_folder_id = await self.drive.get_or_create_deal_folder(number)
 
-            invoice_path = await self.builder.build_invoice(tool_input["data"], number, date)
+            invoice_path = await self.builder.build_invoice(tool_input.get("data", {}), number, date)
             inv_xlsx     = f"Счёт_{number}.xlsx"
 
             await self.drive.upload_file(invoice_path, inv_xlsx, deal_folder_id)
