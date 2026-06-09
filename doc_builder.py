@@ -1,4 +1,6 @@
 import os
+import asyncio
+import logging
 import subprocess
 import tempfile
 from pathlib import Path
@@ -10,8 +12,11 @@ from docx.enum.table import WD_TABLE_ALIGNMENT
 import openpyxl
 from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
 
+logger = logging.getLogger(__name__)
+
 
 class DocumentBuilder:
+
     def __init__(self):
         self.templates_dir = Path(os.environ.get("TEMPLATES_DIR", "./templates"))
         self.output_dir = Path(tempfile.gettempdir()) / "tg_agent_docs"
@@ -39,7 +44,7 @@ class DocumentBuilder:
         s.alignment = WD_ALIGN_PARAGRAPH.CENTER
         s.add_run("на осуществление платежа в пользу третьего лица")
 
-        doc.add_paragraph(f"г. Бишкек  «{date[:2]}» {self._month_name(date[3:5])} {date[6:]} г.")
+        doc.add_paragraph(f"г. Бишкек «{date[:2]}» {self._month_name(date[3:5])} {date[6:]} г.")
         doc.add_paragraph()
 
         buyer = data.get("buyer_name", data.get("company_name", "____________"))
@@ -77,7 +82,6 @@ class DocumentBuilder:
             h.add_run(title).bold = True
             for item in items:
                 doc.add_paragraph(item)
-
         doc.add_paragraph()
         self._add_signature_table(doc)
 
@@ -102,7 +106,7 @@ class DocumentBuilder:
         r = t.add_run(f"ДОГОВОР КУПЛИ-ПРОДАЖИ ТРАНСПОРТНОГО СРЕДСТВА № {number}")
         r.bold = True; r.font.size = Pt(13)
 
-        doc.add_paragraph(f"«{date[:2]}» {self._month_name(date[3:5])} {date[6:]} г.  г. Бишкек")
+        doc.add_paragraph(f"«{date[:2]}» {self._month_name(date[3:5])} {date[6:]} г. г. Бишкек")
         doc.add_paragraph()
 
         seller   = data.get("seller_name", "____________")
@@ -135,9 +139,9 @@ class DocumentBuilder:
             f"5. Право собственности переходит к Покупателю с момента подписания Договора.",
             f"6. Договор составлен в трёх экземплярах.",
         ]
+
         for item in items:
             doc.add_paragraph(item)
-
         doc.add_paragraph()
         self._add_signature_table(doc)
 
@@ -166,38 +170,37 @@ class DocumentBuilder:
         ws.column_dimensions["F"].width = 16
 
         # ── Стили ─────────────────────────────────────────────────────────
-        bold        = Font(bold=True, size=10)
-        bold_lg     = Font(bold=True, size=12)
-        normal      = Font(size=10)
-        small       = Font(size=8)
-        center      = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        left        = Alignment(horizontal="left",   vertical="center", wrap_text=True)
-        left_top    = Alignment(horizontal="left",   vertical="top",    wrap_text=True)
-        right       = Alignment(horizontal="right",  vertical="center", wrap_text=True)
+        bold      = Font(bold=True, size=10)
+        bold_lg   = Font(bold=True, size=12)
+        normal    = Font(size=10)
+        small     = Font(size=8)
+        center    = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        left      = Alignment(horizontal="left",   vertical="center", wrap_text=True)
+        left_top  = Alignment(horizontal="left",   vertical="top",    wrap_text=True)
+        right     = Alignment(horizontal="right",  vertical="center", wrap_text=True)
         thin        = Side(style="thin")
         medium_side = Side(style="medium")
-        brd         = Border(left=thin, right=thin, top=thin, bottom=thin)
-        brd_med     = Border(left=medium_side, right=medium_side,
-                             top=medium_side,  bottom=medium_side)
-        fill_hdr    = PatternFill("solid", fgColor="DCE6F1")
-        fill_gray   = PatternFill("solid", fgColor="F2F2F2")
+        brd     = Border(left=thin, right=thin, top=thin, bottom=thin)
+        brd_med = Border(left=medium_side, right=medium_side,
+                         top=medium_side, bottom=medium_side)
+        fill_hdr  = PatternFill("solid", fgColor="DCE6F1")
 
         def cell(row, col, value="", font=None, align=None, border=None, fill=None, num_fmt=None):
             c = ws.cell(row=row, column=col, value=value)
-            if font:   c.font   = font
-            if align:  c.alignment = align
-            if border: c.border = border
-            if fill:   c.fill   = fill
+            if font:    c.font      = font
+            if align:   c.alignment = align
+            if border:  c.border    = border
+            if fill:    c.fill      = fill
             if num_fmt: c.number_format = num_fmt
             return c
 
         def merge(r1, c1, r2, c2, value="", font=None, align=None, border=None, fill=None):
             ws.merge_cells(start_row=r1, start_column=c1, end_row=r2, end_column=c2)
             c = ws.cell(row=r1, column=c1, value=value)
-            if font:   c.font   = font
+            if font:   c.font      = font
             if align:  c.alignment = align
-            if border: c.border = border
-            if fill:   c.fill   = fill
+            if border: c.border    = border
+            if fill:   c.fill      = fill
             return c
 
         # ── Данные ────────────────────────────────────────────────────────
@@ -207,20 +210,18 @@ class DocumentBuilder:
         except Exception:
             price_val = 0.0
 
-        commission  = round(price_val * commission_pct / 100, 2)
-        total       = round(price_val + commission, 2)
-        currency    = data.get("currency", "RUB")
-        buyer       = data.get("buyer_name", data.get("company_name", ""))
-        car         = (f"{data.get('car_model', '')} год выпуска {data.get('car_year', '')} "
-                       f"VIN {data.get('car_vin', '')}").strip()
+        commission = round(price_val * commission_pct / 100, 2)
+        total      = round(price_val + commission, 2)
+        currency   = data.get("currency", "RUB")
+        buyer      = data.get("buyer_name", data.get("company_name", ""))
+        car        = (f"{data.get('car_model', '')} год выпуска {data.get('car_year', '')} "
+                      f"VIN {data.get('car_vin', '')}").strip()
 
-        # Дата прописью для заголовка: "02 июня 2026"
         day_n  = date[0:2]
         mon_n  = date[3:5]
         year_n = date[6:10]
         date_str = f"{day_n} {self._month_name(mon_n)} {year_n}"
 
-        # Банковские реквизиты из data
         corr_name = data.get("bank_corr_line1", "")
         corr_bik  = data.get("bank_corr_line2", "")
         corr_acc  = data.get("bank_corr_line3", "")
@@ -229,20 +230,21 @@ class DocumentBuilder:
         acc_num   = data.get("account_number", "")
         acc_cur   = data.get("account_currency", currency)
 
-        # ══ БЛОК 1: БАНКОВСКИЕ РЕКВИЗИТЫ (строки 1–9) ════════════════════
+        # ══ БЛОК 1: БАНКОВСКИЕ РЕКВИЗИТЫ (строки 1–10) ═══════════════════
         r = 1
-        # Банк-корреспондент
         merge(r, 1, r, 4, corr_name, font=normal, align=left)
         ws.row_dimensions[r].height = 15; r += 1
+
         merge(r, 1, r, 3, "БИК", font=small, align=left)
         cell(r, 4, corr_bik, font=normal, align=left)
         ws.row_dimensions[r].height = 14; r += 1
+
         merge(r, 1, r, 4, "Банк-корреспондент", font=small, align=left)
         ws.row_dimensions[r].height = 13; r += 1
 
-        # Банк получателя
         merge(r, 1, r, 4, ben_name, font=normal, align=left)
         ws.row_dimensions[r].height = 15; r += 1
+
         merge(r, 1, r, 3, "БИК", font=small, align=left)
         cell(r, 4, ben_bik, font=normal, align=left)
         ws.row_dimensions[r].height = 14; r += 1
@@ -254,8 +256,7 @@ class DocumentBuilder:
         merge(r, 1, r, 4, "Банк получателя", font=small, align=left)
         ws.row_dimensions[r].height = 13; r += 1
 
-        # Получатель — Авто Континент
-        merge(r, 1, r, 2, f"ИНН  01905202610324", font=normal, align=left)
+        merge(r, 1, r, 2, f"ИНН 01905202610324", font=normal, align=left)
         merge(r, 3, r, 3, "Сч. №", font=small, align=right)
         cell(r, 4, acc_num, font=normal, align=left)
         ws.row_dimensions[r].height = 15; r += 1
@@ -266,8 +267,7 @@ class DocumentBuilder:
         merge(r, 1, r, 4, "Получатель", font=small, align=left)
         ws.row_dimensions[r].height = 13; r += 1
 
-        # Разделитель
-        ws.row_dimensions[r].height = 4; r += 1
+        ws.row_dimensions[r].height = 4; r += 1  # разделитель
 
         # ══ БЛОК 2: ЗАГОЛОВОК ════════════════════════════════════════════
         merge(r, 1, r, 6,
@@ -287,25 +287,19 @@ class DocumentBuilder:
         merge(r, 3, r, 6, buyer, font=normal, align=left_top, border=brd)
         ws.row_dimensions[r].height = 22; r += 1
 
-        # Разделитель
-        ws.row_dimensions[r].height = 4; r += 1
+        ws.row_dimensions[r].height = 4; r += 1  # разделитель
 
         # ══ БЛОК 4: ТАБЛИЦА ══════════════════════════════════════════════
-        # Заголовки
         hrow = r
-        for col, (txt, w) in enumerate([
-            ("№", 4), ("Товары (работы, услуги)", 48),
-            ("Кол-во", 8), ("Ед.", 6), ("Цена", 16), ("Сумма", 16)
-        ], 1):
+        for col, txt in enumerate(["№", "Товары (работы, услуги)", "Кол-во", "Ед.", "Цена", "Сумма"], 1):
             c = ws.cell(row=hrow, column=col, value=txt)
             c.font = bold; c.alignment = center
             c.border = brd; c.fill = fill_hdr
         ws.row_dimensions[hrow].height = 30; r += 1
 
-        # Строка 1: оплата за авто
+        num_fmt = '#,##0.00'
         item_desc = (f"Оплата по Агентскому договору {number} от {date_str} г. "
                      f"на оплату автомобиля {car}")
-        num_fmt = '#,##0.00'
         for col, val in enumerate([1, item_desc, 1, "шт", price_val, price_val], 1):
             c = ws.cell(row=r, column=col, value=val)
             c.border = brd
@@ -314,7 +308,6 @@ class DocumentBuilder:
             if col in (5, 6): c.number_format = num_fmt
         ws.row_dimensions[r].height = 45; r += 1
 
-        # Строка 2: комиссия
         for col, val in enumerate([2, f"Комиссия по Агентскому договору {number} от {date_str} г.",
                                     1, "шт", commission, commission], 1):
             c = ws.cell(row=r, column=col, value=val)
@@ -326,25 +319,26 @@ class DocumentBuilder:
 
         # ══ БЛОК 5: ИТОГИ ════════════════════════════════════════════════
         for label, value, is_total in [
-            ("Итого:",           total,  False),
-            ("В том числе НДС:", "-",    False),
-            ("Всего к оплате:",  total,  True),
+            ("Итого:",          total, False),
+            ("В том числе НДС:", "-",  False),
+            ("Всего к оплате:", total, True),
         ]:
             merge(r, 1, r, 5, label,
                   font=bold if is_total else normal, align=right,
                   border=Border(right=thin, bottom=thin))
             c = ws.cell(row=r, column=6, value=value)
-            c.font = bold if is_total else normal
+            c.font      = bold if is_total else normal
             c.alignment = center
-            c.border = brd
+            c.border    = brd
             if isinstance(value, float): c.number_format = num_fmt
             ws.row_dimensions[r].height = 18; r += 1
 
         # ══ БЛОК 6: ИТОГОВАЯ СТРОКА ══════════════════════════════════════
-        ws.row_dimensions[r].height = 5; r += 1  # отступ
+        ws.row_dimensions[r].height = 5; r += 1
 
-        total_fmt = f"{total:,.2f}".replace(",", " ")
+        total_fmt   = f"{total:,.2f}".replace(",", " ")
         price_words = data.get("car_price_words", "")
+
         merge(r, 1, r, 6,
               f"Всего наименований 2, на сумму {total_fmt} {acc_cur}",
               font=bold, align=left)
@@ -353,12 +347,11 @@ class DocumentBuilder:
         merge(r, 1, r, 6, price_words, font=normal, align=left)
         ws.row_dimensions[r].height = 18; r += 1
 
-        ws.row_dimensions[r].height = 8; r += 1  # отступ
+        ws.row_dimensions[r].height = 8; r += 1
 
         # ══ БЛОК 7: ПОДПИСИ ══════════════════════════════════════════════
-        # Руководитель
         cell(r, 1, "Руководитель", font=normal, align=left)
-        merge(r, 2, r, 3, "", border=Border(bottom=thin))   # место подписи
+        merge(r, 2, r, 3, "", border=Border(bottom=thin))
         merge(r, 4, r, 6, "Колотовкин Илья Валерьевич", font=normal, align=center)
         ws.row_dimensions[r].height = 22; r += 1
 
@@ -366,9 +359,8 @@ class DocumentBuilder:
         merge(r, 4, r, 6, "расшифровка подписи", font=small, align=center)
         ws.row_dimensions[r].height = 12; r += 1
 
-        ws.row_dimensions[r].height = 10; r += 1  # отступ
+        ws.row_dimensions[r].height = 10; r += 1
 
-        # Бухгалтер
         cell(r, 1, "Бухгалтер", font=normal, align=left)
         merge(r, 2, r, 3, "", border=Border(bottom=thin))
         merge(r, 4, r, 6, "", border=Border(bottom=thin))
@@ -385,11 +377,11 @@ class DocumentBuilder:
         # ── Параметры страницы ────────────────────────────────────────────
         ws.page_setup.orientation = "portrait"
         ws.page_setup.paperSize   = ws.PAPERSIZE_A4
-        ws.page_margins.left      = 0.5
-        ws.page_margins.right     = 0.3
-        ws.page_margins.top       = 0.5
-        ws.page_margins.bottom    = 0.5
-        ws.print_area             = f"A1:F{r}"
+        ws.page_margins.left   = 0.5
+        ws.page_margins.right  = 0.3
+        ws.page_margins.top    = 0.5
+        ws.page_margins.bottom = 0.5
+        ws.print_area = f"A1:F{r}"
 
         path = self.output_dir / f"Счёт_{number}.xlsx"
         wb.save(str(path))
@@ -400,24 +392,39 @@ class DocumentBuilder:
     async def convert_to_pdf(self, filepath: str) -> str | None:
         """
         Конвертирует файл в PDF через LibreOffice.
-        Возвращает путь к PDF или None если LibreOffice недоступен.
-        FIX: раньше возвращал исходный путь при неудаче — agent.py
-        думал что PDF создан и пытался загрузить docx как PDF.
+        ИСПРАВЛЕНО: asyncio.create_subprocess_exec вместо subprocess.run —
+        не блокирует event loop Telegram-бота.
+        Возвращает путь к PDF или None если LibreOffice недоступен / ошибка.
         """
         try:
-            result = subprocess.run(
-                ["libreoffice", "--headless", "--convert-to", "pdf",
-                 "--outdir", str(self.output_dir), filepath],
-                capture_output=True, timeout=60
+            proc = await asyncio.create_subprocess_exec(
+                "libreoffice", "--headless", "--convert-to", "pdf",
+                "--outdir", str(self.output_dir), filepath,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
+            try:
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+                if stderr:
+                    logger.debug(f"LibreOffice stderr: {stderr.decode(errors='ignore')}")
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.communicate()
+                logger.warning("LibreOffice: таймаут конвертации (> 60 сек)")
+                return None
+
             pdf_path = str(filepath).rsplit(".", 1)[0] + ".pdf"
             if Path(pdf_path).exists() and Path(pdf_path).stat().st_size > 0:
                 return pdf_path
+
+            logger.warning(f"LibreOffice: PDF не создан для {filepath}")
+            return None
+
         except FileNotFoundError:
             logger.warning("LibreOffice не установлен — PDF конвертация недоступна")
         except Exception as e:
             logger.error(f"Ошибка конвертации PDF: {e}")
-        return None  # FIX: None вместо исходного пути — вызывающий код должен проверять
+        return None
 
     # ─── ВСПОМОГАТЕЛЬНЫЕ ─────────────────────────────────────────────────
 
@@ -441,10 +448,10 @@ class DocumentBuilder:
 
     def _month_name(self, month_num: str) -> str:
         months = {
-            "01": "января", "02": "февраля", "03": "марта",
-            "04": "апреля", "05": "мая", "06": "июня",
-            "07": "июля", "08": "августа", "09": "сентября",
-            "10": "октября", "11": "ноября", "12": "декабря"
+            "01": "января",  "02": "февраля", "03": "марта",
+            "04": "апреля",  "05": "мая",     "06": "июня",
+            "07": "июля",    "08": "августа", "09": "сентября",
+            "10": "октября", "11": "ноября",  "12": "декабря",
         }
         return months.get(month_num, month_num)
 
@@ -467,8 +474,6 @@ class DocumentBuilder:
             price_fmt = price_str
             price_val = 0
 
-        # FIX: {{СУММА_НАЛИЧНЫМИ}} должна брать cash_amount (доллары для поручения),
-        # а не car_price (рубли для ДКП). Раньше cash_fmt = f"{price_val:,.0f}" — НЕВЕРНО.
         cash_amount_raw = str(data.get("cash_amount", ""))
         try:
             cash_fmt = f"{float(cash_amount_raw.replace(' ', '')):,.0f}".replace(",", " ")
@@ -476,11 +481,11 @@ class DocumentBuilder:
             cash_fmt = cash_amount_raw
 
         replacements = {
-            "{{НОМЕР}}":                    number,
-            "{{ДЕНЬ}}":                     day,
-            "{{МЕСЯЦ}}":                    self._month_name(month),
-            "{{ГОД}}":                      year,
-            "{{КОМИССИЯ}}":                 str(commission_pct),
+            "{{НОМЕР}}":   number,
+            "{{ДЕНЬ}}":    day,
+            "{{МЕСЯЦ}}":   self._month_name(month),
+            "{{ГОД}}":     year,
+            "{{КОМИССИЯ}}": str(commission_pct),
 
             # Покупатель (гражданин РФ)
             "{{ПОКУПАТЕЛЬ_ФИО}}":           data.get("buyer_name", ""),
@@ -490,81 +495,62 @@ class DocumentBuilder:
             "{{ПОКУПАТЕЛЬ_ПОЛНЫЕ_ДАННЫЕ}}": data.get("buyer_full_details", data.get("buyer_name", "")),
 
             # Паспорт покупателя (РФ)
-            "{{ПАСПОРТ_СЕРИЯ}}":            data.get("passport_series", ""),
-            "{{ПАСПОРТ_НОМЕР}}":            data.get("passport_number", ""),
-            "{{ПАСПОРТ_ВЫДАН}}":            data.get("passport_issued_by", ""),
-            "{{ПАСПОРТ_КОД}}":              data.get("passport_code", ""),
-            "{{ПАСПОРТ_ДАТА_ВЫДАЧИ}}":      data.get("passport_issued_date", ""),
+            "{{ПАСПОРТ_СЕРИЯ}}":       data.get("passport_series", ""),
+            "{{ПАСПОРТ_НОМЕР}}":       data.get("passport_number", ""),
+            "{{ПАСПОРТ_ВЫДАН}}":       data.get("passport_issued_by", ""),
+            "{{ПАСПОРТ_КОД}}":         data.get("passport_code", ""),
+            "{{ПАСПОРТ_ДАТА_ВЫДАЧИ}}": data.get("passport_issued_date", ""),
 
             # Продавец (гражданин КР)
-            "{{ПРОДАВЕЦ_ФИО}}":             data.get("seller_name", ""),
-            "{{ПРОДАВЕЦ_ДАТА_РОЖДЕНИЯ}}":   data.get("seller_birth_date", ""),
-            "{{ПРОДАВЕЦ_АДРЕС}}":           data.get("seller_address", ""),
-            "{{ПРОДАВЕЦ_ИНИЦИАЛЫ}}":        data.get("seller_initials", ""),
-            "{{ПРОДАВЕЦ_ПОЛНЫЕ_ДАННЫЕ}}":   data.get("seller_full_details", data.get("seller_name", "")),
+            "{{ПРОДАВЕЦ_ФИО}}":           data.get("seller_name", ""),
+            "{{ПРОДАВЕЦ_ДАТА_РОЖДЕНИЯ}}": data.get("seller_birth_date", ""),
+            "{{ПРОДАВЕЦ_АДРЕС}}":         data.get("seller_address", ""),
+            "{{ПРОДАВЕЦ_ИНИЦИАЛЫ}}":      data.get("seller_initials", ""),
+            "{{ПРОДАВЕЦ_ПОЛНЫЕ_ДАННЫЕ}}": data.get("seller_full_details", data.get("seller_name", "")),
 
             # Идентификационная карта продавца (КР)
-            # FIX: был data.get("seller_id") — но ключ в data всегда seller_id_number
-            "{{ПРОДАВЕЦ_ID}}":              data.get("seller_id_number", data.get("seller_id", "")),
-            "{{ПРОДАВЕЦ_ID_НОМЕР}}":        data.get("seller_id_number", data.get("seller_id", "")),
-            "{{ПРОДАВЕЦ_ID_ВЫДАНА}}":       data.get("seller_id_issued_by", ""),
-            "{{ПРОДАВЕЦ_ID_ДАТА}}":         data.get("seller_id_issued_date", ""),
+            "{{ПРОДАВЕЦ_ID}}":        data.get("seller_id_number", data.get("seller_id", "")),
+            "{{ПРОДАВЕЦ_ID_НОМЕР}}":  data.get("seller_id_number", data.get("seller_id", "")),
+            "{{ПРОДАВЕЦ_ID_ВЫДАНА}}": data.get("seller_id_issued_by", ""),
+            "{{ПРОДАВЕЦ_ID_ДАТА}}":   data.get("seller_id_issued_date", ""),
 
             # Авто
-            "{{МАРКА_МОДЕЛЬ}}":             data.get("car_model", ""),
-            "{{VIN}}":                      data.get("car_vin", ""),
-            "{{ГОД_ВЫП}}":                 data.get("car_year", ""),
-            "{{ЦВЕТ}}":                     data.get("car_color", ""),
-            "{{НОМ_КУЗОВА}}":              data.get("car_body_number", data.get("car_vin", "")),
-            "{{НОМ_ТПО}}":                 data.get("tpo_number", ""),
-            "{{ДЕНЬ_ТПО}}":                data.get("tpo_day", ""),
-            "{{МЕС_ТПО}}":                 data.get("tpo_month", ""),
-            "{{ГОД_ТПО}}":                 data.get("tpo_year", ""),
+            "{{МАРКА_МОДЕЛЬ}}": data.get("car_model", ""),
+            "{{VIN}}":          data.get("car_vin", ""),
+            "{{ГОД_ВЫП}}":      data.get("car_year", ""),
+            "{{ЦВЕТ}}":         data.get("car_color", ""),
+            "{{НОМ_КУЗОВА}}":   data.get("car_body_number", data.get("car_vin", "")),
+            "{{НОМ_ТПО}}":      data.get("tpo_number", ""),
+            "{{ДЕНЬ_ТПО}}":     data.get("tpo_day", ""),
+            "{{МЕС_ТПО}}":      data.get("tpo_month", ""),
+            "{{ГОД_ТПО}}":      data.get("tpo_year", ""),
 
             # Цена и оплата
             "{{ЦЕНА_ЦИФРАМИ}}":            price_fmt,
             "{{ЦЕНА_ПРОПИСЬЮ}}":           data.get("car_price_words", ""),
             "{{ВАЛЮТА}}":                  data.get("currency", "рублей"),
-            "{{СУММА_НАЛИЧНЫМИ}}":         cash_fmt,                              # FIX: теперь cash_amount
-            # FIX: был {{СУММА_ПРОПИСЬЮ}} — не совпадало с плейсхолдером в шаблоне
+            "{{СУММА_НАЛИЧНЫМИ}}":         cash_fmt,
             "{{СУММА_НАЛИЧНЫМИ_ПРОПИСЬЮ}}": data.get("cash_amount_words", ""),
             "{{ВАЛЮТА_НАЛИЧНЫМИ}}":        data.get("cash_currency", data.get("currency", "рублей")),
 
             # Банковские реквизиты
-            "{{БАНК_КОРР_СТРОКА1}}":       data.get("bank_corr_line1", ""),
-            "{{БАНК_КОРР_СТРОКА2}}":       data.get("bank_corr_line2", ""),
-            "{{БАНК_КОРР_СТРОКА3}}":       data.get("bank_corr_line3", ""),
-            "{{БАНК_ПОЛ_СТРОКА1}}":        data.get("bank_ben_line1", ""),
-            "{{БАНК_ПОЛ_СТРОКА2}}":        data.get("bank_ben_line2", ""),
-            "{{СЧЕТ_ВАЛЮТА}}":             data.get("account_currency", ""),
-            "{{СЧЕТ_НОМЕР}}":              data.get("account_number", ""),
+            "{{БАНК_КОРР_СТРОКА1}}": data.get("bank_corr_line1", ""),
+            "{{БАНК_КОРР_СТРОКА2}}": data.get("bank_corr_line2", ""),
+            "{{БАНК_КОРР_СТРОКА3}}": data.get("bank_corr_line3", ""),
+            "{{БАНК_ПОЛ_СТРОКА1}}":  data.get("bank_ben_line1", ""),
+            "{{БАНК_ПОЛ_СТРОКА2}}":  data.get("bank_ben_line2", ""),
+            "{{СЧЕТ_ВАЛЮТА}}":       data.get("account_currency", ""),
+            "{{СЧЕТ_НОМЕР}}":        data.get("account_number", ""),
         }
 
         W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 
         def replace_in_para(para):
-            """
-            FIX: Заменяем плейсхолдеры через XML напрямую.
-
-            Проблема старого кода: _apply_replacements_to_para() запускалась первой
-            и меняла runs[0].text. После этого _process_paragraph_xml() не находила
-            плейсхолдеров (они уже заменены) и ничего не делала — XML-метод был мёртвым.
-            Но если _apply_replacements_to_para() не срабатывала (Word дробил {{НОМЕР}}
-            на несколько runs с разным форматированием), текст вообще не заменялся.
-
-            Решение: только XML-метод. Он:
-            1. Собирает полный текст из ВСЕХ w:r → w:t элементов
-            2. Выполняет замену
-            3. Удаляет все старые runs
-            4. Вставляет один новый run с нужным текстом НА МЕСТО первого удалённого
-               (не в конец параграфа через SubElement!)
-            """
             p_elem = para._element
-            runs = p_elem.findall(f"{{{W}}}r")
+            runs   = p_elem.findall(f"{{{W}}}r")
             if not runs:
                 return
 
-            # Полный текст параграфа (объединяем все w:t внутри w:r)
             full_text = "".join(
                 t.text or ""
                 for r in runs
@@ -573,21 +559,17 @@ class DocumentBuilder:
             if not any(ph in full_text for ph in replacements):
                 return
 
-            # Запоминаем форматирование и позицию первого run
-            first_rpr = runs[0].find(f"{{{W}}}rPr")
-            children = list(p_elem)
+            first_rpr  = runs[0].find(f"{{{W}}}rPr")
+            children   = list(p_elem)
             insert_idx = children.index(runs[0])
 
-            # Выполняем замену
             new_text = full_text
             for ph, val in replacements.items():
                 new_text = new_text.replace(ph, str(val) if val is not None else "")
 
-            # Удаляем все старые runs
             for r in runs:
                 p_elem.remove(r)
 
-            # Создаём новый run
             new_run = etree.Element(f"{{{W}}}r")
             if first_rpr is not None:
                 new_run.append(deepcopy(first_rpr))
@@ -596,21 +578,17 @@ class DocumentBuilder:
             if new_text and (new_text[0] == " " or new_text[-1] == " "):
                 new_t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
 
-            # FIX: вставляем на место первого удалённого run, а не в конец (SubElement)
             p_elem.insert(insert_idx, new_run)
 
-        # Основной текст документа
         for para in doc.paragraphs:
             replace_in_para(para)
 
-        # Таблицы
         for table in doc.tables:
             for row in table.rows:
                 for cell in row.cells:
                     for para in cell.paragraphs:
                         replace_in_para(para)
 
-        # Колонтитулы
         for section in doc.sections:
             for para in section.header.paragraphs:
                 replace_in_para(para)

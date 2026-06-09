@@ -2,25 +2,29 @@ import os
 import base64
 import json
 import re
+import asyncio
 import tempfile
 from pathlib import Path
 from datetime import datetime
 import logging
 import httpx
-import asyncio
+
 import anthropic
+
 logger = logging.getLogger(__name__)
+
 import memory
 from drive_service import GoogleDriveService
 from doc_builder import DocumentBuilder
 
 
 class DocumentAgent:
+
     def __init__(self):
-        self.client = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-        self.drive = GoogleDriveService()
+        self.client  = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+        self.drive   = GoogleDriveService()
         self.builder = DocumentBuilder()
-        self.model = "claude-haiku-4-5-20251001"
+        self.model   = "claude-haiku-4-5-20251001"
         memory.init_db()
 
     def _build_system_prompt(self) -> str:
@@ -28,61 +32,63 @@ class DocumentAgent:
 Компания занимается продажей автомобилей из Китая, выступает платёжным агентом между покупателями из России и местными продавцами.
 
 У тебя есть РЕАЛЬНЫЕ ИНСТРУМЕНТЫ которые ты ОБЯЗАН использовать:
+
 - create_contract — создать договор купли-продажи и сохранить на Google Drive
-- create_invoice — создать счёт на оплату и сохранить на Google Drive
-- save_company — сохранить реквизиты компании/клиента в постоянную память
+- create_invoice  — создать счёт на оплату и сохранить на Google Drive
+- save_company    — сохранить реквизиты компании/клиента в постоянную память
 - save_instruction — сохранить инструкцию для себя
 
 ВАЖНО: Когда пользователь просит создать договор или счёт — ВСЕГДА вызывай соответствующий инструмент.
 
 === ОБЯЗАТЕЛЬНЫЕ КЛЮЧИ В ПОЛЕ data ===
+
 При вызове create_contract ты ОБЯЗАН передать data со СТРОГО ЭТИМИ ключами (используй только эти, никакие другие):
 
 ПОКУПАТЕЛЬ (гражданин РФ):
-  buyer_name              — ФИО полностью
-  buyer_birth_date        — дата рождения (ДД.ММ.ГГГГ)
-  buyer_address           — адрес регистрации
-  buyer_initials          — инициалы (Иванов И.И.)
-  passport_series         — серия паспорта
-  passport_number         — номер паспорта
-  passport_issued_by      — кем выдан
-  passport_issued_date    — дата выдачи (ДД.ММ.ГГГГ)
-  passport_code           — код подразделения
+buyer_name           — ФИО полностью
+buyer_birth_date     — дата рождения (ДД.ММ.ГГГГ)
+buyer_address        — адрес регистрации
+buyer_initials       — инициалы (Иванов И.И.)
+passport_series      — серия паспорта
+passport_number      — номер паспорта
+passport_issued_by   — кем выдан
+passport_issued_date — дата выдачи (ДД.ММ.ГГГГ)
+passport_code        — код подразделения
 
 ПРОДАВЕЦ (гражданин КР):
-  seller_name             — ФИО полностью
-  seller_birth_date       — дата рождения (ДД.ММ.ГГГГ)
-  seller_address          — адрес регистрации
-  seller_initials         — инициалы (Иванов И.И.)
-  seller_id_number        — номер идентификационной карты
-  seller_id_issued_by     — кем выдана карта
-  seller_id_issued_date   — дата выдачи карты (ДД.ММ.ГГГГ)
+seller_name          — ФИО полностью
+seller_birth_date    — дата рождения (ДД.ММ.ГГГГ)
+seller_address       — адрес регистрации
+seller_initials      — инициалы (Иванов И.И.)
+seller_id_number     — номер идентификационной карты
+seller_id_issued_by  — кем выдана карта
+seller_id_issued_date — дата выдачи карты (ДД.ММ.ГГГГ)
 
 АВТОМОБИЛЬ:
-  car_model               — марка и модель (Toyota RAV4)
-  car_vin                 — VIN номер
-  car_year                — год выпуска
-  car_color               — цвет
-  car_body_number         — номер кузова (если есть, иначе VIN)
-  tpo_number              — номер ТПО
-  tpo_day                 — день выдачи ТПО
-  tpo_month               — месяц выдачи ТПО (прописью: января, февраля...)
-  tpo_year                — год выдачи ТПО
+car_model       — марка и модель (Toyota RAV4)
+car_vin         — VIN номер
+car_year        — год выпуска
+car_color       — цвет
+car_body_number — номер кузова (если есть, иначе VIN)
+tpo_number      — номер ТПО
+tpo_day         — день выдачи ТПО
+tpo_month       — месяц выдачи ТПО (прописью: января, февраля...)
+tpo_year        — год выдачи ТПО
 
 ФИНАНСЫ — ВАЖНО: это ДВЕ РАЗНЫЕ СУММЫ:
-  car_price               — цена автомобиля в ДКП цифрами (например: 4200000). Валюта — рубли.
-  car_price_words         — цена ДКП прописью (Четыре миллиона двести тысяч рублей)
-  currency                — валюта ДКП (рублей)
-  cash_amount             — сумма наличных в Поручении цифрами (например: 54900). Это ДРУГАЯ сумма — в долларах!
-  cash_amount_words       — сумма наличных прописью БЕЗ валюты (Пятьдесят четыре тысячи девятьсот)
-  cash_currency           — валюта наличных (долларов / сом)
-  account_currency        — валюта счёта для банковского перевода
-  account_number          — номер счёта
-  bank_corr_line1         — реквизиты банка-корреспондента строка 1
-  bank_corr_line2         — реквизиты банка-корреспондента строка 2
-  bank_corr_line3         — реквизиты банка-корреспондента строка 3
-  bank_ben_line1          — реквизиты банка получателя строка 1
-  bank_ben_line2          — реквизиты банка получателя строка 2
+car_price        — цена автомобиля в ДКП цифрами (например: 4200000). Валюта — рубли.
+car_price_words  — цена ДКП прописью (Четыре миллиона двести тысяч рублей)
+currency         — валюта ДКП (рублей)
+cash_amount      — сумма наличных в Поручении цифрами (например: 54900). Это ДРУГАЯ сумма — в долларах!
+cash_amount_words — сумма наличных прописью БЕЗ валюты (Пятьдесят четыре тысячи девятьсот)
+cash_currency    — валюта наличных (долларов / сом)
+account_currency — валюта счёта для банковского перевода
+account_number   — номер счёта
+bank_corr_line1  — реквизиты банка-корреспондента строка 1
+bank_corr_line2  — реквизиты банка-корреспондента строка 2
+bank_corr_line3  — реквизиты банка-корреспондента строка 3
+bank_ben_line1   — реквизиты банка получателя строка 1
+bank_ben_line2   — реквизиты банка получателя строка 2
 
 === ОБЯЗАТЕЛЬНАЯ ПРОВЕРКА ПЕРЕД ВЫЗОВОМ create_contract ===
 
@@ -90,44 +96,46 @@ class DocumentAgent:
 Если хотя бы одно обязательное поле пустое — НЕ создавай договор, а спроси все недостающие данные ОДНИМ сообщением.
 
 ОБЯЗАТЕЛЬНЫЕ поля (без них договор создавать НЕЛЬЗЯ):
-  Покупатель: buyer_name, buyer_initials, buyer_birth_date, buyer_address, passport_series, passport_number, passport_issued_by, passport_issued_date, passport_code
-  Продавец: seller_name, seller_initials, seller_id_issued_date, seller_birth_date, seller_address, seller_id_number, seller_id_issued_by
-  Автомобиль: car_model, car_vin, car_year, car_color, tpo_number, tpo_day, tpo_month, tpo_year,
-  Финансы: car_price, car_price_words, currency, cash_amount, cash_amount_words, cash_currency, account_currency, account_number, bank_corr_line1, bank_corr_line2, bank_corr_line3, bank_ben_line1, bank_ben_line2
-  Комиссия: commission_pct передаётся как отдельный параметр инструмента, НЕ внутри data
+Покупатель: buyer_name, buyer_initials, buyer_birth_date, buyer_address, passport_series, passport_number, passport_issued_by, passport_issued_date, passport_code
+Продавец:   seller_name, seller_initials, seller_id_issued_date, seller_birth_date, seller_address, seller_id_number, seller_id_issued_by
+Автомобиль: car_model, car_vin, car_year, car_color, tpo_number, tpo_day, tpo_month, tpo_year
+Финансы:    car_price, car_price_words, currency, cash_amount, cash_amount_words, cash_currency, account_currency, account_number, bank_corr_line1, bank_corr_line2, bank_corr_line3, bank_ben_line1, bank_ben_line2
+Комиссия:   commission_pct передаётся как отдельный параметр инструмента, НЕ внутри data
 
 НЕОБЯЗАТЕЛЬНЫЕ поля (оставь пустыми если нет):
-  car_body_number
+car_body_number
 
 === ПРАВИЛА ИЗВЛЕЧЕНИЯ ДАННЫХ ИЗ ДОКУМЕНТОВ ===
+
 Когда пользователь присылает скан или фото документа — автоматически извлекай все данные.
 
 1. ТПО (Таможенный приходной ордер) — документ называется "Таможенный приходной ордер №":
-   - tpo_number: поле "1. Справочный номер" — длинный номер вида 41714106/310526/0000050870/00
-   - Дата ТПО берётся из самого номера ТПО — это средняя часть между первым и вторым слэшем:
-     Например: 41714106/310526/0000050870/00 → средняя часть "310526" → ДДММГГ → день=31, месяц=05, год=2026
-     tpo_day: первые 2 цифры (например "31")
-     tpo_month: следующие 2 цифры → ПРОПИСЬЮ в родительном падеже (01=января, 02=февраля, 03=марта, 04=апреля, 05=мая, 06=июня, 07=июля, 08=августа, 09=сентября, 10=октября, 11=ноября, 12=декабря)
-     tpo_year: последние 2 цифры + "20" спереди (26 → "2026")
-   - Из ТПО также можно взять данные продавца (поле "4. Плательщик"): ФИО, ИНН, адрес, номер ID карты
+- tpo_number: поле "1. Справочный номер" — длинный номер вида 41714106/310526/0000050870/00
+- Дата ТПО берётся из самого номера ТПО — это средняя часть между первым и вторым слэшем:
+  Например: 41714106/310526/0000050870/00 → средняя часть "310526" → ДДММГГ → день=31, месяц=05, год=2026
+  tpo_day: первые 2 цифры (например "31")
+  tpo_month: следующие 2 цифры → ПРОПИСЬЮ в родительном падеже (01=января, 02=февраля, 03=марта, 04=апреля, 05=мая, 06=июня, 07=июля, 08=августа, 09=сентября, 10=октября, 11=ноября, 12=декабря)
+  tpo_year: последние 2 цифры + "20" спереди (26 → "2026")
+- Из ТПО также можно взять данные продавца (поле "4. Плательщик"): ФИО, ИНН, адрес, номер ID карты
 
 2. Пассажирская таможенная декларация — из неё извлекай:
-   - Данные продавца: ФИО (фамилия/имя/отчество), номер ID карты и дата выдачи, орган выдачи, адрес регистрации
-   - Данные автомобиля: марка, модель, VIN, год выпуска
+- Данные продавца: ФИО (фамилия/имя/отчество), номер ID карты и дата выдачи, орган выдачи, адрес регистрации
+- Данные автомобиля: марка, модель, VIN, год выпуска
 
 3. Паспорт РФ — извлеки все поля покупателя:
-   buyer_name, buyer_birth_date, buyer_address, passport_series, passport_number, passport_issued_by, passport_issued_date, passport_code
+buyer_name, buyer_birth_date, buyer_address, passport_series, passport_number, passport_issued_by, passport_issued_date, passport_code
 
 4. Идентификационная карта КР — извлеки все поля продавца:
-   seller_name, seller_birth_date, seller_address, seller_id_number, seller_id_issued_by, seller_id_issued_date
-   
-   ВАЖНО: ИНН продавца (гражданина КР) содержит дату рождения — цифры с 2 по 9 (8 цифр), формат ДДММГГГГ.
-   Например: ИНН 13008200700377 → цифры 2-9 = "30082007" → день=30, месяц=08, год=2007 → seller_birth_date="30.08.2007"
-   Если дата рождения не указана явно — всегда извлекай её из ИНН по этому правилу.
-   - Дата рождения продавца содержится в его ИНН КР: цифры со 2-й по 9-ю = ДДММГГГГ (день, месяц, год четырёхзначный).
-     Пример: ИНН 13008200700377 → цифры 2-9 = "30082007" → ДД=30, ММ=08, ГГГГ=2007 → seller_birth_date = "30.08.2007"
-     Пример: ИНН 20512199801234 → цифры 2-9 = "05121998" → ДД=05, ММ=12, ГГГГ=1998 → seller_birth_date = "05.12.1998"
-     Формула: seller_birth_date = ИНН[1:3] + "." + ИНН[3:5] + "." + ИНН[5:9]
+seller_name, seller_birth_date, seller_address, seller_id_number, seller_id_issued_by, seller_id_issued_date
+
+ВАЖНО: ИНН продавца (гражданина КР) содержит дату рождения — цифры с 2 по 9 (8 цифр), формат ДДММГГГГ.
+Например: ИНН 13008200700377 → цифры 2-9 = "30082007" → день=30, месяц=08, год=2007 → seller_birth_date="30.08.2007"
+Если дата рождения не указана явно — всегда извлекай её из ИНН по этому правилу.
+
+Дата рождения продавца содержится в его ИНН КР: цифры со 2-й по 9-ю = ДДММГГГГ (день, месяц, год четырёхзначный).
+Пример: ИНН 13008200700377 → цифры 2-9 = "30082007" → ДД=30, ММ=08, ГГГГ=2007 → seller_birth_date = "30.08.2007"
+Пример: ИНН 20512199801234 → цифры 2-9 = "05121998" → ДД=05, ММ=12, ГГГГ=1998 → seller_birth_date = "05.12.1998"
+Формула: seller_birth_date = ИНН[1:3] + "." + ИНН[3:5] + "." + ИНН[5:9]
 
 5. Любой другой документ — извлеки все данные которые относятся к известным полям.
 
@@ -135,10 +143,11 @@ class DocumentAgent:
 
 ПРАВИЛА:
 1. car_price и cash_amount — РАЗНЫЕ суммы:
-   - car_price = цена в ДКП в РУБЛЯХ (например 4200000). Идёт только в ДКП.
+   - car_price   = цена в ДКП в РУБЛЯХ (например 4200000). Идёт только в ДКП.
    - cash_amount = сумма наличных которую агент передаёт продавцу в ДОЛЛАРАХ (например 54900). Идёт только в Поручение.
    - НИКОГДА не ставь car_price в поле cash_amount. Это всегда разные числа.
    - cash_amount_words — сумма прописью БЕЗ названия валюты. Только число словами: "Пятьдесят четыре тысячи девятьсот". Валюта указывается отдельно в поле cash_currency.
+
 2. Если пользователь не назвал цвет автомобиля — обязательно спроси.
 3. Если пользователь не назвал сумму наличных (cash_amount) отдельно — спроси.
 4. Собери все недостающие поля в ОДНОМ вопросе, не задавай по одному.
@@ -147,41 +156,42 @@ class DocumentAgent:
 📋 ПРОВЕРЬТЕ ДАННЫЕ ПЕРЕД СОЗДАНИЕМ ДОГОВОРА:
 
 👤 ПОКУПАТЕЛЬ:
-  ФИО: ...
-  Дата рождения: ...
-  Адрес: ...
-  Паспорт: серия ... № ..., выдан: ..., дата: ..., код: ...
+ФИО: ...
+Дата рождения: ...
+Адрес: ...
+Паспорт: серия ... № ..., выдан: ..., дата: ..., код: ...
 
 👤 ПРОДАВЕЦ:
-  ФИО: ...
-  Дата рождения: ...
-  Адрес: ...
-  Идентификационная карта № ..., выдана: ...
+ФИО: ...
+Дата рождения: ...
+Адрес: ...
+Идентификационная карта № ..., выдана: ...
 
 🚗 АВТОМОБИЛЬ:
-  Марка/модель: ...
-  VIN: ...
-  Год: ...
-  Цвет: ...
+Марка/модель: ...
+VIN: ...
+Год: ...
+Цвет: ...
 
 💰 ФИНАНСЫ:
-  Цена в ДКП (рублей): ...
-  Цена прописью: ...
-  Сумма наличными агенту (долларов): ...
-  Сумма наличными прописью (без валюты): ...
-  Комиссия: ...%
+Цена в ДКП (рублей): ...
+Цена прописью: ...
+Сумма наличными агенту (долларов): ...
+Сумма наличными прописью (без валюты): ...
+Комиссия: ...%
 
 🏦 БАНКОВСКИЕ РЕКВИЗИТЫ:
-  Валюта счёта: ...
-  Номер счёта: ...
-  Банк-корреспондент: ...
-  Банк получателя: ...
+Валюта счёта: ...
+Номер счёта: ...
+Банк-корреспондент: ...
+Банк получателя: ...
 
 Всё верно? Создаю договоры?
 
 После этого жди ответа пользователя. Только если он подтвердил (написал "да", "верно", "создавай", "всё верно" или аналог) — вызывай create_contract.
 
 Если каких-то необязательных данных нет — оставь значение пустой строкой "".
+
 Отвечай на русском языке. Будь краток и по делу."""
 
         instructions = memory.get_instructions()
@@ -205,8 +215,9 @@ class DocumentAgent:
     async def process_message(self, user_text: str, filepath: str = None, filename: str = None) -> dict:
         memory.add_to_history("user", user_text if not filepath else f"[файл: {filename}] {user_text}")
 
-        history = memory.get_history(limit=15)
+        history  = memory.get_history(limit=15)
         messages = []
+
         for h in history[:-1]:
             messages.append({"role": h["role"], "content": h["content"]})
 
@@ -224,7 +235,7 @@ class DocumentAgent:
                     max_tokens=1024,
                     system=self._build_system_prompt(),
                     tools=self._get_tools(),
-                    messages=messages
+                    messages=messages,
                 )
                 break
             except (httpx.RemoteProtocolError, httpx.ReadTimeout, httpx.ConnectTimeout) as e:
@@ -249,11 +260,11 @@ class DocumentAgent:
                             "type": "object",
                             "description": "Данные для заполнения документов — строго по ключам из системного промпта"
                         },
-                        "contract_number": {"type": "string", "description": "Номер договора (опционально)"},
-                        "commission_pct": {"type": "number", "description": "Комиссия агента в процентах, например 2.0"}
+                        "contract_number": {"type": "string",  "description": "Номер договора (опционально)"},
+                        "commission_pct":  {"type": "number",  "description": "Комиссия агента в процентах, например 2.0"},
                     },
-                    "required": ["data", "commission_pct"]
-                }
+                    "required": ["data", "commission_pct"],
+                },
             },
             {
                 "name": "create_invoice",
@@ -261,11 +272,11 @@ class DocumentAgent:
                 "input_schema": {
                     "type": "object",
                     "properties": {
-                        "data": {"type": "object", "description": "Данные для заполнения счёта"},
-                        "invoice_number": {"type": "string", "description": "Номер счёта (опционально)"}
+                        "data":           {"type": "object", "description": "Данные для заполнения счёта"},
+                        "invoice_number": {"type": "string", "description": "Номер счёта (опционально)"},
                     },
-                    "required": ["data"]
-                }
+                    "required": ["data"],
+                },
             },
             {
                 "name": "save_company",
@@ -274,10 +285,10 @@ class DocumentAgent:
                     "type": "object",
                     "properties": {
                         "name": {"type": "string"},
-                        "data": {"type": "object"}
+                        "data": {"type": "object"},
                     },
-                    "required": ["name", "data"]
-                }
+                    "required": ["name", "data"],
+                },
             },
             {
                 "name": "save_instruction",
@@ -285,11 +296,11 @@ class DocumentAgent:
                 "input_schema": {
                     "type": "object",
                     "properties": {
-                        "text": {"type": "string"}
+                        "text": {"type": "string"},
                     },
-                    "required": ["text"]
-                }
-            }
+                    "required": ["text"],
+                },
+            },
         ]
 
     async def _handle_response(self, response) -> dict:
@@ -304,19 +315,20 @@ class DocumentAgent:
 
                 if tool_result.get("file"):
                     result["files"].append({
-                        "file": tool_result["file"],
-                        "filename": tool_result["filename"],
-                        "drive_link": tool_result.get("drive_link", "")
+                        "file":       tool_result["file"],
+                        "filename":   tool_result["filename"],
+                        "drive_link": tool_result.get("drive_link", ""),
                     })
 
-                extra_files = tool_result.get("extra_files", [])
-                extra_names = tool_result.get("extra_names", [])
-                for f_path, f_name in zip(extra_files, extra_names):
+                for f_path, f_name in zip(
+                    tool_result.get("extra_files", []),
+                    tool_result.get("extra_names", []),
+                ):
                     if Path(f_path).exists():
                         result["files"].append({
-                            "file": f_path,
-                            "filename": f_name,
-                            "drive_link": ""
+                            "file":       f_path,
+                            "filename":   f_name,
+                            "drive_link": "",
                         })
 
                 if tool_result.get("message"):
@@ -325,113 +337,110 @@ class DocumentAgent:
         return result
 
     async def _execute_tool(self, tool_name: str, tool_input: dict) -> dict:
+
         if tool_name == "create_contract":
-            # Номер ДДММГГ+NNN: берём из Drive следующий свободный порядковый номер за сегодня
             number = tool_input.get("contract_number") or await self.drive.get_next_contract_number()
+
             logger.info("=== DATA KEYS: " + str(list(tool_input.get("data", {}).keys())))
             logger.info("=== BANK FIELDS: corr1=" + repr(tool_input.get("data", {}).get("bank_corr_line1"))
                         + " pol1=" + repr(tool_input.get("data", {}).get("bank_ben_line1")))
-            date = datetime.now().strftime("%d.%m.%Y")
-            commission_pct = float(tool_input.get("commission_pct", 1.0))
 
+            date           = datetime.now().strftime("%d.%m.%Y")
+            commission_pct = float(tool_input.get("commission_pct", 1.0))
             deal_folder_id = await self.drive.get_or_create_deal_folder(number)
 
-            # ── 1. Агентский договор ──────────────────────────────────────
-            ag_path  = await self.builder.build_contract(tool_input["data"], number, date, commission_pct)
+            # ── 1. Строим все три документа параллельно ───────────────────
+            ag_path, dkp_path, invoice_path = await asyncio.gather(
+                self.builder.build_contract(tool_input["data"], number, date, commission_pct),
+                self.builder.build_dkp(tool_input["data"], number, date),
+                self.builder.build_invoice(tool_input["data"], number, date, commission_pct),
+            )
+
             ag_docx  = f"АГ_Договор_{number}.docx"
-            ag_pdf   = f"АГ_Договор_{number}.pdf"
-
-            await self.drive.upload_file(ag_path, ag_docx, deal_folder_id)
-
-            # FIX: convert_to_pdf теперь возвращает None если LibreOffice недоступен
-            ag_pdf_path = await self.builder.convert_to_pdf(ag_path)
-            if ag_pdf_path:
-                await self.drive.upload_file(ag_pdf_path, ag_pdf, deal_folder_id)
-                ag_link = await self.drive.upload_file(ag_pdf_path, ag_pdf, deal_folder_id)
-            else:
-                ag_link = ""
-
-            # ── 2. ДКП ТС ────────────────────────────────────────────────
-            dkp_path = await self.builder.build_dkp(tool_input["data"], number, date)
             dkp_docx = f"ДКП_ТС_{number}.docx"
-            dkp_pdf  = f"ДКП_ТС_{number}.pdf"
-
-            await self.drive.upload_file(dkp_path, dkp_docx, deal_folder_id)
-
-            dkp_pdf_path = await self.builder.convert_to_pdf(dkp_path)
-            if dkp_pdf_path:
-                await self.drive.upload_file(dkp_pdf_path, dkp_pdf, deal_folder_id)
-
-            # ── 3. Счёт ──────────────────────────────────────────────────
-            invoice_path = await self.builder.build_invoice(tool_input["data"], number, date, commission_pct)
             inv_xlsx = f"Счёт_{number}.xlsx"
+            ag_pdf   = f"АГ_Договор_{number}.pdf"
+            dkp_pdf  = f"ДКП_ТС_{number}.pdf"
             inv_pdf  = f"Счёт_{number}.pdf"
 
-            await self.drive.upload_file(invoice_path, inv_xlsx, deal_folder_id)
+            # ── 2. Загружаем docx/xlsx на Drive параллельно ───────────────
+            await asyncio.gather(
+                self.drive.upload_file(ag_path,      ag_docx,  deal_folder_id),
+                self.drive.upload_file(dkp_path,     dkp_docx, deal_folder_id),
+                self.drive.upload_file(invoice_path, inv_xlsx,  deal_folder_id),
+            )
 
-            inv_pdf_path = await self.builder.convert_to_pdf(invoice_path)
+            # ── 3. Конвертируем в PDF параллельно (неблокирующий asyncio) ─
+            ag_pdf_path, dkp_pdf_path, inv_pdf_path = await asyncio.gather(
+                self.builder.convert_to_pdf(ag_path),
+                self.builder.convert_to_pdf(dkp_path),
+                self.builder.convert_to_pdf(invoice_path),
+            )
+
+            # ── 4. Загружаем PDF на Drive (если созданы) ──────────────────
+            ag_link = ""
+            upload_tasks = []
+            if ag_pdf_path:
+                upload_tasks.append(self.drive.upload_file(ag_pdf_path, ag_pdf, deal_folder_id))
+            if dkp_pdf_path:
+                upload_tasks.append(self.drive.upload_file(dkp_pdf_path, dkp_pdf, deal_folder_id))
             if inv_pdf_path:
-                await self.drive.upload_file(inv_pdf_path, inv_pdf, deal_folder_id)
+                upload_tasks.append(self.drive.upload_file(inv_pdf_path, inv_pdf, deal_folder_id))
 
-            # ── Собираем файлы для Telegram ───────────────────────────────
-            # FIX: раньше при неудаче convert_to_pdf возвращал исходный путь,
-            # и ag_docx отправлялся дважды (как docx и как "pdf").
-            # Теперь None означает "PDF нет" — добавляем только реальные файлы.
+            if upload_tasks:
+                upload_results = await asyncio.gather(*upload_tasks)
+                if ag_pdf_path:
+                    ag_link = upload_results[0]
+
+            # ── 5. Собираем файлы для отправки в Telegram ─────────────────
             extra_files = []
             extra_names = []
 
-            # PDF агентского договора (если создан)
             if ag_pdf_path and Path(ag_pdf_path).exists():
-                extra_files.append(ag_pdf_path)
-                extra_names.append(ag_pdf)
+                extra_files.append(ag_pdf_path);   extra_names.append(ag_pdf)
 
-            # ДКП docx — всегда есть
             if Path(dkp_path).exists():
-                extra_files.append(dkp_path)
-                extra_names.append(dkp_docx)
-
-            # PDF ДКП (если создан)
+                extra_files.append(dkp_path);      extra_names.append(dkp_docx)
             if dkp_pdf_path and Path(dkp_pdf_path).exists():
-                extra_files.append(dkp_pdf_path)
-                extra_names.append(dkp_pdf)
+                extra_files.append(dkp_pdf_path);  extra_names.append(dkp_pdf)
 
-            # Счёт xlsx — всегда есть
             if Path(invoice_path).exists():
-                extra_files.append(invoice_path)
-                extra_names.append(inv_xlsx)
-
-            # PDF счёта (если создан)
+                extra_files.append(invoice_path);  extra_names.append(inv_xlsx)
             if inv_pdf_path and Path(inv_pdf_path).exists():
-                extra_files.append(inv_pdf_path)
-                extra_names.append(inv_pdf)
+                extra_files.append(inv_pdf_path);  extra_names.append(inv_pdf)
 
-            total_files = 1 + len(extra_files)  # ag_docx + остальные
-            pdf_note = "" if ag_pdf_path else " (PDF недоступен — LibreOffice не установлен)"
+            total_files = 1 + len(extra_files)
+            pdf_note    = "" if ag_pdf_path else " (PDF недоступен — LibreOffice не установлен)"
+
             return {
-                "file": ag_path,
-                "filename": ag_docx,
+                "file":        ag_path,
+                "filename":    ag_docx,
                 "extra_files": extra_files,
                 "extra_names": extra_names,
-                "drive_link": ag_link,
-                "message": f"Сделка {number}: {total_files} файлов отправлено{pdf_note}"
+                "drive_link":  ag_link,
+                "message":     f"Сделка {number}: {total_files} файлов отправлено{pdf_note}",
             }
 
         elif tool_name == "create_invoice":
             number = tool_input.get("invoice_number") or await self.drive.get_next_contract_number()
-            date = datetime.now().strftime("%d.%m.%Y")
+            date   = datetime.now().strftime("%d.%m.%Y")
             deal_folder_id = await self.drive.get_or_create_deal_folder(number)
+
             invoice_path = await self.builder.build_invoice(tool_input["data"], number, date)
-            inv_xlsx = f"Счёт_{number}.xlsx"
+            inv_xlsx     = f"Счёт_{number}.xlsx"
+
             await self.drive.upload_file(invoice_path, inv_xlsx, deal_folder_id)
+
             inv_pdf_path = await self.builder.convert_to_pdf(invoice_path)
             link = ""
             if inv_pdf_path:
                 link = await self.drive.upload_file(inv_pdf_path, f"Счёт_{number}.pdf", deal_folder_id)
+
             return {
-                "file": invoice_path,
-                "filename": inv_xlsx,
+                "file":       invoice_path,
+                "filename":   inv_xlsx,
                 "drive_link": link,
-                "message": f"Счёт {number} создан и сохранён на Drive"
+                "message":    f"Счёт {number} создан и сохранён на Drive",
             }
 
         elif tool_name == "save_company":
@@ -445,24 +454,31 @@ class DocumentAgent:
         return {"message": "Выполнено"}
 
     async def _build_file_message(self, filepath: str, filename: str, user_text: str) -> list:
-        ext = Path(filename).suffix.lower()
+        ext     = Path(filename).suffix.lower()
         content = []
 
         if ext in [".jpg", ".jpeg", ".png", ".webp"]:
             with open(filepath, "rb") as f:
                 data = base64.standard_b64encode(f.read()).decode("utf-8")
-            media_map = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png", "webp": "image/webp"}
+            media_map = {"jpg": "image/jpeg", "jpeg": "image/jpeg",
+                         "png": "image/png",  "webp": "image/webp"}
             content.append({
                 "type": "image",
-                "source": {"type": "base64", "media_type": media_map.get(ext.strip("."), "image/jpeg"), "data": data}
+                "source": {
+                    "type":       "base64",
+                    "media_type": media_map.get(ext.strip("."), "image/jpeg"),
+                    "data":       data,
+                },
             })
+
         elif ext == ".pdf":
             with open(filepath, "rb") as f:
                 data = base64.standard_b64encode(f.read()).decode("utf-8")
             content.append({
                 "type": "document",
-                "source": {"type": "base64", "media_type": "application/pdf", "data": data}
+                "source": {"type": "base64", "media_type": "application/pdf", "data": data},
             })
+
         else:
             try:
                 with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
@@ -479,5 +495,5 @@ class DocumentAgent:
         return await self.process_message(
             "Извлеки все данные из документа и скажи что нашёл.",
             filepath=filepath,
-            filename=filename
+            filename=filename,
         )
