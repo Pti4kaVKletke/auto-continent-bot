@@ -204,15 +204,18 @@ class DocumentBuilder:
             "{{ИТОГО_ПРОПИСЬЮ}}": price_words,
         }
 
-        # Z26 содержит формулу с плейсхолдером процента: =Z25*{{ПРОЦЕНТ_КОМИССИИ}}%
+        # Z26 — формула комиссии: подставляем реальный процент напрямую в формулу
+        # (в шаблоне: =Z25*1% — заменяем "1" на нужный процент, сохраняя валидный синтаксис)
+        z26 = ws["Z26"]
+        if isinstance(z26.value, str) and z26.value.startswith("="):
+            z26.value = f"=Z25*{commission_pct}%"
+
         for row in ws.iter_rows():
             for cell in row:
                 if isinstance(cell.value, str):
                     val = cell.value
-                    if "{{ПРОЦЕНТ_КОМИССИИ}}" in val:
-                        val = val.replace("{{ПРОЦЕНТ_КОМИССИИ}}", str(commission_pct))
-                        cell.value = val
-                        continue
+                    if val.startswith("="):
+                        continue  # формулы не трогаем (кроме Z26 выше)
                     for ph, repl in replacements.items():
                         if ph in val:
                             if val == ph:
