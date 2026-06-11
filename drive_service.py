@@ -187,13 +187,21 @@ class GoogleDriveService:
 
             return file.get("webViewLink", "")
 
-        try:
-            link = await asyncio.to_thread(_do_upload)
-            logger.info(f"Загружено: {filename} → {link}")
-            return link
-        except Exception as e:
-            logger.error(f"Ошибка загрузки '{filename}': {e}", exc_info=True)
-            return ""
+        for attempt in range(3):
+            try:
+                link = await asyncio.to_thread(_do_upload)
+                logger.info(f"Загружено: {filename} → {link}")
+                return link
+            except Exception as e:
+                logger.warning(f"Попытка {attempt+1}/3 загрузки '{filename}' не удалась: {e}")
+                if attempt < 2:
+                    # Пересоздаём service — старое SSL-соединение могло сломаться
+                    self.service = _build_service()
+                    await asyncio.sleep(1)
+                else:
+                    logger.error(f"Окончательная ошибка загрузки '{filename}': {e}", exc_info=True)
+                    return ""
+        return ""
 
     async def _get_or_create_folder(self, name: str, parent_id: str) -> str:
         def _do_find_or_create():

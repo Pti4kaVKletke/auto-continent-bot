@@ -403,11 +403,10 @@ VIN: ...
             if not skip_drive:
                 logger.info("Загружаю на Drive...")
                 deal_folder_id = await self.drive.get_or_create_deal_folder(number)
-                await asyncio.gather(
-                    self.drive.upload_file(ag_path,      ag_docx,  deal_folder_id),
-                    self.drive.upload_file(dkp_path,     dkp_docx, deal_folder_id),
-                    self.drive.upload_file(invoice_path, inv_xlsx,  deal_folder_id),
-                )
+                # ПОСЛЕДОВАТЕЛЬНО: параллельные запросы через httplib2 ломают SSL-соединение
+                ag_link = await self.drive.upload_file(ag_path,      ag_docx,  deal_folder_id)
+                await self.drive.upload_file(dkp_path,     dkp_docx, deal_folder_id)
+                await self.drive.upload_file(invoice_path, inv_xlsx,  deal_folder_id)
             else:
                 logger.info("Drive пропущен (SKIP_DRIVE=1)")
 
