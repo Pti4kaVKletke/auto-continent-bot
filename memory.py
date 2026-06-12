@@ -29,6 +29,13 @@ def init_db():
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         );
 
+        CREATE TABLE IF NOT EXISTS bank_profiles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            data TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+
         CREATE TABLE IF NOT EXISTS instructions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             text TEXT NOT NULL,
@@ -97,6 +104,40 @@ def list_companies() -> list:
 def delete_company(name: str):
     conn = get_conn()
     conn.execute("DELETE FROM companies WHERE name=?", (name,))
+    conn.commit()
+    conn.close()
+
+
+# --- Профили банковских реквизитов ---
+
+def save_bank_profile(name: str, data: dict):
+    conn = get_conn()
+    existing = conn.execute("SELECT id FROM bank_profiles WHERE name=?", (name,)).fetchone()
+    if existing:
+        conn.execute("UPDATE bank_profiles SET data=? WHERE name=?", (json.dumps(data, ensure_ascii=False), name))
+    else:
+        conn.execute("INSERT INTO bank_profiles (name, data) VALUES (?, ?)", (name, json.dumps(data, ensure_ascii=False)))
+    conn.commit()
+    conn.close()
+
+
+def get_bank_profile(name: str) -> dict:
+    conn = get_conn()
+    row = conn.execute("SELECT data FROM bank_profiles WHERE name=?", (name,)).fetchone()
+    conn.close()
+    return json.loads(row["data"]) if row else {}
+
+
+def list_bank_profiles() -> list:
+    conn = get_conn()
+    rows = conn.execute("SELECT name FROM bank_profiles ORDER BY name").fetchall()
+    conn.close()
+    return [r["name"] for r in rows]
+
+
+def delete_bank_profile(name: str):
+    conn = get_conn()
+    conn.execute("DELETE FROM bank_profiles WHERE name=?", (name,))
     conn.commit()
     conn.close()
 

@@ -210,6 +210,37 @@ VIN: ...
                     if v:
                         base += f"  {k}: {v}\n"
 
+        bank_profile_names = memory.list_bank_profiles()
+        base += "\n\n=== БАНКОВСКИЕ ПРОФИЛИ (реквизиты для зачисления денег продавцу) ===\n"
+        if bank_profile_names:
+            base += "Сохранённые профили:\n"
+            for name in bank_profile_names:
+                data = memory.get_bank_profile(name)
+                base += f"\n{name}:\n"
+                for k, v in data.items():
+                    if v:
+                        base += f"  {k}: {v}\n"
+            base += (
+                "\nПЕРЕД созданием сделки (create_contract), когда нужны банковские "
+                "реквизиты (account_number, bank_corr_line1-3, bank_ben_line1-2, "
+                "account_currency), ВСЕГДА вызывай инструмент request_bank_choice — "
+                "он покажет пользователю кнопки с сохранёнными профилями + кнопку "
+                "«Новые реквизиты». Не спрашивай это текстом, всегда через инструмент. "
+                "После того как пользователь выберет вариант (его выбор придёт как "
+                "обычное сообщение), либо подставь данные выбранного профиля в data, "
+                "либо (если выбрано «Новые реквизиты») спроси реквизиты текстом и "
+                "предложи сохранить их через save_bank_profile с понятным названием "
+                "вида «Банк - Имя получателя» (например «Альфа Банк - Бакай»)."
+            )
+        else:
+            base += (
+                "Сохранённых профилей пока нет. ПЕРЕД созданием сделки, когда нужны "
+                "банковские реквизиты, вызывай request_bank_choice — он покажет кнопку "
+                "«Новые реквизиты» (других вариантов не будет). После того как "
+                "пользователь укажет реквизиты текстом, предложи сохранить их через "
+                "save_bank_profile с названием вида «Банк - Имя получателя»."
+            )
+
         return base
 
     async def process_message(self, user_text: str, filepath: str = None, filename: str = None) -> dict:
@@ -309,10 +340,54 @@ VIN: ...
                     "required": ["text"],
                 },
             },
+            {
+                "name": "save_bank_profile",
+                "description": (
+                    "Сохранить набор банковских реквизитов для зачисления денег продавцу "
+                    "под понятным названием, например «Альфа Банк - Бакай»."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Название профиля, например «Альфа Банк - Бакай»",
+                        },
+                        "data": {
+                            "type": "object",
+                            "description": (
+                                "Реквизиты: account_number, account_currency, "
+                                "bank_corr_line1, bank_corr_line2, bank_corr_line3, "
+                                "bank_ben_line1, bank_ben_line2"
+                            ),
+                        },
+                    },
+                    "required": ["name", "data"],
+                },
+            },
+            {
+                "name": "request_bank_choice",
+                "description": (
+                    "Показать пользователю кнопки для выбора банковских реквизитов: "
+                    "сохранённые профили + кнопка «Новые реквизиты». Вызывай ВСЕГДА "
+                    "перед созданием сделки, когда нужны банковские реквизиты, вместо "
+                    "того чтобы спрашивать текстом."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "message": {
+                            "type": "string",
+                            "description": "Короткий текст-подпись над кнопками, например «Какие реквизиты использовать для этой сделки?»",
+                        },
+                    },
+                    "required": ["message"],
+                },
+            },
         ]
 
     async def _handle_response(self, response) -> dict:
-        result = {"text": "", "files": [], "success": True}
+        result = {"text": "", "files": [], "success": True, "buttons": None}
 
         for block in response.content:
             if block.type == "text":
@@ -339,7 +414,11 @@ VIN: ...
                             "drive_link": "",
                         })
 
-                if tool_result.get("message"):
+                if tool_result.get("buttons"):
+                    result["buttons"] = tool_result["buttons"]
+                    if tool_result.get("message"):
+                        result["text"] += f"\n{tool_result['message']}"
+                elif tool_result.get("message"):
                     msg = tool_result["message"]
                     prefix = "" if msg.startswith(("⚠️", "❌", "✅")) else "✅ "
                     result["text"] += f"\n{prefix}{msg}"
@@ -351,9 +430,7 @@ VIN: ...
         if tool_name == "create_contract":
             number = tool_input.get("contract_number") or await self.drive.get_next_contract_number()
 
-            logger.info("=== DATA KEYS: " + str(list(tool_input.get("data", {}).keys())))
-            logger.info("=== BANK FIELDS: corr1=" + repr(tool_input.get("data", {}).get("bank_corr_line1"))
-                        + " pol1=" + repr(tool_input.get("data", {}).get("bank_ben_line1")))
+            logger.debug("DATA KEYS: " + str(list(tool_input.get("data", {}).keys())))
 
             date           = datetime.now().strftime("%d.%m.%Y")
             commission_pct = float(tool_input.get("commission_pct", 1.0))
@@ -482,6 +559,20 @@ VIN: ...
         elif tool_name == "save_instruction":
             memory.add_instruction(tool_input["text"])
             return {"message": f"Инструкция сохранена: {tool_input['text']}"}
+
+        elif tool_name == "save_bank_profile":
+            memory.save_bank_profile(tool_input["name"], tool_input["data"])
+            return {"message": f"Реквизиты «{tool_input['name']}» сохранены как банковский профиль"}
+
+        elif tool_name == "request_bank_choice":
+            profiles = memory.list_bank_profiles()
+            buttons = [{"text": name, "callback_data": f"bankprofile:{name}"} for name in profiles]
+            buttons.append({"text": "🆕 Новые реквизиты", "callback_data": "bankprofile:__new__"})
+            return {
+                "message": tool_input.get("message", "Какие реквизиты использовать?"),
+                "buttons": buttons,
+                "no_check": True,
+            }
 
         return {"message": "Выполнено"}
 

@@ -1,8 +1,8 @@
 import os
 import logging
 import tempfile
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from agent import DocumentAgent
 import memory
 
@@ -38,6 +38,16 @@ async def show_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text += f"  • {c['name']}\n"
     else:
         text += "Компаний пока нет\n"
+
+    text += "\n"
+
+    bank_profiles = memory.list_bank_profiles()
+    if bank_profiles:
+        text += "*Банковские профили:*\n"
+        for name in bank_profiles:
+            text += f"  • {name}\n"
+    else:
+        text += "Банковских профилей пока нет\n"
 
     text += "\n"
 
@@ -83,7 +93,14 @@ async def send_result(message, result: dict):
                 logger.error(f"Файл не найден при отправке: {f_info.get('file')}")
 
     if result.get("text"):
-        await message.reply_text(result["text"])
+        reply_markup = None
+        if result.get("buttons"):
+            keyboard = [
+                [InlineKeyboardButton(b["text"], callback_data=b["callback_data"])]
+                for b in result["buttons"]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+        await message.reply_text(result["text"], reply_markup=reply_markup)
 
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -110,6 +127,26 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_result(message, result)
 
 
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data or ""
+    if data.startswith("bankprofile:"):
+        profile_name = data.split(":", 1)[1]
+
+        if profile_name == "__new__":
+            await query.edit_message_reply_markup(reply_markup=None)
+            user_text = "Использовать новые реквизиты (введу их сейчас)"
+        else:
+            await query.edit_message_reply_markup(reply_markup=None)
+            user_text = f"Использовать сохранённые реквизиты: {profile_name}"
+
+        await query.message.reply_text("🤔 Думаю...")
+        result = await agent.process_message(user_text)
+        await send_result(query.message, result)
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
     await update.message.reply_text("🤔 Думаю...")
@@ -127,6 +164,7 @@ def main():
     app.add_handler(CommandHandler("memory", show_memory))
     app.add_handler(CommandHandler("clear", clear_history))
     app.add_handler(CommandHandler("del_instruction", del_instruction))
+    app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, handle_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
