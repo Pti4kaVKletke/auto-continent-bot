@@ -215,17 +215,11 @@ VIN: ...
     async def process_message(self, user_text: str, filepath: str = None, filename: str = None) -> dict:
         memory.add_to_history("user", user_text if not filepath else f"[файл: {filename}] {user_text}")
 
-        history = memory.get_history(limit=15)
-
-        # Anthropic требует строгого чередования user/assistant.
-        # После краша в истории могут остаться два подряд user-сообщения — ошибка 400.
-        raw = [{"role": h["role"], "content": h["content"]} for h in history[:-1]]
+        history  = memory.get_history(limit=15)
         messages = []
-        for msg in raw:
-            if messages and messages[-1]["role"] == msg["role"]:
-                messages[-1]["content"] += "\n" + msg["content"]
-            else:
-                messages.append(msg)
+
+        for h in history[:-1]:
+            messages.append({"role": h["role"], "content": h["content"]})
 
         if filepath:
             current_content = await self._build_file_message(filepath, filename, user_text)
@@ -234,55 +228,39 @@ VIN: ...
 
         messages.append({"role": "user", "content": current_content})
 
-        response = None
         for attempt in range(3):
             try:
                 response = await self.client.with_options(timeout=120.0).messages.create(
                     model=self.model,
-                    max_tokens=4096,
+                    max_tokens=1024,
                     system=self._build_system_prompt(),
                     tools=self._get_tools(),
                     messages=messages,
                 )
-                break
-            except anthropic.BadRequestError as e:
-                logger.warning(f"BadRequestError — очищаю историю и повторяю: {e}")
-                memory.clear_history()
-                memory.add_to_history("user", user_text)
-                messages = [{"role": "user", "content": current_content}]
-                try:
-                    response = await self.client.with_options(timeout=120.0).messages.create(
-                        model=self.model,
-                        max_tokens=4096,
-                        system=self._build_system_prompt(),
-                        tools=self._get_tools(),
-                        messages=messages,
-                    )
-                except Exception as e2:
-                    logger.error(f"Ошибка после очистки истории: {e2}")
-                    return {"text": f"❌ Ошибка API: {e2}", "files": [], "success": False}
                 break
             except (httpx.RemoteProtocolError, httpx.ReadTimeout, httpx.ConnectTimeout) as e:
                 logger.warning(f"Сетевая ошибка (попытка {attempt+1}/3): {e}")
                 if attempt == 2:
                     return {"text": "⚠️ Ошибка соединения с AI. Попробуйте ещё раз.", "files": [], "success": False}
                 await asyncio.sleep(2)
-            except Exception as e:
-                logger.error(f"Неожиданная ошибка Anthropic API: {e}", exc_info=True)
-                return {"text": f"❌ Ошибка: {e}", "files": [], "success": False}
 
-        if response is None:
-            return {"text": "⚠️ Не удалось получить ответ от AI.", "files": [], "success": False}
-
-        result = await self._handle_response(response)
-        memory.add_to_history("assistant", result.get("text", "✅"))
+        try:
+            result = await self._handle_response(response)
+        except Exception as e:
+            logger.error(f"Необработанная ошибка при выполнении инструмента: {e}", exc_info=True)
+            result = {
+                "text": f"⚠️ Произошла ошибка при обработке: {e}",
+                "files": [],
+                "success": False,
+            }
+        memory.add_to_history("assistant", result.get("text", ""))
         return result
 
     def _get_tools(self) -> list:
         return [
             {
                 "name": "create_contract",
-                "description": "Создать полный пакет документов по сделке (АГ договор, ДКП ТС, Счёт на оплату). ВСЕГДА спрашивай размер комиссии в процентах перед вызовом если он не указан. НИКОГДА не вызывай create_invoice после create_contract — счёт уже включён внутри.",
+                "description": "Создать полный пакет документов по сделке (АГ договор, ДКП ТС, Счёт на оплату). ВСЕГДА спрашивай размер комиссии в процентах перед вызовом если он не указан.",
                 "input_schema": {
                     "type": "object",
                     "properties": {
@@ -362,33 +340,48 @@ VIN: ...
                         })
 
                 if tool_result.get("message"):
-                    result["text"] += f"\n✅ {tool_result['message']}"
+                    msg = tool_result["message"]
+                    prefix = "" if msg.startswith(("⚠️", "❌", "✅")) else "✅ "
+                    result["text"] += f"\n{prefix}{msg}"
 
         return result
 
     async def _execute_tool(self, tool_name: str, tool_input: dict) -> dict:
-        skip_drive = os.environ.get("SKIP_DRIVE", "0") == "1"
-        skip_pdf   = os.environ.get("SKIP_PDF",   "0") == "1"
 
         if tool_name == "create_contract":
-            # ── Номер договора ────────────────────────────────────────────
-            if skip_drive:
-                number = tool_input.get("contract_number") or datetime.now().strftime("%d%m%y") + "001"
-            else:
-                number = tool_input.get("contract_number") or await self.drive.get_next_contract_number()
+            number = tool_input.get("contract_number") or await self.drive.get_next_contract_number()
 
             logger.info("=== DATA KEYS: " + str(list(tool_input.get("data", {}).keys())))
+            logger.info("=== BANK FIELDS: corr1=" + repr(tool_input.get("data", {}).get("bank_corr_line1"))
+                        + " pol1=" + repr(tool_input.get("data", {}).get("bank_ben_line1")))
 
             date           = datetime.now().strftime("%d.%m.%Y")
             commission_pct = float(tool_input.get("commission_pct", 1.0))
+            deal_folder_id = await self.drive.get_or_create_deal_folder(number)
 
-            # ── 1. Строим документы ПОСЛЕДОВАТЕЛЬНО (меньше памяти) ───────
-            logger.info("Строю АГ договор...")
-            ag_path = await self.builder.build_contract(tool_input["data"], number, date, commission_pct)
-            logger.info("Строю ДКП...")
-            dkp_path = await self.builder.build_dkp(tool_input["data"], number, date)
-            logger.info("Строю счёт...")
-            invoice_path = await self.builder.build_invoice(tool_input["data"], number, date, commission_pct)
+            # ── 1. Строим документы ПОСЛЕДОВАТЕЛЬНО (не параллельно — меньше памяти) ──
+            built = {}
+            try:
+                logger.info("Строю АГ договор...")
+                built["ag"] = await self.builder.build_contract(tool_input["data"], number, date, commission_pct)
+
+                logger.info("Строю ДКП...")
+                built["dkp"] = await self.builder.build_dkp(tool_input["data"], number, date)
+
+                logger.info("Строю счёт...")
+                built["invoice"] = await self.builder.build_invoice(tool_input["data"], number, date, commission_pct)
+
+            except Exception as e:
+                logger.error(f"Ошибка построения документов для сделки {number}: {e}", exc_info=True)
+                files_done = list(built.keys())
+                return {
+                    "message": (
+                        f"⚠️ Ошибка при создании документов сделки {number}: {e}\n"
+                        f"Успешно создано: {', '.join(files_done) if files_done else 'ничего'}"
+                    ),
+                }
+
+            ag_path, dkp_path, invoice_path = built["ag"], built["dkp"], built["invoice"]
 
             ag_docx  = f"АГ_Договор_{number}.docx"
             dkp_docx = f"ДКП_ТС_{number}.docx"
@@ -397,83 +390,89 @@ VIN: ...
             dkp_pdf  = f"ДКП_ТС_{number}.pdf"
             inv_pdf  = f"Счёт_{number}.pdf"
 
-            # ── 2. Drive (только если не отключён) ────────────────────────
-            ag_link = ""
-            deal_folder_id = ""
-            if not skip_drive:
-                logger.info("Загружаю на Drive...")
-                deal_folder_id = await self.drive.get_or_create_deal_folder(number)
-                # ПОСЛЕДОВАТЕЛЬНО: параллельные запросы через httplib2 ломают SSL-соединение
-                ag_link = await self.drive.upload_file(ag_path,      ag_docx,  deal_folder_id)
-                await self.drive.upload_file(dkp_path,     dkp_docx, deal_folder_id)
-                await self.drive.upload_file(invoice_path, inv_xlsx,  deal_folder_id)
-            else:
-                logger.info("Drive пропущен (SKIP_DRIVE=1)")
+            # ── 2. Загружаем docx/xlsx на Drive ───────────────────────────
+            logger.info("Загружаю на Drive...")
+            upload_results = await asyncio.gather(
+                self.drive.upload_file(ag_path,      ag_docx,  deal_folder_id),
+                self.drive.upload_file(dkp_path,     dkp_docx, deal_folder_id),
+                self.drive.upload_file(invoice_path, inv_xlsx,  deal_folder_id),
+                return_exceptions=True,
+            )
+            for r in upload_results:
+                if isinstance(r, Exception):
+                    logger.error(f"Ошибка загрузки на Drive (сделка {number}): {r}", exc_info=True)
 
-            # ── 3. PDF (только если не отключён) ──────────────────────────
+            # ── 3. PDF только если не отключён через SKIP_PDF=1 ───────────
+            skip_pdf = os.environ.get("SKIP_PDF", "0") == "1"
             ag_pdf_path = dkp_pdf_path = inv_pdf_path = None
+            ag_link = ""
+
             if not skip_pdf:
                 logger.info("Конвертирую в PDF...")
                 ag_pdf_path  = await self.builder.convert_to_pdf(ag_path)
                 dkp_pdf_path = await self.builder.convert_to_pdf(dkp_path)
                 inv_pdf_path = await self.builder.convert_to_pdf(invoice_path)
-                if not skip_drive and deal_folder_id:
-                    if ag_pdf_path:
-                        ag_link = await self.drive.upload_file(ag_pdf_path, ag_pdf, deal_folder_id)
-                    if dkp_pdf_path:
-                        await self.drive.upload_file(dkp_pdf_path, dkp_pdf, deal_folder_id)
-                    if inv_pdf_path:
-                        await self.drive.upload_file(inv_pdf_path, inv_pdf, deal_folder_id)
+
+                if ag_pdf_path:
+                    ag_link = await self.drive.upload_file(ag_pdf_path, ag_pdf, deal_folder_id)
+                if dkp_pdf_path:
+                    await self.drive.upload_file(dkp_pdf_path, dkp_pdf, deal_folder_id)
+                if inv_pdf_path:
+                    await self.drive.upload_file(inv_pdf_path, inv_pdf, deal_folder_id)
             else:
                 logger.info("PDF пропущен (SKIP_PDF=1)")
 
-            # ── 4. Собираем файлы для Telegram ────────────────────────────
-            extra_files, extra_names = [], []
+            # ── 4. Собираем файлы для отправки в Telegram ─────────────────
+            extra_files = []
+            extra_names = []
+
             if ag_pdf_path and Path(ag_pdf_path).exists():
-                extra_files.append(ag_pdf_path); extra_names.append(ag_pdf)
+                extra_files.append(ag_pdf_path);   extra_names.append(ag_pdf)
+
             if Path(dkp_path).exists():
-                extra_files.append(dkp_path); extra_names.append(dkp_docx)
+                extra_files.append(dkp_path);      extra_names.append(dkp_docx)
             if dkp_pdf_path and Path(dkp_pdf_path).exists():
-                extra_files.append(dkp_pdf_path); extra_names.append(dkp_pdf)
+                extra_files.append(dkp_pdf_path);  extra_names.append(dkp_pdf)
+
             if Path(invoice_path).exists():
-                extra_files.append(invoice_path); extra_names.append(inv_xlsx)
+                extra_files.append(invoice_path);  extra_names.append(inv_xlsx)
             if inv_pdf_path and Path(inv_pdf_path).exists():
-                extra_files.append(inv_pdf_path); extra_names.append(inv_pdf)
+                extra_files.append(inv_pdf_path);  extra_names.append(inv_pdf)
 
             total_files = 1 + len(extra_files)
+            pdf_note = " (PDF отключён)" if skip_pdf else ("" if ag_pdf_path else " (LibreOffice недоступен)")
+
             return {
                 "file":        ag_path,
                 "filename":    ag_docx,
                 "extra_files": extra_files,
                 "extra_names": extra_names,
                 "drive_link":  ag_link,
-                "message":     f"Сделка {number}: {total_files} файлов отправлено",
+                "message":     f"Сделка {number}: {total_files} файлов отправлено{pdf_note}",
             }
 
         elif tool_name == "create_invoice":
-            if skip_drive:
-                number = tool_input.get("invoice_number") or datetime.now().strftime("%d%m%y") + "001"
-            else:
-                number = tool_input.get("invoice_number") or await self.drive.get_next_contract_number()
+            number = tool_input.get("invoice_number") or await self.drive.get_next_contract_number()
+            date   = datetime.now().strftime("%d.%m.%Y")
+            deal_folder_id = await self.drive.get_or_create_deal_folder(number)
 
-            date         = datetime.now().strftime("%d.%m.%Y")
-            invoice_path = await self.builder.build_invoice(tool_input.get("data", {}), number, date)
+            invoice_path = await self.builder.build_invoice(tool_input["data"], number, date)
             inv_xlsx     = f"Счёт_{number}.xlsx"
 
+            await self.drive.upload_file(invoice_path, inv_xlsx, deal_folder_id)
+
+            skip_pdf = os.environ.get("SKIP_PDF", "0") == "1"
             link = ""
-            if not skip_drive:
-                deal_folder_id = await self.drive.get_or_create_deal_folder(number)
-                await self.drive.upload_file(invoice_path, inv_xlsx, deal_folder_id)
-                if not skip_pdf:
-                    inv_pdf_path = await self.builder.convert_to_pdf(invoice_path)
-                    if inv_pdf_path:
-                        link = await self.drive.upload_file(inv_pdf_path, f"Счёт_{number}.pdf", deal_folder_id)
+            if not skip_pdf:
+                inv_pdf_path = await self.builder.convert_to_pdf(invoice_path)
+                if inv_pdf_path:
+                    link = await self.drive.upload_file(inv_pdf_path, f"Счёт_{number}.pdf", deal_folder_id)
 
             return {
                 "file":       invoice_path,
                 "filename":   inv_xlsx,
                 "drive_link": link,
-                "message":    f"Счёт {number} создан",
+                "message":    f"Счёт {number} создан и сохранён на Drive",
             }
 
         elif tool_name == "save_company":
