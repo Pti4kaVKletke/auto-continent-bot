@@ -66,6 +66,26 @@ async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ История диалога очищена")
 
 
+async def send_result(message, result: dict):
+    """Отправляет файлы и текст результата обработки сообщению пользователя."""
+    if result.get("files"):
+        for f_info in result["files"]:
+            try:
+                with open(f_info["file"], "rb") as f:
+                    link = f_info.get("drive_link", "")
+                    caption = f"☁️ {link}" if link else "☁️ (не загружено на Drive)"
+                    await message.reply_document(
+                        document=f,
+                        filename=f_info["filename"],
+                        caption=caption,
+                    )
+            except FileNotFoundError:
+                logger.error(f"Файл не найден при отправке: {f_info.get('file')}")
+
+    if result.get("text"):
+        await message.reply_text(result["text"])
+
+
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     await message.reply_text("📥 Получил файл, обрабатываю...")
@@ -87,17 +107,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         caption = message.caption or ""
         result = await agent.process_file(filepath, filename)
 
-        if result.get("files"):
-            for f_info in result["files"]:
-                with open(f_info["file"], "rb") as f:
-                    await message.reply_document(
-                        document=f,
-                        filename=f_info["filename"],
-                        caption=f"☁️ {f_info.get('drive_link', '')}"
-                    )
-
-        if result.get("text"):
-            await message.reply_text(result["text"])
+        await send_result(message, result)
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -106,17 +116,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     result = await agent.process_message(user_text)
 
-    if result.get("files"):
-        for f_info in result["files"]:
-            with open(f_info["file"], "rb") as f:
-                await update.message.reply_document(
-                    document=f,
-                    filename=f_info["filename"],
-                    caption=f"☁️ {f_info.get('drive_link', '')}"
-                )
-
-    if result.get("text"):
-        await update.message.reply_text(result["text"])
+    await send_result(update.message, result)
 
 
 def main():
