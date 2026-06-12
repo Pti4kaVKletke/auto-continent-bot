@@ -614,9 +614,9 @@ VIN: ...
         content.append({"type": "text", "text": prompt})
         return content
 
-    async def process_file(self, filepath: str, filename: str) -> dict:
+    async def process_file(self, filepath: str, filename: str, caption: str = "") -> dict:
         return await self.process_message(
-            "Извлеки все данные из документа и скажи что нашёл.",
+            caption or "Извлеки все данные из документа и скажи что нашёл.",
             filepath=filepath,
             filename=filename,
         )

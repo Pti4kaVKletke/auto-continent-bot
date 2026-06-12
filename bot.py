@@ -122,7 +122,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await file.download_to_drive(filepath)
 
         caption = message.caption or ""
-        result = await agent.process_file(filepath, filename)
+        result = await agent.process_file(filepath, filename, caption)
 
         await send_result(message, result)
 
