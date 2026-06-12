@@ -135,6 +135,8 @@ def add_to_history(role: str, content: str):
             SELECT id FROM history ORDER BY id DESC LIMIT 50
         )
     """)
+    # Удаляем записи старше 7 дней (могут содержать паспортные данные, ИНН и т.п.)
+    conn.execute("DELETE FROM history WHERE created_at < datetime('now', '-3 days')")
     conn.commit()
     conn.close()
 
