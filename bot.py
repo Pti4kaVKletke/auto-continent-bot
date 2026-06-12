@@ -30,10 +30,10 @@ async def show_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
     companies = memory.list_companies()
     instructions = memory.get_instructions()
 
-    text = "🧠 *Моя память:*\n\n"
+    text = "🧠 Моя память:\n\n"
 
     if companies:
-        text += "*Сохранённые компании:*\n"
+        text += "Сохранённые компании:\n"
         for c in companies:
             text += f"  • {c['name']}\n"
     else:
@@ -43,7 +43,7 @@ async def show_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     bank_profiles = memory.list_bank_profiles()
     if bank_profiles:
-        text += "*Банковские профили:*\n"
+        text += "Банковские профили:\n"
         for name in bank_profiles:
             text += f"  • {name}\n"
     else:
@@ -52,14 +52,14 @@ async def show_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text += "\n"
 
     if instructions:
-        text += "*Постоянные инструкции:*\n"
+        text += "Постоянные инструкции:\n"
         for i in instructions:
             text += f"  {i['id']}. {i['text']}\n"
         text += "\nЧтобы удалить инструкцию: /del_instruction 1"
     else:
         text += "Инструкций пока нет"
 
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await update.message.reply_text(text)
 
 
 async def del_instruction(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -156,6 +156,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_result(update.message, result)
 
 
+async def error_handler(update, context):
+    logger.error(f"Необработанная ошибка: {context.error}", exc_info=context.error)
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            await update.effective_message.reply_text("⚠️ Произошла ошибка, попробуйте ещё раз.")
+        except Exception:
+            pass
+
+
 def main():
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     app = ApplicationBuilder().token(token).build()
@@ -167,6 +176,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, handle_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_error_handler(error_handler)
 
     logger.info("Бот запущен")
     app.run_polling()
