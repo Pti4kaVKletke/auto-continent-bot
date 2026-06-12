@@ -531,6 +531,7 @@ class DocumentBuilder:
             "{{ВАЛЮТА}}":                  data.get("currency", "рублей"),
             "{{СУММА_НАЛИЧНЫМИ}}":         cash_fmt,
             "{{СУММА_НАЛИЧНЫМИ_ПРОПИСЬЮ}}": data.get("cash_amount_words", ""),
+            "{{СУММА_ПРОПИСЬЮ}}":           data.get("cash_amount_words", ""),
             "{{ВАЛЮТА_НАЛИЧНЫМИ}}":        data.get("cash_currency", data.get("currency", "рублей")),
 
             # Банковские реквизиты
