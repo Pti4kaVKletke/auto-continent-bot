@@ -24,7 +24,7 @@ class DocumentAgent:
         self.client  = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
         self.drive   = GoogleDriveService()
         self.builder = DocumentBuilder()
-        self.model   = "claude-haiku-4-5-20251001"
+        self.model   = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
         memory.init_db()
 
     def _build_system_prompt(self) -> str:
