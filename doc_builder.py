@@ -153,82 +153,10 @@ class DocumentBuilder:
 
     async def build_invoice(self, data: dict, number: str, date: str, commission_pct: float = 1.0) -> str:
         """
-        Формирует счёт на оплату на основе шаблона invoice_template.xlsx.
-        Шаблон содержит дизайн компании (логотип, реквизиты, формулы) с плейсхолдерами {{...}}.
-        Если шаблон не найден — используется встроенная генерация (запасной вариант).
+        Формирует счёт на оплату в формате, соответствующем шаблону компании.
+        Структура: блок банковских реквизитов → заголовок → стороны → таблица → итоги → подписи.
+        Колонки: A=№(4) B=описание(48) C=кол-во(8) D=ед.(6) E=цена(16) F=сумма(16)
         """
-        template = self.templates_dir / "invoice_template.xlsx"
-        if template.exists():
-            return await self._fill_invoice_template(template, data, number, date, commission_pct)
-        return await self._generate_invoice(data, number, date, commission_pct)
-
-    async def _fill_invoice_template(self, template_path, data: dict, number: str, date: str,
-                                      commission_pct: float = 1.0) -> str:
-        wb = openpyxl.load_workbook(str(template_path))
-        ws = wb.active
-
-        day   = date[0:2]
-        month = date[3:5]
-        year  = date[6:10]
-        date_str = f"{day} {self._month_name(month)} {year}"
-
-        price_str = str(data.get("car_price", "0")).replace(" ", "").replace(",", ".")
-        try:
-            price_val = float(price_str)
-        except Exception:
-            price_val = 0.0
-
-        commission = round(price_val * commission_pct / 100, 2)
-        total = round(price_val + commission, 2)
-        currency = data.get("currency", "RUB")
-
-        buyer = data.get("buyer_name", data.get("company_name", ""))
-        car = (f"{data.get('car_model', '')}  год выпуска {data.get('car_year', '')} "
-               f"VIN {data.get('car_vin', '')}").strip()
-
-        total_fmt = f"{total:,.2f}".replace(",", " ").replace(".", ",")
-        price_words = data.get("car_price_words", "")
-
-        replacements = {
-            "{{СЧЕТ_ЗАГОЛОВОК}}": f"Счет на оплату № {number} от {date_str} г.",
-            "{{ПОКУПАТЕЛЬ_ПОЛНЫЕ_ДАННЫЕ}}": buyer,
-            "{{ОПИСАНИЕ_АВТО}}": (
-                f"Оплата по Агентскому договору {number} от {date_str} г. на оплату "
-                f"автомобиля {car}"
-            ),
-            "{{ЦЕНА_АВТО}}": price_val,
-            "{{ОПИСАНИЕ_КОМИССИИ}}": (
-                f"Комиссия по Агентскому договору {number} от {date_str} г."
-            ),
-            "{{ВСЕГО_НАИМЕНОВАНИЙ}}": f"Всего наименований 2, на сумму {total_fmt} {currency}",
-            "{{ИТОГО_ПРОПИСЬЮ}}": price_words,
-        }
-
-        # Z26 — формула комиссии: подставляем реальный процент напрямую в формулу
-        # (в шаблоне: =Z25*1% — заменяем "1" на нужный процент, сохраняя валидный синтаксис)
-        z26 = ws["Z26"]
-        if isinstance(z26.value, str) and z26.value.startswith("="):
-            z26.value = f"=Z25*{commission_pct}%"
-
-        for row in ws.iter_rows():
-            for cell in row:
-                if isinstance(cell.value, str):
-                    val = cell.value
-                    if val.startswith("="):
-                        continue  # формулы не трогаем (кроме Z26 выше)
-                    for ph, repl in replacements.items():
-                        if ph in val:
-                            if val == ph:
-                                cell.value = repl
-                            else:
-                                cell.value = val.replace(ph, str(repl))
-                            break
-
-        path = self.output_dir / f"Счёт_{number}.xlsx"
-        wb.save(str(path))
-        return str(path)
-
-    async def _generate_invoice(self, data: dict, number: str, date: str, commission_pct: float = 1.0) -> str:
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = "Счёт"
@@ -459,7 +387,6 @@ class DocumentBuilder:
         wb.save(str(path))
         return str(path)
 
-
     # ─── КОНВЕРТАЦИЯ В PDF ────────────────────────────────────────────────
 
     async def convert_to_pdf(self, filepath: str) -> str | None:
@@ -603,7 +530,7 @@ class DocumentBuilder:
             "{{ЦЕНА_ПРОПИСЬЮ}}":           data.get("car_price_words", ""),
             "{{ВАЛЮТА}}":                  data.get("currency", "рублей"),
             "{{СУММА_НАЛИЧНЫМИ}}":         cash_fmt,
-            "{{СУММА_ПРОПИСЬЮ}}": data.get("cash_amount_words", ""),
+            "{{СУММА_НАЛИЧНЫМИ_ПРОПИСЬЮ}}": data.get("cash_amount_words", ""),
             "{{ВАЛЮТА_НАЛИЧНЫМИ}}":        data.get("cash_currency", data.get("currency", "рублей")),
 
             # Банковские реквизиты
@@ -667,6 +594,35 @@ class DocumentBuilder:
                 replace_in_para(para)
             for para in section.footer.paragraphs:
                 replace_in_para(para)
+
+        # ── Проверка на незамещённые плейсхолдеры ──────────────────────
+        import re
+        leftover = set()
+
+        def scan_para(para):
+            text = "".join(t.text or "" for r in para._element.findall(f"{{{W}}}r")
+                            for t in r.findall(f"{{{W}}}t"))
+            for m in re.findall(r"\{\{[^{}]+\}\}", text):
+                leftover.add(m)
+
+        for para in doc.paragraphs:
+            scan_para(para)
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    for para in cell.paragraphs:
+                        scan_para(para)
+        for section in doc.sections:
+            for para in section.header.paragraphs:
+                scan_para(para)
+            for para in section.footer.paragraphs:
+                scan_para(para)
+
+        if leftover:
+            logger.warning(
+                f"В документе {output_name}.docx остались незамещённые плейсхолдеры: "
+                f"{sorted(leftover)}"
+            )
 
         path = self.output_dir / f"{output_name}.docx"
         doc.save(str(path))
