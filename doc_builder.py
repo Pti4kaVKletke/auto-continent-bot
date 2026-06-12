@@ -15,6 +15,94 @@ from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
 logger = logging.getLogger(__name__)
 
 
+# ─── Сумма прописью (рубли) ────────────────────────────────────────────────
+
+_UNITS = ["", "один", "два", "три", "четыре", "пять", "шесть", "семь", "восемь", "девять"]
+_UNITS_F = ["", "одна", "две", "три", "четыре", "пять", "шесть", "семь", "восемь", "девять"]
+_TEENS = ["десять", "одиннадцать", "двенадцать", "тринадцать", "четырнадцать",
+          "пятнадцать", "шестнадцать", "семнадцать", "восемнадцать", "девятнадцать"]
+_TENS = ["", "", "двадцать", "тридцать", "сорок", "пятьдесят",
+         "шестьдесят", "семьдесят", "восемьдесят", "девяносто"]
+_HUNDREDS = ["", "сто", "двести", "триста", "четыреста", "пятьсот",
+             "шестьсот", "семьсот", "восемьсот", "девятьсот"]
+
+# (ед.ч., мн.ч. 2-4, мн.ч. 5+, женский род)
+_SCALE = [
+    ("", "", "", False),
+    ("тысяча", "тысячи", "тысяч", True),
+    ("миллион", "миллиона", "миллионов", False),
+    ("миллиард", "миллиарда", "миллиардов", False),
+]
+
+
+def _plural(n: int, one: str, few: str, many: str) -> str:
+    n100 = n % 100
+    n10 = n % 10
+    if 11 <= n100 <= 14:
+        return many
+    if n10 == 1:
+        return one
+    if 2 <= n10 <= 4:
+        return few
+    return many
+
+
+def _three_digits_to_words(n: int, feminine: bool = False) -> str:
+    words = []
+    h, rem = divmod(n, 100)
+    if h:
+        words.append(_HUNDREDS[h])
+    t, u = divmod(rem, 10)
+    if t == 1:
+        words.append(_TEENS[u])
+    else:
+        if t:
+            words.append(_TENS[t])
+        if u:
+            words.append((_UNITS_F if feminine else _UNITS)[u])
+    return " ".join(words)
+
+
+def amount_to_words_rub(amount) -> str:
+    """
+    Преобразует сумму в рублях в строку прописью с копейками.
+    Пример: 3997500 -> "Три миллиона девятьсот девяносто семь тысяч пятьсот рублей 00 копеек"
+    """
+    try:
+        amount = float(amount)
+    except (TypeError, ValueError):
+        return ""
+
+    rub = int(amount)
+    kop = round((amount - rub) * 100)
+
+    if rub == 0:
+        rub_words = "ноль"
+    else:
+        groups = []
+        n = rub
+        scale_idx = 0
+        while n > 0:
+            n, group = divmod(n, 1000)
+            if group:
+                groups.append((group, scale_idx))
+            scale_idx += 1
+
+        parts = []
+        for group, idx in reversed(groups):
+            one, few, many, feminine = _SCALE[idx]
+            parts.append(_three_digits_to_words(group, feminine=feminine))
+            if idx > 0:
+                parts.append(_plural(group, one, few, many))
+        rub_words = " ".join(p for p in parts if p)
+
+    rub_words = rub_words[0].upper() + rub_words[1:]
+    rub_label = _plural(rub, "рубль", "рубля", "рублей")
+    kop_label = _plural(kop, "копейка", "копейки", "копеек")
+
+    return f"{rub_words} {rub_label} {kop:02d} {kop_label}"
+
+
 class DocumentBuilder:
 
     def __init__(self):
@@ -180,7 +268,7 @@ class DocumentBuilder:
         date_str = f"{day_n} {self._month_name(mon_n)} {year_n}"
 
         total_fmt   = f"{total:,.2f}".replace(",", " ")
-        total_words = data.get("cash_amount_words") or data.get("car_price_words", "")
+        total_words = amount_to_words_rub(total) if acc_cur == "RUB" else ""
 
         replacements = {
             "{{BANK_CORR_NAME}}":    data.get("bank_corr_line1", ""),
