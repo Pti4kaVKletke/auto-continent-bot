@@ -506,17 +506,19 @@ VIN: ...
             dkp_pdf  = f"ДКП_ТС_{number}.pdf"
             inv_pdf  = f"Счёт_{number}.pdf"
 
-            # ── 2. Загружаем docx/xlsx на Drive ───────────────────────────
+            # ── 2. Загружаем docx/xlsx на Drive ПОСЛЕДОВАТЕЛЬНО ────────────
+            # (параллельные запросы через httplib2/googleapiclient в разных
+            #  потоках вызывают сегфолт "double free or corruption")
             logger.info("Загружаю на Drive...")
-            upload_results = await asyncio.gather(
-                self.drive.upload_file(ag_path,      ag_docx,  deal_folder_id),
-                self.drive.upload_file(dkp_path,     dkp_docx, deal_folder_id),
-                self.drive.upload_file(invoice_path, inv_xlsx,  deal_folder_id),
-                return_exceptions=True,
-            )
-            for r in upload_results:
-                if isinstance(r, Exception):
-                    logger.error(f"Ошибка загрузки на Drive (сделка {number}): {r}", exc_info=True)
+            for fpath, fname in (
+                (ag_path,      ag_docx),
+                (dkp_path,     dkp_docx),
+                (invoice_path, inv_xlsx),
+            ):
+                try:
+                    await self.drive.upload_file(fpath, fname, deal_folder_id)
+                except Exception as e:
+                    logger.error(f"Ошибка загрузки на Drive (сделка {number}, файл {fname}): {e}", exc_info=True)
 
             # ── 3. PDF только если не отключён через SKIP_PDF=1 ───────────
             skip_pdf = os.environ.get("SKIP_PDF", "0") == "1"
