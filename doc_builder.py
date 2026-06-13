@@ -315,7 +315,6 @@ class DocumentBuilder:
         ws.page_setup.fitToPage = True
         ws.page_setup.fitToWidth = 1
         ws.page_setup.fitToHeight = 0
-        ws.sheet_properties.pageSetUpPr = openpyxl.worksheet.properties.PageSetupProperties(fitToPage=True)
 
         path = self.output_dir / f"Счёт_{number}.xlsx"
         wb.save(str(path))
