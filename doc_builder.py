@@ -13,6 +13,7 @@ import openpyxl
 from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
 
 logger = logging.getLogger(__name__)
+logger.info(f"openpyxl version: {openpyxl.__version__}")
 
 
 # ─── Сумма прописью (рубли) ────────────────────────────────────────────────
@@ -312,9 +313,102 @@ class DocumentBuilder:
         wb.save(str(path))
 
         wb_check = openpyxl.load_workbook(str(path))
-        logger.info(f"Счёт сохранён, изображений в файле: {len(wb_check.active._images)}")
+        n_images = len(wb_check.active._images)
+        logger.info(f"Счёт сохранён, изображений в файле: {n_images}")
+
+        if n_images == 0 and template.exists():
+            logger.warning("Изображения потерялись при сохранении — восстанавливаю вручную из шаблона")
+            self._restore_images_from_template(path, template)
 
         return str(path)
+
+    def _restore_images_from_template(self, output_path: Path, template_path: Path):
+        """
+        Запасной путь: копирует печать/подпись (xl/media/*, xl/drawings/*) и связи
+        из шаблона прямо в zip-архив готового файла, на случай если openpyxl
+        потерял изображения при load/save.
+        """
+        import zipfile
+        import shutil
+        import re
+
+        tmp_path = output_path.with_suffix(".tmp.xlsx")
+
+        with zipfile.ZipFile(template_path, "r") as tz:
+            template_names = set(tz.namelist())
+            media_files   = [n for n in template_names if n.startswith("xl/media/")]
+            drawing_files = [n for n in template_names if n.startswith("xl/drawings/")]
+
+            if not media_files:
+                logger.warning("В шаблоне нет xl/media/* — восстановление невозможно")
+                return
+
+            with zipfile.ZipFile(output_path, "r") as oz:
+                out_names = set(oz.namelist())
+
+                with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as nz:
+                    # копируем всё содержимое готового файла, кроме того что заменим
+                    skip = set(media_files) | set(drawing_files)
+                    for item in oz.infolist():
+                        if item.filename in skip:
+                            continue
+                        data = oz.read(item.filename)
+                        if item.filename == "xl/worksheets/sheet1.xml":
+                            # добавляем ссылку <drawing r:id="..."/> перед </worksheet>, если её нет
+                            text = data.decode("utf-8")
+                            if "<drawing " not in text:
+                                if 'xmlns:r=' not in text.split('>', 1)[0]:
+                                    text = text.replace(
+                                        "<worksheet xmlns=",
+                                        '<worksheet xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns=',
+                                        1,
+                                    )
+                                text = text.replace("</worksheet>", '<drawing r:id="rIdDrawing1"/></worksheet>')
+                                data = text.encode("utf-8")
+                        elif item.filename == "xl/worksheets/_rels/sheet1.xml.rels":
+                            text = data.decode("utf-8")
+                            if "drawing1.xml" not in text:
+                                text = text.replace(
+                                    "</Relationships>",
+                                    '<Relationship Id="rIdDrawing1" '
+                                    'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" '
+                                    'Target="../drawings/drawing1.xml"/></Relationships>'
+                                )
+                                data = text.encode("utf-8")
+                        elif item.filename == "[Content_Types].xml":
+                            text = data.decode("utf-8")
+                            additions = ""
+                            if "PartName=\"/xl/drawings/drawing1.xml\"" not in text:
+                                additions += ('<Override PartName="/xl/drawings/drawing1.xml" '
+                                               'ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/>')
+                            if "Extension=\"png\"" not in text:
+                                additions += '<Default Extension="png" ContentType="image/png"/>'
+                            if additions:
+                                text = text.replace("</Types>", additions + "</Types>")
+                                data = text.encode("utf-8")
+                        nz.writestr(item, data)
+
+                    if "xl/worksheets/_rels/sheet1.xml.rels" not in out_names:
+                        # на случай если у листа вообще не было _rels
+                        rels = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+                                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                                '<Relationship Id="rIdDrawing1" '
+                                'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" '
+                                'Target="../drawings/drawing1.xml"/></Relationships>')
+                        nz.writestr("xl/worksheets/_rels/sheet1.xml.rels", rels)
+
+                    # копируем media и drawings из шаблона как есть
+                    for name in media_files + drawing_files:
+                        nz.writestr(name, tz.read(name))
+
+        shutil.move(str(tmp_path), str(output_path))
+
+        # финальная проверка
+        try:
+            wb_final = openpyxl.load_workbook(str(output_path))
+            logger.info(f"После восстановления изображений: {len(wb_final.active._images)}")
+        except Exception as e:
+            logger.error(f"Ошибка проверки файла после восстановления картинок: {e}", exc_info=True)
 
     # ─── КОНВЕРТАЦИЯ В PDF ────────────────────────────────────────────────
 
