@@ -245,8 +245,11 @@ class DocumentBuilder:
         (содержит реальную печать и подпись директора).
         """
         template = self.templates_dir / "invoice_template.xlsx"
+        logger.info(f"Загружаю шаблон счёта: {template} (существует: {template.exists()}, "
+                    f"размер: {template.stat().st_size if template.exists() else 0} байт)")
         wb = openpyxl.load_workbook(str(template))
         ws = wb.active
+        logger.info(f"Шаблон счёта загружен, изображений: {len(ws._images)}")
 
         price_str = str(data.get("car_price", "0")).replace(" ", "").replace(",", ".")
         try:
@@ -307,6 +310,10 @@ class DocumentBuilder:
 
         path = self.output_dir / f"Счёт_{number}.xlsx"
         wb.save(str(path))
+
+        wb_check = openpyxl.load_workbook(str(path))
+        logger.info(f"Счёт сохранён, изображений в файле: {len(wb_check.active._images)}")
+
         return str(path)
 
     # ─── КОНВЕРТАЦИЯ В PDF ────────────────────────────────────────────────
