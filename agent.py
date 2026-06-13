@@ -33,8 +33,7 @@ class DocumentAgent:
 
 У тебя есть РЕАЛЬНЫЕ ИНСТРУМЕНТЫ которые ты ОБЯЗАН использовать:
 
-- create_contract — создать договор купли-продажи и сохранить на Google Drive
-- create_invoice  — создать счёт на оплату и сохранить на Google Drive
+- create_contract — создать полный пакет документов сделки (агентский договор, ДКП и счёт) и сохранить на Google Drive
 - save_company    — сохранить реквизиты компании/клиента в постоянную память
 - save_instruction — сохранить инструкцию для себя
 
@@ -367,18 +366,6 @@ VIN: ...
                 },
             },
             {
-                "name": "create_invoice",
-                "description": "Создать счёт на оплату",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "data":           {"type": "object", "description": "Данные для заполнения счёта"},
-                        "invoice_number": {"type": "string", "description": "Номер счёта (опционально)"},
-                    },
-                    "required": ["data"],
-                },
-            },
-            {
                 "name": "save_company",
                 "description": "Сохранить реквизиты компании или клиента в память",
                 "input_schema": {
@@ -589,30 +576,6 @@ VIN: ...
                 "extra_names": extra_names,
                 "drive_link":  ag_link,
                 "message":     f"Сделка {number}: {total_files} файлов отправлено{pdf_note}",
-            }
-
-        elif tool_name == "create_invoice":
-            number = tool_input.get("invoice_number") or await self.drive.get_next_contract_number()
-            date   = datetime.now().strftime("%d.%m.%Y")
-            deal_folder_id = await self.drive.get_or_create_deal_folder(number)
-
-            invoice_path = await self.builder.build_invoice(tool_input["data"], number, date)
-            inv_xlsx     = f"Счёт_{number}.xlsx"
-
-            await self.drive.upload_file(invoice_path, inv_xlsx, deal_folder_id)
-
-            skip_pdf = os.environ.get("SKIP_PDF", "0") == "1"
-            link = ""
-            if not skip_pdf:
-                inv_pdf_path = await self.builder.convert_to_pdf(invoice_path)
-                if inv_pdf_path:
-                    link = await self.drive.upload_file(inv_pdf_path, f"Счёт_{number}.pdf", deal_folder_id)
-
-            return {
-                "file":       invoice_path,
-                "filename":   inv_xlsx,
-                "drive_link": link,
-                "message":    f"Счёт {number} создан и сохранён на Drive",
             }
 
         elif tool_name == "save_company":
