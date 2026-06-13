@@ -1,2 +1,2 @@
 [phases.setup]
-nixPkgs = ["python311", "libreoffice"]
+nixPkgs = ["python311", "libreoffice", "fontconfig", "liberation_ttf", "dejavu_fonts"]

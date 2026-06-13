@@ -309,6 +309,14 @@ class DocumentBuilder:
         ws["B31"] = f"Всего наименований 2, на сумму {total_fmt} {acc_cur}"
         ws["B32"] = total_words
 
+        # Настройка области печати для корректного PDF-экспорта через LibreOffice
+        ws.print_area = ws.dimensions
+        ws.page_setup.orientation = "portrait"
+        ws.page_setup.fitToPage = True
+        ws.page_setup.fitToWidth = 1
+        ws.page_setup.fitToHeight = 0
+        ws.sheet_properties.pageSetUpPr = openpyxl.worksheet.properties.PageSetupProperties(fitToPage=True)
+
         path = self.output_dir / f"Счёт_{number}.xlsx"
         wb.save(str(path))
 
@@ -583,35 +591,40 @@ class DocumentBuilder:
             if not any(ph in full_text for ph in replacements):
                 return
 
-            # Найти один run, который содержит ВСЕ плейсхолдеры этого параграфа —
-            # обычно так и есть. Заменяем текст только в нём, сохраняя его
-            # собственное форматирование и НЕ трогая соседние runs (например
-            # жирный номер пункта "2.", "4.", "6.").
-            target_run = None
+            # Шаг 1: заменяем плейсхолдеры, которые ПОЛНОСТЬЮ находятся
+            # внутри одного run — сохраняем форматирование этого run и
+            # НЕ трогаем соседние runs (например жирный номер пункта "2.", "4.", "6.").
             for r in runs:
                 r_text = "".join(t.text or "" for t in r.findall(f"{{{W}}}t"))
                 if any(ph in r_text for ph in replacements):
-                    target_run = r
-                    break
+                    for t in r.findall(f"{{{W}}}t"):
+                        if t.text:
+                            new_text = t.text
+                            for ph, val in replacements.items():
+                                new_text = new_text.replace(ph, str(val) if val is not None else "")
+                            t.text = new_text
+                            if new_text and (new_text[0] == " " or new_text[-1] == " "):
+                                t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
 
-            if target_run is not None:
-                for t in target_run.findall(f"{{{W}}}t"):
-                    if t.text:
-                        new_text = t.text
-                        for ph, val in replacements.items():
-                            new_text = new_text.replace(ph, str(val) if val is not None else "")
-                        t.text = new_text
-                        if new_text and (new_text[0] == " " or new_text[-1] == " "):
-                            t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+            # Шаг 2: проверяем, остались ли НЕзамещённые плейсхолдеры —
+            # значит они были разорваны между несколькими runs (например
+            # «{{ДЕНЬ}}» — кавычка-ёлочка в одном run, а сам плейсхолдер
+            # в другом). Для них делаем фоллбэк-слияние всех runs параграфа.
+            runs = p_elem.findall(f"{{{W}}}r")
+            full_text2 = "".join(
+                t.text or ""
+                for r in runs
+                for t in r.findall(f"{{{W}}}t")
+            )
+            if not any(ph in full_text2 for ph in replacements):
                 return
 
-            # Фоллбэк: плейсхолдер разорван между несколькими runs —
-            # сливаем как раньше (форматирование первого run).
+            # Фоллбэк: сливаем все runs параграфа в один (форматирование первого run).
             first_rpr  = runs[0].find(f"{{{W}}}rPr")
             children   = list(p_elem)
             insert_idx = children.index(runs[0])
 
-            new_text = full_text
+            new_text = full_text2
             for ph, val in replacements.items():
                 new_text = new_text.replace(ph, str(val) if val is not None else "")
 
