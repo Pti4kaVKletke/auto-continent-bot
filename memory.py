@@ -49,6 +49,14 @@ def init_db():
             content TEXT NOT NULL,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         );
+
+        CREATE TABLE IF NOT EXISTS pending_scans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id TEXT NOT NULL,
+            filepath TEXT NOT NULL,
+            original_name TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
     """)
     conn.commit()
     conn.close()
@@ -194,5 +202,65 @@ def get_history(limit: int = 20) -> list:
 def clear_history():
     conn = get_conn()
     conn.execute("DELETE FROM history")
+    conn.commit()
+    conn.close()
+
+
+# --- Сканы документов, ожидающие привязки к сделке ---
+
+def add_pending_scan(chat_id: str, filepath: str, original_name: str):
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO pending_scans (chat_id, filepath, original_name) VALUES (?, ?, ?)",
+        (str(chat_id), filepath, original_name)
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_pending_scans(chat_id: str) -> list:
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT id, filepath, original_name FROM pending_scans WHERE chat_id=? ORDER BY id",
+        (str(chat_id),)
+    ).fetchall()
+    conn.close()
+    return [{"id": r["id"], "filepath": r["filepath"], "original_name": r["original_name"]} for r in rows]
+
+
+def clear_pending_scans(chat_id: str):
+    """Удаляет записи и сами файлы для данного chat_id (после успешной загрузки в Drive)."""
+    scans = get_pending_scans(chat_id)
+    for s in scans:
+        try:
+            p = Path(s["filepath"])
+            if p.exists():
+                p.unlink()
+        except Exception:
+            pass
+
+    conn = get_conn()
+    conn.execute("DELETE FROM pending_scans WHERE chat_id=?", (str(chat_id),))
+    conn.commit()
+    conn.close()
+
+
+def cleanup_old_pending_scans(max_age_days: int = 7):
+    """Удаляет старые незавершённые сканы (старше max_age_days) — вызывать при старте бота."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT id, filepath FROM pending_scans WHERE created_at < datetime('now', ?)",
+        (f"-{max_age_days} days",)
+    ).fetchall()
+
+    for r in rows:
+        try:
+            p = Path(r["filepath"])
+            if p.exists():
+                p.unlink()
+        except Exception:
+            pass
+
+    conn.execute("DELETE FROM pending_scans WHERE created_at < datetime('now', ?)", (f"-{max_age_days} days",))
     conn.commit()
     conn.close()

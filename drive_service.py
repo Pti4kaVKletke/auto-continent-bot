@@ -129,7 +129,8 @@ class GoogleDriveService:
 
         return await asyncio.to_thread(_find_max_number)
 
-    async def get_or_create_deal_folder(self, contract_number: str) -> str:
+    async def get_or_create_deal_folder(self, contract_number: str) -> tuple[str, str]:
+        """Возвращает (deal_folder_id, scans_folder_id)."""
         month = contract_number[2:4]
         year  = "20" + contract_number[4:6]
         month_name = f"{month}-{MONTHS_RU.get(month, month)}"
@@ -138,9 +139,9 @@ class GoogleDriveService:
         year_id      = await self._get_or_create_folder(year, contracts_id)
         month_id     = await self._get_or_create_folder(month_name, year_id)
         deal_id      = await self._get_or_create_folder(contract_number, month_id)
-        await self._get_or_create_folder("Сканы", deal_id)
+        scans_id     = await self._get_or_create_folder("Сканы", deal_id)
 
-        return deal_id
+        return deal_id, scans_id
 
     async def upload_file(self, filepath: str, filename: str, folder_id: str,
                           mime_type: str = None) -> str:
