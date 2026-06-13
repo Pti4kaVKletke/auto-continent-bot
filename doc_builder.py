@@ -692,6 +692,18 @@ class DocumentBuilder:
                 f"{sorted(leftover)}"
             )
 
+        # ── Удаляем w:proofErr (артефакты проверки правописания Word) ──
+        # Эти теги между runs иногда вызывают переупорядочивание текста
+        # при экспорте в PDF через LibreOffice. Header/footer — отдельные
+        # XML-части, проходим по ним отдельно.
+        for elem in doc.element.body.iter(f"{{{W}}}proofErr"):
+            elem.getparent().remove(elem)
+        for section in doc.sections:
+            for elem in list(section.header._element.iter(f"{{{W}}}proofErr")):
+                elem.getparent().remove(elem)
+            for elem in list(section.footer._element.iter(f"{{{W}}}proofErr")):
+                elem.getparent().remove(elem)
+
         path = self.output_dir / f"{output_name}.docx"
         doc.save(str(path))
         return str(path)
