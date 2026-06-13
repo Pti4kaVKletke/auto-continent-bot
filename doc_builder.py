@@ -310,11 +310,19 @@ class DocumentBuilder:
         ws["B32"] = total_words
 
         # Настройка области печати для корректного PDF-экспорта через LibreOffice
-        ws.print_area = ws.dimensions
-        ws.page_setup.orientation = "portrait"
-        ws.page_setup.fitToPage = True
-        ws.page_setup.fitToWidth = 1
-        ws.page_setup.fitToHeight = 0
+        try:
+            from openpyxl.worksheet.properties import WorksheetProperties, PageSetupProperties
+            if ws.sheet_properties is None:
+                ws.sheet_properties = WorksheetProperties()
+            if ws.sheet_properties.pageSetUpPr is None:
+                ws.sheet_properties.pageSetUpPr = PageSetupProperties()
+            ws.print_area = ws.dimensions
+            ws.page_setup.orientation = "portrait"
+            ws.page_setup.fitToPage = True
+            ws.page_setup.fitToWidth = 1
+            ws.page_setup.fitToHeight = 0
+        except Exception as e:
+            logger.warning(f"Не удалось настроить page_setup для PDF: {e}")
 
         path = self.output_dir / f"Счёт_{number}.xlsx"
         wb.save(str(path))
