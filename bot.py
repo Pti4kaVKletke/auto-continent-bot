@@ -132,7 +132,23 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     data = query.data or ""
-    if data.startswith("bankprofile:"):
+
+    if data.startswith("deal_date:"):
+        value = data.split(":", 1)[1]
+        await query.edit_message_reply_markup(reply_markup=None)
+
+        if value == "__custom__":
+            context.user_data["awaiting_deal_date"] = True
+            await query.message.reply_text(
+                "Введите дату договора в формате ДД.ММ.ГГГГ (например: 18.06.2026):"
+            )
+        else:
+            # Дата выбрана — получаем номер и создаём
+            await query.message.reply_text("⏳ Создаю договоры...")
+            result = await agent.process_message(f"Дата договора: {value}")
+            await send_result(query.message, result)
+
+    elif data.startswith("bankprofile:"):
         profile_name = data.split(":", 1)[1]
 
         if profile_name == "__new__":
@@ -149,46 +165,33 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
+
+    # Если ожидаем ввод даты договора вручную
+    if context.user_data.get("awaiting_deal_date"):
+        context.user_data["awaiting_deal_date"] = False
+        date_input = user_text.strip()
+        await update.message.reply_text("⏳ Создаю договоры...")
+        result = await agent.process_message(f"Дата договора: {date_input}")
+        await send_result(update.message, result)
+        return
+
     await update.message.reply_text("🤔 Думаю...")
-
     result = await agent.process_message(user_text)
-
     await send_result(update.message, result)
 
 
 async def error_handler(update, context):
-    from telegram.error import TimedOut, NetworkError
-    err = context.error
-
-    logger.error(f"Необработанная ошибка: {err}", exc_info=err)
-
-    if isinstance(err, TimedOut):
-        # Таймаут при отправке файлов — файлы уже доставлены, просто медленный Drive
-        logger.warning("TimedOut при отправке в Telegram — файлы скорее всего уже доставлены")
-        return
-
+    logger.error(f"Необработанная ошибка: {context.error}", exc_info=context.error)
     if isinstance(update, Update) and update.effective_message:
         try:
-            if isinstance(err, NetworkError):
-                msg = "⚠️ Ошибка сети при связи с Telegram. Попробуйте ещё раз."
-            else:
-                msg = "⚠️ Произошла ошибка, попробуйте ещё раз."
-            await update.effective_message.reply_text(msg)
+            await update.effective_message.reply_text("⚠️ Произошла ошибка, попробуйте ещё раз.")
         except Exception:
             pass
 
 
 def main():
     token = os.environ["TELEGRAM_BOT_TOKEN"]
-    app = (
-        ApplicationBuilder()
-        .token(token)
-        .connect_timeout(30)
-        .read_timeout(120)
-        .write_timeout(120)
-        .pool_timeout(30)
-        .build()
-    )
+    app = ApplicationBuilder().token(token).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("memory", show_memory))

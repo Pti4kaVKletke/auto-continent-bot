@@ -154,6 +154,61 @@ class GoogleDriveService:
 
         return await asyncio.to_thread(_find_max_number)
 
+    async def get_next_number_for_date(self, date_str: str) -> str:
+        """
+        Возвращает следующий номер договора для произвольной даты ДД.ММ.ГГГГ.
+        Формат: ДДММГГ+NNN
+        """
+        parts = date_str.strip().split(".")
+        if len(parts) != 3:
+            return await self.get_next_contract_number()
+        day, month, year2 = parts[0], parts[1], parts[2][2:]  # год 2026 → 26
+        year4 = parts[2]
+        prefix = f"{day}{month}{year2}"
+        month_name = f"{month}-{MONTHS_RU.get(month, month)}"
+
+        def _find_max():
+            try:
+                def find_folder(name, parent):
+                    q = (f"name='{name}' and "
+                         f"mimeType='application/vnd.google-apps.folder' and "
+                         f"'{parent}' in parents and trashed=false")
+                    res = self.service.files().list(q=q, fields="files(id)",
+                                                    supportsAllDrives=True,
+                                                    includeItemsFromAllDrives=True).execute()
+                    files = res.get("files", [])
+                    return files[0]["id"] if files else None
+
+                contracts_id = find_folder("Договоры", self.root_folder_id)
+                if not contracts_id: return f"{prefix}001"
+                year_id = find_folder(year4, contracts_id)
+                if not year_id: return f"{prefix}001"
+                month_id = find_folder(month_name, year_id)
+                if not month_id: return f"{prefix}001"
+
+                q = (f"mimeType='application/vnd.google-apps.folder' and "
+                     f"'{month_id}' in parents and trashed=false and "
+                     f"name contains '{prefix}'")
+                res = self.service.files().list(q=q, fields="files(name)",
+                                                supportsAllDrives=True,
+                                                includeItemsFromAllDrives=True).execute()
+                folders = res.get("files", [])
+                max_n = 0
+                for f in folders:
+                    name = f.get("name", "")
+                    if name.startswith(prefix) and len(name) == len(prefix) + 3:
+                        try:
+                            n = int(name[len(prefix):])
+                            max_n = max(max_n, n)
+                        except ValueError:
+                            pass
+                return f"{prefix}{max_n + 1:03d}"
+            except Exception as e:
+                logger.error(f"Ошибка получения номера для даты {date_str}: {e}", exc_info=True)
+                return f"{prefix}001"
+
+        return await asyncio.to_thread(_find_max)
+
     async def get_or_create_deal_folder(self, contract_number: str) -> str:
         month = contract_number[2:4]
         year  = "20" + contract_number[4:6]

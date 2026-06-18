@@ -33,11 +33,17 @@ class DocumentAgent:
 
 У тебя есть РЕАЛЬНЫЕ ИНСТРУМЕНТЫ которые ты ОБЯЗАН использовать:
 
+- propose_contract_number — предложить номер договора пользователю на подтверждение (вызывать ПЕРЕД create_contract)
 - create_contract — создать полный пакет документов сделки (агентский договор, ДКП и счёт) и сохранить на Google Drive
 - save_company    — сохранить реквизиты компании/клиента в постоянную память
 - save_instruction — сохранить инструкцию для себя
 
-ВАЖНО: Когда пользователь просит создать договор или счёт — ВСЕГДА вызывай соответствующий инструмент.
+ВАЖНО: Когда все данные собраны и пользователь подтвердил "верно" — СНАЧАЛА вызови propose_contract_number,
+дождись подтверждения номера от пользователя, и только потом вызови create_contract с подтверждённым номером.
+
+Когда пользователь пишет "Дата договора: ДД.ММ.ГГГГ" — немедленно вызывай create_contract,
+передавая данные из __pending_deal__ в памяти. НЕ указывай contract_number — он определится автоматически по дате.
+Дату передавай в поле data как "contract_date": "ДД.ММ.ГГГГ".
 
 === ОБЯЗАТЕЛЬНЫЕ КЛЮЧИ В ПОЛЕ data ===
 
@@ -397,6 +403,22 @@ VIN: ...
                 },
             },
             {
+                "name": "propose_contract_number",
+                "description": (
+                    "Спросить у пользователя дату договора — сегодня или другая. "
+                    "ВСЕГДА вызывай этот инструмент ПЕРЕД create_contract. "
+                    "После выбора даты автоматически определяется номер договора."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "data":           {"type": "object", "description": "Те же данные что передашь в create_contract"},
+                        "commission_pct": {"type": "number", "description": "Комиссия в процентах"},
+                    },
+                    "required": ["data", "commission_pct"],
+                },
+            },
+            {
                 "name": "save_company",
                 "description": "Сохранить реквизиты компании или клиента в память",
                 "input_schema": {
@@ -507,25 +529,49 @@ VIN: ...
     async def _execute_tool(self, tool_name: str, tool_input: dict) -> dict:
 
         if tool_name == "create_contract":
-            number = tool_input.get("contract_number") or await self.drive.get_next_contract_number()
+            # ── Проверяем доступ к Drive ДО начала работы ─────────────────
+            drive_ok = await self.drive.check_access()
+            if not drive_ok:
+                return {
+                    "message": (
+                        "❌ Нет доступа к Google Drive — токен авторизации истёк или отозван.\n\n"
+                        "Необходимо обновить токен:\n"
+                        "1. Сообщите директору — нужно обновить GOOGLE_OAUTH_TOKEN в Railway\n"
+                        "2. После обновления токена повторите создание договора"
+                    )
+                }
 
-            logger.debug("DATA KEYS: " + str(list(tool_input.get("data", {}).keys())))
-
-            date           = datetime.now().strftime("%d.%m.%Y")
+            data_input     = dict(tool_input.get("data", {}))
             commission_pct = float(tool_input.get("commission_pct", 1.0))
+
+            # Дата договора — из data["contract_date"] или сегодня
+            contract_date = data_input.pop("contract_date", None)
+            date = contract_date if contract_date else datetime.now().strftime("%d.%m.%Y")
+
+            # Номер — явный, или по указанной дате, или сегодняшний
+            if tool_input.get("contract_number"):
+                number = tool_input["contract_number"]
+            elif contract_date:
+                number = await self.drive.get_next_number_for_date(contract_date)
+            else:
+                number = await self.drive.get_next_contract_number()
+
+            logger.debug("DATA KEYS: " + str(list(data_input.keys())))
+            logger.info(f"Создаю сделку {number} датой {date}")
+
             deal_folder_id = await self.drive.get_or_create_deal_folder(number)
 
             # ── 1. Строим документы ПОСЛЕДОВАТЕЛЬНО (не параллельно — меньше памяти) ──
             built = {}
             try:
                 logger.info("Строю АГ договор...")
-                built["ag"] = await self.builder.build_contract(tool_input["data"], number, date, commission_pct)
+                built["ag"] = await self.builder.build_contract(data_input, number, date, commission_pct)
 
                 logger.info("Строю ДКП...")
-                built["dkp"] = await self.builder.build_dkp(tool_input["data"], number, date)
+                built["dkp"] = await self.builder.build_dkp(data_input, number, date)
 
                 logger.info("Строю счёт...")
-                built["invoice"] = await self.builder.build_invoice(tool_input["data"], number, date, commission_pct)
+                built["invoice"] = await self.builder.build_invoice(data_input, number, date, commission_pct)
 
             except Exception as e:
                 logger.error(f"Ошибка построения документов для сделки {number}: {e}", exc_info=True)
@@ -547,23 +593,17 @@ VIN: ...
             inv_pdf  = f"Счёт_{number}.pdf"
 
             # ── 2. Загружаем docx/xlsx на Drive ПОСЛЕДОВАТЕЛЬНО ────────────
+            # (параллельные запросы через httplib2/googleapiclient в разных
+            #  потоках вызывают сегфолт "double free or corruption")
             logger.info("Загружаю на Drive...")
-            drive_uploaded = 0
-            drive_failed = 0
             for fpath, fname in (
                 (ag_path,      ag_docx),
                 (dkp_path,     dkp_docx),
                 (invoice_path, inv_xlsx),
             ):
                 try:
-                    link = await self.drive.upload_file(fpath, fname, deal_folder_id)
-                    if link:
-                        drive_uploaded += 1
-                    else:
-                        drive_failed += 1
-                        logger.error(f"Загрузка вернула пустую ссылку: {fname}")
+                    await self.drive.upload_file(fpath, fname, deal_folder_id)
                 except Exception as e:
-                    drive_failed += 1
                     logger.error(f"Ошибка загрузки на Drive (сделка {number}, файл {fname}): {e}", exc_info=True)
 
             # ── 3. PDF только если не отключён через SKIP_PDF=1 ───────────
@@ -579,16 +619,10 @@ VIN: ...
 
                 if ag_pdf_path:
                     ag_link = await self.drive.upload_file(ag_pdf_path, ag_pdf, deal_folder_id)
-                    if ag_link: drive_uploaded += 1
-                    else: drive_failed += 1
                 if dkp_pdf_path:
-                    r = await self.drive.upload_file(dkp_pdf_path, dkp_pdf, deal_folder_id)
-                    if r: drive_uploaded += 1
-                    else: drive_failed += 1
+                    await self.drive.upload_file(dkp_pdf_path, dkp_pdf, deal_folder_id)
                 if inv_pdf_path:
-                    r = await self.drive.upload_file(inv_pdf_path, inv_pdf, deal_folder_id)
-                    if r: drive_uploaded += 1
-                    else: drive_failed += 1
+                    await self.drive.upload_file(inv_pdf_path, inv_pdf, deal_folder_id)
             else:
                 logger.info("PDF пропущен (SKIP_PDF=1)")
 
@@ -612,20 +646,39 @@ VIN: ...
             total_files = 1 + len(extra_files)
             pdf_note = " (PDF отключён)" if skip_pdf else ("" if ag_pdf_path else " (LibreOffice недоступен)")
 
-            if drive_failed == 0:
-                drive_note = f"☁️ Drive: {drive_uploaded} файлов загружено"
-            elif drive_uploaded == 0:
-                drive_note = "⚠️ Drive: файлы НЕ сохранены — проверьте токен Google"
-            else:
-                drive_note = f"⚠️ Drive: загружено {drive_uploaded}, не загружено {drive_failed}"
-
             return {
                 "file":        ag_path,
                 "filename":    ag_docx,
                 "extra_files": extra_files,
                 "extra_names": extra_names,
                 "drive_link":  ag_link,
-                "message":     f"Сделка {number}: {total_files} файлов отправлено{pdf_note}\n{drive_note}",
+                "message":     f"Сделка {number}: {total_files} файлов отправлено{pdf_note}",
+            }
+
+        elif tool_name == "propose_contract_number":
+            # Проверяем доступ к Drive
+            drive_ok = await self.drive.check_access()
+            if not drive_ok:
+                return {
+                    "message": (
+                        "❌ Нет доступа к Google Drive — токен авторизации истёк или отозван.\n\n"
+                        "Необходимо обновить токен:\n"
+                        "1. Сообщите директору — нужно обновить GOOGLE_OAUTH_TOKEN в Railway\n"
+                        "2. После обновления токена повторите создание договора"
+                    )
+                }
+            # Сохраняем данные сделки во временную память
+            memory.save_company("__pending_deal__", {
+                "data": tool_input["data"],
+                "commission_pct": tool_input["commission_pct"],
+            })
+            today = datetime.now().strftime("%d.%m.%Y")
+            return {
+                "message": f"📅 Дата договора?",
+                "buttons": [
+                    {"text": f"✅ Сегодня {today}", "callback_data": f"deal_date:{today}"},
+                    {"text": "📅 Другая дата", "callback_data": "deal_date:__custom__"},
+                ],
             }
 
         elif tool_name == "save_company":
