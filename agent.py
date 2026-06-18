@@ -507,18 +507,6 @@ VIN: ...
     async def _execute_tool(self, tool_name: str, tool_input: dict) -> dict:
 
         if tool_name == "create_contract":
-            # ── Проверяем доступ к Drive ДО начала работы ─────────────────
-            drive_ok = await self.drive.check_access()
-            if not drive_ok:
-                return {
-                    "message": (
-                        "❌ Нет доступа к Google Drive — токен авторизации истёк или отозван.\n\n"
-                        "Необходимо обновить токен:\n"
-                        "1. Сообщите директору — нужно обновить GOOGLE_OAUTH_TOKEN в Railway\n"
-                        "2. После обновления токена повторите создание договора"
-                    )
-                }
-
             number = tool_input.get("contract_number") or await self.drive.get_next_contract_number()
 
             logger.debug("DATA KEYS: " + str(list(tool_input.get("data", {}).keys())))
@@ -559,17 +547,23 @@ VIN: ...
             inv_pdf  = f"Счёт_{number}.pdf"
 
             # ── 2. Загружаем docx/xlsx на Drive ПОСЛЕДОВАТЕЛЬНО ────────────
-            # (параллельные запросы через httplib2/googleapiclient в разных
-            #  потоках вызывают сегфолт "double free or corruption")
             logger.info("Загружаю на Drive...")
+            drive_uploaded = 0
+            drive_failed = 0
             for fpath, fname in (
                 (ag_path,      ag_docx),
                 (dkp_path,     dkp_docx),
                 (invoice_path, inv_xlsx),
             ):
                 try:
-                    await self.drive.upload_file(fpath, fname, deal_folder_id)
+                    link = await self.drive.upload_file(fpath, fname, deal_folder_id)
+                    if link:
+                        drive_uploaded += 1
+                    else:
+                        drive_failed += 1
+                        logger.error(f"Загрузка вернула пустую ссылку: {fname}")
                 except Exception as e:
+                    drive_failed += 1
                     logger.error(f"Ошибка загрузки на Drive (сделка {number}, файл {fname}): {e}", exc_info=True)
 
             # ── 3. PDF только если не отключён через SKIP_PDF=1 ───────────
@@ -585,10 +579,16 @@ VIN: ...
 
                 if ag_pdf_path:
                     ag_link = await self.drive.upload_file(ag_pdf_path, ag_pdf, deal_folder_id)
+                    if ag_link: drive_uploaded += 1
+                    else: drive_failed += 1
                 if dkp_pdf_path:
-                    await self.drive.upload_file(dkp_pdf_path, dkp_pdf, deal_folder_id)
+                    r = await self.drive.upload_file(dkp_pdf_path, dkp_pdf, deal_folder_id)
+                    if r: drive_uploaded += 1
+                    else: drive_failed += 1
                 if inv_pdf_path:
-                    await self.drive.upload_file(inv_pdf_path, inv_pdf, deal_folder_id)
+                    r = await self.drive.upload_file(inv_pdf_path, inv_pdf, deal_folder_id)
+                    if r: drive_uploaded += 1
+                    else: drive_failed += 1
             else:
                 logger.info("PDF пропущен (SKIP_PDF=1)")
 
@@ -612,13 +612,20 @@ VIN: ...
             total_files = 1 + len(extra_files)
             pdf_note = " (PDF отключён)" if skip_pdf else ("" if ag_pdf_path else " (LibreOffice недоступен)")
 
+            if drive_failed == 0:
+                drive_note = f"☁️ Drive: {drive_uploaded} файлов загружено"
+            elif drive_uploaded == 0:
+                drive_note = "⚠️ Drive: файлы НЕ сохранены — проверьте токен Google"
+            else:
+                drive_note = f"⚠️ Drive: загружено {drive_uploaded}, не загружено {drive_failed}"
+
             return {
                 "file":        ag_path,
                 "filename":    ag_docx,
                 "extra_files": extra_files,
                 "extra_names": extra_names,
                 "drive_link":  ag_link,
-                "message":     f"Сделка {number}: {total_files} файлов отправлено{pdf_note}",
+                "message":     f"Сделка {number}: {total_files} файлов отправлено{pdf_note}\n{drive_note}",
             }
 
         elif tool_name == "save_company":
