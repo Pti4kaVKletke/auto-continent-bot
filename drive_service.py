@@ -68,6 +68,31 @@ class GoogleDriveService:
         self.service = _build_service()
         self.root_folder_id = os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "")
 
+    async def check_access(self) -> bool:
+        """
+        Быстрая проверка доступа к Drive — пробует получить метаданные корневой папки.
+        Возвращает True если доступ есть, False если токен протух или нет сети.
+        """
+        def _do_check():
+            self.service.files().get(
+                fileId=self.root_folder_id,
+                fields="id",
+                supportsAllDrives=True,
+            ).execute()
+            return True
+
+        try:
+            return await asyncio.to_thread(_do_check)
+        except Exception as e:
+            logger.error(f"Drive недоступен: {e}")
+            # Пробуем пересоздать service (обновить токен) и проверить ещё раз
+            try:
+                self.service = _build_service()
+                return await asyncio.to_thread(_do_check)
+            except Exception as e2:
+                logger.error(f"Drive недоступен после пересоздания service: {e2}")
+                return False
+
     async def get_next_contract_number(self) -> str:
         """
         Возвращает следующий номер договора в формате ДДММГГ+NNN.
@@ -125,12 +150,11 @@ class GoogleDriveService:
 
             except Exception as e:
                 logger.error(f"Ошибка получения номера договора: {e}", exc_info=True)
-                return f"{prefix}{datetime.now().strftime('%H%M')}"
+                return f"{prefix}001"
 
         return await asyncio.to_thread(_find_max_number)
 
-    async def get_or_create_deal_folder(self, contract_number: str) -> tuple[str, str]:
-        """Возвращает (deal_folder_id, scans_folder_id)."""
+    async def get_or_create_deal_folder(self, contract_number: str) -> str:
         month = contract_number[2:4]
         year  = "20" + contract_number[4:6]
         month_name = f"{month}-{MONTHS_RU.get(month, month)}"
@@ -139,9 +163,9 @@ class GoogleDriveService:
         year_id      = await self._get_or_create_folder(year, contracts_id)
         month_id     = await self._get_or_create_folder(month_name, year_id)
         deal_id      = await self._get_or_create_folder(contract_number, month_id)
-        scans_id     = await self._get_or_create_folder("Сканы", deal_id)
+        await self._get_or_create_folder("Сканы", deal_id)
 
-        return deal_id, scans_id
+        return deal_id
 
     async def upload_file(self, filepath: str, filename: str, folder_id: str,
                           mime_type: str = None) -> str:

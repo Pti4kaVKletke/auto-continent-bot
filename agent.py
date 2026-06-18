@@ -334,7 +334,7 @@ VIN: ...
 
         return base
 
-    async def process_message(self, user_text: str, filepath: str = None, filename: str = None, chat_id=None) -> dict:
+    async def process_message(self, user_text: str, filepath: str = None, filename: str = None) -> dict:
         memory.add_to_history("user", user_text if not filepath else f"[файл: {filename}] {user_text}")
 
         history  = memory.get_history(limit=15)
@@ -350,7 +350,6 @@ VIN: ...
 
         messages.append({"role": "user", "content": current_content})
 
-        response = None
         for attempt in range(3):
             try:
                 response = await self.client.with_options(timeout=120.0).messages.create(
@@ -367,11 +366,8 @@ VIN: ...
                     return {"text": "⚠️ Ошибка соединения с AI. Попробуйте ещё раз.", "files": [], "success": False}
                 await asyncio.sleep(2)
 
-        if response is None:
-            return {"text": "⚠️ Ошибка соединения с AI. Попробуйте ещё раз.", "files": [], "success": False}
-
         try:
-            result = await self._handle_response(response, chat_id=chat_id)
+            result = await self._handle_response(response)
         except Exception as e:
             logger.error(f"Необработанная ошибка при выполнении инструмента: {e}", exc_info=True)
             result = {
@@ -469,7 +465,7 @@ VIN: ...
             },
         ]
 
-    async def _handle_response(self, response, chat_id=None) -> dict:
+    async def _handle_response(self, response) -> dict:
         result = {"text": "", "files": [], "success": True, "buttons": None}
 
         for block in response.content:
@@ -477,7 +473,7 @@ VIN: ...
                 result["text"] += block.text
 
             elif block.type == "tool_use":
-                tool_result = await self._execute_tool(block.name, block.input, chat_id=chat_id)
+                tool_result = await self._execute_tool(block.name, block.input)
 
                 if tool_result.get("file"):
                     result["files"].append({
@@ -508,16 +504,28 @@ VIN: ...
 
         return result
 
-    async def _execute_tool(self, tool_name: str, tool_input: dict, chat_id=None) -> dict:
+    async def _execute_tool(self, tool_name: str, tool_input: dict) -> dict:
 
         if tool_name == "create_contract":
+            # ── Проверяем доступ к Drive ДО начала работы ─────────────────
+            drive_ok = await self.drive.check_access()
+            if not drive_ok:
+                return {
+                    "message": (
+                        "❌ Нет доступа к Google Drive — токен авторизации истёк или отозван.\n\n"
+                        "Необходимо обновить токен:\n"
+                        "1. Сообщите директору — нужно обновить GOOGLE_OAUTH_TOKEN в Railway\n"
+                        "2. После обновления токена повторите создание договора"
+                    )
+                }
+
             number = tool_input.get("contract_number") or await self.drive.get_next_contract_number()
 
             logger.debug("DATA KEYS: " + str(list(tool_input.get("data", {}).keys())))
 
             date           = datetime.now().strftime("%d.%m.%Y")
             commission_pct = float(tool_input.get("commission_pct", 1.0))
-            deal_folder_id, scans_folder_id = await self.drive.get_or_create_deal_folder(number)
+            deal_folder_id = await self.drive.get_or_create_deal_folder(number)
 
             # ── 1. Строим документы ПОСЛЕДОВАТЕЛЬНО (не параллельно — меньше памяти) ──
             built = {}
@@ -604,32 +612,13 @@ VIN: ...
             total_files = 1 + len(extra_files)
             pdf_note = " (PDF отключён)" if skip_pdf else ("" if ag_pdf_path else " (LibreOffice недоступен)")
 
-            # ── 5. Загружаем накопленные сканы документов в папку "Сканы" ──
-            scans_note = ""
-            if chat_id is not None:
-                pending = memory.get_pending_scans(chat_id)
-                if pending:
-                    logger.info(f"Загружаю {len(pending)} сканов в папку 'Сканы' сделки {number}")
-                    uploaded = 0
-                    for scan in pending:
-                        sp = Path(scan["filepath"])
-                        if sp.exists():
-                            try:
-                                await self.drive.upload_file(str(sp), scan["original_name"], scans_folder_id)
-                                uploaded += 1
-                            except Exception as e:
-                                logger.error(f"Ошибка загрузки скана {scan['original_name']}: {e}", exc_info=True)
-                    memory.clear_pending_scans(chat_id)
-                    if uploaded:
-                        scans_note = f", сканы документов ({uploaded}) сохранены в папку «Сканы»"
-
             return {
                 "file":        ag_path,
                 "filename":    ag_docx,
                 "extra_files": extra_files,
                 "extra_names": extra_names,
                 "drive_link":  ag_link,
-                "message":     f"Сделка {number}: {total_files} файлов отправлено{pdf_note}{scans_note}",
+                "message":     f"Сделка {number}: {total_files} файлов отправлено{pdf_note}",
             }
 
         elif tool_name == "save_company":
@@ -694,10 +683,9 @@ VIN: ...
         content.append({"type": "text", "text": prompt})
         return content
 
-    async def process_file(self, filepath: str, filename: str, caption: str = "", chat_id=None) -> dict:
+    async def process_file(self, filepath: str, filename: str, caption: str = "") -> dict:
         return await self.process_message(
             caption or "Извлеки все данные из документа и скажи что нашёл.",
             filepath=filepath,
             filename=filename,
-            chat_id=chat_id,
         )

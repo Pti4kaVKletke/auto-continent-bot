@@ -1,8 +1,6 @@
 import os
 import logging
 import tempfile
-import shutil
-from pathlib import Path
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from agent import DocumentAgent
@@ -107,41 +105,24 @@ async def send_result(message, result: dict):
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
-    chat_id = update.effective_chat.id
     await message.reply_text("📥 Получил файл, обрабатываю...")
 
-    if message.document:
-        file = await message.document.get_file()
-        filename = message.document.file_name
-    elif message.photo:
-        file = await message.photo[-1].get_file()
-        filename = f"photo_{message.message_id}.jpg"
-    else:
-        await message.reply_text("❌ Неподдерживаемый тип файла")
-        return
-
-    # Сохраняем во временную папку для обработки текущим запросом
     with tempfile.TemporaryDirectory() as tmpdir:
-        tmp_filepath = f"{tmpdir}/{filename}"
-        await file.download_to_drive(tmp_filepath)
+        if message.document:
+            file = await message.document.get_file()
+            filename = message.document.file_name
+        elif message.photo:
+            file = await message.photo[-1].get_file()
+            filename = "photo.jpg"
+        else:
+            await message.reply_text("❌ Неподдерживаемый тип файла")
+            return
 
-        # Дополнительно сохраняем постоянную копию — пригодится при создании сделки
-        pending_dir = Path("/data/pending_scans") / str(chat_id)
-        pending_dir.mkdir(parents=True, exist_ok=True)
-        persistent_path = pending_dir / filename
-        # избегаем перезаписи при совпадении имён
-        counter = 1
-        base_persistent = persistent_path
-        while persistent_path.exists():
-            persistent_path = base_persistent.with_name(
-                f"{base_persistent.stem}_{counter}{base_persistent.suffix}"
-            )
-            counter += 1
-        shutil.copy(tmp_filepath, persistent_path)
-        memory.add_pending_scan(chat_id, str(persistent_path), filename)
+        filepath = f"{tmpdir}/{filename}"
+        await file.download_to_drive(filepath)
 
         caption = message.caption or ""
-        result = await agent.process_file(tmp_filepath, filename, caption, chat_id=chat_id)
+        result = await agent.process_file(filepath, filename, caption)
 
         await send_result(message, result)
 
@@ -162,35 +143,52 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_text = f"Использовать сохранённые реквизиты: {profile_name}"
 
         await query.message.reply_text("🤔 Думаю...")
-        result = await agent.process_message(user_text, chat_id=update.effective_chat.id)
+        result = await agent.process_message(user_text)
         await send_result(query.message, result)
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
-    chat_id = update.effective_chat.id
     await update.message.reply_text("🤔 Думаю...")
 
-    result = await agent.process_message(user_text, chat_id=chat_id)
+    result = await agent.process_message(user_text)
 
     await send_result(update.message, result)
 
 
 async def error_handler(update, context):
-    logger.error(f"Необработанная ошибка: {context.error}", exc_info=context.error)
+    from telegram.error import TimedOut, NetworkError
+    err = context.error
+
+    logger.error(f"Необработанная ошибка: {err}", exc_info=err)
+
+    if isinstance(err, TimedOut):
+        # Таймаут при отправке файлов — файлы уже доставлены, просто медленный Drive
+        logger.warning("TimedOut при отправке в Telegram — файлы скорее всего уже доставлены")
+        return
+
     if isinstance(update, Update) and update.effective_message:
         try:
-            await update.effective_message.reply_text("⚠️ Произошла ошибка, попробуйте ещё раз.")
+            if isinstance(err, NetworkError):
+                msg = "⚠️ Ошибка сети при связи с Telegram. Попробуйте ещё раз."
+            else:
+                msg = "⚠️ Произошла ошибка, попробуйте ещё раз."
+            await update.effective_message.reply_text(msg)
         except Exception:
             pass
 
 
 def main():
-    memory.init_db()
-    memory.cleanup_old_pending_scans()
-
     token = os.environ["TELEGRAM_BOT_TOKEN"]
-    app = ApplicationBuilder().token(token).build()
+    app = (
+        ApplicationBuilder()
+        .token(token)
+        .connect_timeout(30)
+        .read_timeout(120)
+        .write_timeout(120)
+        .pool_timeout(30)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("memory", show_memory))
