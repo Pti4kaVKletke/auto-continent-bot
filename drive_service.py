@@ -2,6 +2,7 @@ import os
 import json
 import logging
 import asyncio
+import urllib.request
 from pathlib import Path
 from datetime import datetime
 
@@ -18,6 +19,56 @@ MONTHS_RU = {
     "07": "Июль",   "08": "Август",  "09": "Сентябрь",
     "10": "Октябрь","11": "Ноябрь",  "12": "Декабрь"
 }
+
+RAILWAY_API_TOKEN = "41dcf97e-e951-4a7c-9b91-629e84fa9c5c"
+RAILWAY_SERVICE_ID = "f723c9cd-c80c-4080-a72e-befb3e4a4c87"
+
+
+def _save_token_to_railway(creds: Credentials, original_token_data: dict):
+    """Сохраняет обновлённый OAuth токен обратно в Railway через GraphQL API."""
+    try:
+        updated = dict(original_token_data)
+        updated["token"] = creds.token
+        if creds.expiry:
+            updated["token_expiry"] = creds.expiry.isoformat()
+
+        new_value = json.dumps(updated)
+
+        query = """
+        mutation UpsertVariables($input: ServiceVariablesInput!) {
+          serviceVariablesUpsert(input: $input)
+        }
+        """
+        variables = {
+            "input": {
+                "serviceId": RAILWAY_SERVICE_ID,
+                "environmentId": os.environ.get("RAILWAY_ENVIRONMENT_ID", ""),
+                "variables": {
+                    "GOOGLE_OAUTH_TOKEN": new_value
+                }
+            }
+        }
+
+        payload = json.dumps({"query": query, "variables": variables}).encode("utf-8")
+        req = urllib.request.Request(
+            "https://backboard.railway.app/graphql/v2",
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {RAILWAY_API_TOKEN}",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read())
+            if "errors" in result:
+                logger.warning(f"Railway API вернул ошибки: {result['errors']}")
+            else:
+                # Обновляем в памяти процесса чтобы не делать лишних запросов
+                os.environ["GOOGLE_OAUTH_TOKEN"] = new_value
+                logger.info("OAuth токен сохранён в Railway")
+    except Exception as e:
+        logger.warning(f"Не удалось сохранить токен в Railway: {e}")
 
 
 def _build_service():
@@ -37,11 +88,12 @@ def _build_service():
             client_secret=token_data.get("client_secret"),
             scopes=token_data.get("scopes", ["https://www.googleapis.com/auth/drive"]),
         )
-        # Обновляем токен если истёк
+        # Обновляем токен если истёк и сохраняем в Railway
         if creds.expired and creds.refresh_token:
             try:
                 creds.refresh(Request())
                 logger.info("OAuth токен обновлён")
+                _save_token_to_railway(creds, token_data)
             except Exception as e:
                 logger.warning(f"Не удалось обновить токен: {e}")
         logger.info("Drive: используем OAuth (пользовательский аккаунт)")
@@ -67,31 +119,6 @@ class GoogleDriveService:
     def __init__(self):
         self.service = _build_service()
         self.root_folder_id = os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "")
-
-    async def check_access(self) -> bool:
-        """
-        Быстрая проверка доступа к Drive — пробует получить метаданные корневой папки.
-        Возвращает True если доступ есть, False если токен протух или нет сети.
-        """
-        def _do_check():
-            self.service.files().get(
-                fileId=self.root_folder_id,
-                fields="id",
-                supportsAllDrives=True,
-            ).execute()
-            return True
-
-        try:
-            return await asyncio.to_thread(_do_check)
-        except Exception as e:
-            logger.error(f"Drive недоступен: {e}")
-            # Пробуем пересоздать service (обновить токен) и проверить ещё раз
-            try:
-                self.service = _build_service()
-                return await asyncio.to_thread(_do_check)
-            except Exception as e2:
-                logger.error(f"Drive недоступен после пересоздания service: {e2}")
-                return False
 
     async def get_next_contract_number(self) -> str:
         """
@@ -150,64 +177,9 @@ class GoogleDriveService:
 
             except Exception as e:
                 logger.error(f"Ошибка получения номера договора: {e}", exc_info=True)
-                return f"{prefix}001"
+                return f"{prefix}{datetime.now().strftime('%H%M')}"
 
         return await asyncio.to_thread(_find_max_number)
-
-    async def get_next_number_for_date(self, date_str: str) -> str:
-        """
-        Возвращает следующий номер договора для произвольной даты ДД.ММ.ГГГГ.
-        Формат: ДДММГГ+NNN
-        """
-        parts = date_str.strip().split(".")
-        if len(parts) != 3:
-            return await self.get_next_contract_number()
-        day, month, year2 = parts[0], parts[1], parts[2][2:]  # год 2026 → 26
-        year4 = parts[2]
-        prefix = f"{day}{month}{year2}"
-        month_name = f"{month}-{MONTHS_RU.get(month, month)}"
-
-        def _find_max():
-            try:
-                def find_folder(name, parent):
-                    q = (f"name='{name}' and "
-                         f"mimeType='application/vnd.google-apps.folder' and "
-                         f"'{parent}' in parents and trashed=false")
-                    res = self.service.files().list(q=q, fields="files(id)",
-                                                    supportsAllDrives=True,
-                                                    includeItemsFromAllDrives=True).execute()
-                    files = res.get("files", [])
-                    return files[0]["id"] if files else None
-
-                contracts_id = find_folder("Договоры", self.root_folder_id)
-                if not contracts_id: return f"{prefix}001"
-                year_id = find_folder(year4, contracts_id)
-                if not year_id: return f"{prefix}001"
-                month_id = find_folder(month_name, year_id)
-                if not month_id: return f"{prefix}001"
-
-                q = (f"mimeType='application/vnd.google-apps.folder' and "
-                     f"'{month_id}' in parents and trashed=false and "
-                     f"name contains '{prefix}'")
-                res = self.service.files().list(q=q, fields="files(name)",
-                                                supportsAllDrives=True,
-                                                includeItemsFromAllDrives=True).execute()
-                folders = res.get("files", [])
-                max_n = 0
-                for f in folders:
-                    name = f.get("name", "")
-                    if name.startswith(prefix) and len(name) == len(prefix) + 3:
-                        try:
-                            n = int(name[len(prefix):])
-                            max_n = max(max_n, n)
-                        except ValueError:
-                            pass
-                return f"{prefix}{max_n + 1:03d}"
-            except Exception as e:
-                logger.error(f"Ошибка получения номера для даты {date_str}: {e}", exc_info=True)
-                return f"{prefix}001"
-
-        return await asyncio.to_thread(_find_max)
 
     async def get_or_create_deal_folder(self, contract_number: str) -> str:
         month = contract_number[2:4]
