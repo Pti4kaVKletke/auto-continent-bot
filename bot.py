@@ -1,6 +1,8 @@
 import os
 import logging
 import tempfile
+import time
+from pathlib import Path
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from agent import DocumentAgent
@@ -105,26 +107,34 @@ async def send_result(message, result: dict):
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
+    chat_id = str(update.effective_chat.id)
     await message.reply_text("📥 Получил файл, обрабатываю...")
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        if message.document:
-            file = await message.document.get_file()
-            filename = message.document.file_name
-        elif message.photo:
-            file = await message.photo[-1].get_file()
-            filename = "photo.jpg"
-        else:
-            await message.reply_text("❌ Неподдерживаемый тип файла")
-            return
+    if message.document:
+        file = await message.document.get_file()
+        filename = message.document.file_name
+    elif message.photo:
+        file = await message.photo[-1].get_file()
+        filename = "photo.jpg"
+    else:
+        await message.reply_text("❌ Неподдерживаемый тип файла")
+        return
 
-        filepath = f"{tmpdir}/{filename}"
-        await file.download_to_drive(filepath)
+    # Сохраняем в постоянную папку — файл останется для загрузки в Сканы при создании договора
+    scans_dir = Path("/data/pending_scans")
+    scans_dir.mkdir(parents=True, exist_ok=True)
+    safe_filename = f"{int(time.time())}_{filename}"
+    filepath = str(scans_dir / safe_filename)
+    await file.download_to_drive(filepath)
 
-        caption = message.caption or ""
-        result = await agent.process_file(filepath, filename, caption)
+    # Регистрируем в БД
+    memory.add_pending_scan(chat_id, filepath, filename)
+    logger.info(f"Скан сохранён: {filepath} (chat_id={chat_id})")
 
-        await send_result(message, result)
+    caption = message.caption or ""
+    result = await agent.process_file(filepath, filename, caption, chat_id=chat_id)
+
+    await send_result(message, result)
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -145,7 +155,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             # Дата выбрана — получаем номер и создаём
             await query.message.reply_text("⏳ Создаю договоры...")
-            result = await agent.process_message(f"Дата договора: {value}")
+            result = await agent.process_message(f"Дата договора: {value}", chat_id=str(update.effective_chat.id))
             await send_result(query.message, result)
 
     elif data.startswith("bankprofile:"):
@@ -159,7 +169,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_text = f"Использовать сохранённые реквизиты: {profile_name}"
 
         await query.message.reply_text("🤔 Думаю...")
-        result = await agent.process_message(user_text)
+        result = await agent.process_message(user_text, chat_id=str(update.effective_chat.id))
         await send_result(query.message, result)
 
 
@@ -171,12 +181,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["awaiting_deal_date"] = False
         date_input = user_text.strip()
         await update.message.reply_text("⏳ Создаю договоры...")
-        result = await agent.process_message(f"Дата договора: {date_input}")
+        result = await agent.process_message(f"Дата договора: {date_input}", chat_id=str(update.effective_chat.id))
         await send_result(update.message, result)
         return
 
     await update.message.reply_text("🤔 Думаю...")
-    result = await agent.process_message(user_text)
+    result = await agent.process_message(user_text, chat_id=str(update.effective_chat.id))
     await send_result(update.message, result)
 
 
@@ -190,6 +200,8 @@ async def error_handler(update, context):
 
 
 def main():
+    memory.init_db()
+    memory.cleanup_old_pending_scans()
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     app = ApplicationBuilder().token(token).build()
 

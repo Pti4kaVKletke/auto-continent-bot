@@ -358,7 +358,8 @@ VIN: ...
 
         return base
 
-    async def process_message(self, user_text: str, filepath: str = None, filename: str = None) -> dict:
+    async def process_message(self, user_text: str, filepath: str = None, filename: str = None, chat_id: str = "") -> dict:
+        self._current_chat_id = chat_id
         memory.add_to_history("user", user_text if not filepath else f"[файл: {filename}] {user_text}")
 
         history  = memory.get_history(limit=15)
@@ -541,6 +542,21 @@ VIN: ...
             commission_pct = float(tool_input.get("commission_pct", 1.0))
             deal_folder_id = await self.drive.get_or_create_deal_folder(number)
 
+            # ── 0. Загружаем pending_scans в папку Сканы ──────────────────
+            chat_id = getattr(self, "_current_chat_id", "")
+            scans = memory.get_pending_scans(chat_id) if chat_id else []
+            if scans:
+                scans_folder_id = await self.drive._get_or_create_folder("Сканы", deal_folder_id)
+                uploaded_scans = 0
+                for scan in scans:
+                    if Path(scan["filepath"]).exists():
+                        await self.drive.upload_file(scan["filepath"], scan["original_name"], scans_folder_id)
+                        uploaded_scans += 1
+                    else:
+                        logger.warning(f"Файл скана не найден: {scan['filepath']}")
+                memory.clear_pending_scans(chat_id)
+                logger.info(f"Загружено {uploaded_scans} сканов в папку сделки {number}")
+
             # ── 1. Строим документы ПОСЛЕДОВАТЕЛЬНО (не параллельно — меньше памяти) ──
             built = {}
             try:
@@ -697,9 +713,10 @@ VIN: ...
         content.append({"type": "text", "text": prompt})
         return content
 
-    async def process_file(self, filepath: str, filename: str, caption: str = "") -> dict:
+    async def process_file(self, filepath: str, filename: str, caption: str = "", chat_id: str = "") -> dict:
         return await self.process_message(
             caption or "Извлеки все данные из документа и скажи что нашёл.",
             filepath=filepath,
             filename=filename,
+            chat_id=chat_id,
         )
