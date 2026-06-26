@@ -120,13 +120,18 @@ class GoogleDriveService:
         self.service = _build_service()
         self.root_folder_id = os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "")
 
-    async def get_next_contract_number(self) -> str:
+    async def get_next_contract_number(self, contract_date: str = None) -> str:
         """
         Возвращает следующий номер договора в формате ДДММГГ+NNN.
-        Смотрит папку сегодняшнего дня на Drive и берёт max(NNN) + 1.
-        Если папок за сегодня нет — возвращает ДДММГГ001.
+        contract_date: дата в формате ДД.ММ.ГГГГ (если не указана — сегодня).
         """
-        today = datetime.now()
+        if contract_date:
+            try:
+                today = datetime.strptime(contract_date, "%d.%m.%Y")
+            except ValueError:
+                today = datetime.now()
+        else:
+            today = datetime.now()
         day   = today.strftime("%d")
         month = today.strftime("%m")
         year  = today.strftime("%y")
