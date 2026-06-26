@@ -415,7 +415,6 @@ VIN: ...
                             "type": "object",
                             "description": "Данные для заполнения документов — строго по ключам из системного промпта"
                         },
-                        "contract_number": {"type": "string",  "description": "Номер договора (опционально)"},
                         "contract_date":   {"type": "string",  "description": "Дата договора в формате ДД.ММ.ГГГГ (опционально, если не указана — используется сегодняшняя дата)"},
                         "commission_pct":  {"type": "number",  "description": "Комиссия агента в процентах, например 2.0"},
                     },
@@ -534,7 +533,7 @@ VIN: ...
 
         if tool_name == "create_contract":
             contract_date = tool_input.get("contract_date") or None
-            number = tool_input.get("contract_number") or await self.drive.get_next_contract_number(contract_date)
+            number = await self.drive.get_next_contract_number(contract_date)
 
             logger.debug("DATA KEYS: " + str(list(tool_input.get("data", {}).keys())))
 
