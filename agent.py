@@ -33,17 +33,11 @@ class DocumentAgent:
 
 У тебя есть РЕАЛЬНЫЕ ИНСТРУМЕНТЫ которые ты ОБЯЗАН использовать:
 
-- propose_contract_number — предложить номер договора пользователю на подтверждение (вызывать ПЕРЕД create_contract)
 - create_contract — создать полный пакет документов сделки (агентский договор, ДКП и счёт) и сохранить на Google Drive
 - save_company    — сохранить реквизиты компании/клиента в постоянную память
 - save_instruction — сохранить инструкцию для себя
 
-ВАЖНО: Когда все данные собраны и пользователь подтвердил "верно" — СНАЧАЛА вызови propose_contract_number,
-дождись подтверждения номера от пользователя, и только потом вызови create_contract с подтверждённым номером.
-
-Когда пользователь пишет "Дата договора: ДД.ММ.ГГГГ" — немедленно вызывай create_contract,
-передавая данные из __pending_deal__ в памяти. НЕ указывай contract_number — он определится автоматически по дате.
-Дату передавай в поле data как "contract_date": "ДД.ММ.ГГГГ".
+ВАЖНО: Когда пользователь просит создать договор или счёт — ВСЕГДА вызывай соответствующий инструмент.
 
 === ОБЯЗАТЕЛЬНЫЕ КЛЮЧИ В ПОЛЕ data ===
 
@@ -204,16 +198,31 @@ seller_name, seller_birth_date, seller_address, seller_id_number, seller_id_issu
 ВАЖНО про seller_birth_date (дата рождения продавца):
 - ОБЯЗАТЕЛЬНО вычисляй seller_birth_date из ИНН продавца (поле "4. Плательщик" в ТПО,
   начинается с "ИНН:"), используя формулу ниже.
-- ЭТО ПРАВИЛО ПРИМЕНЯЕТСЯ ВСЕГДА, даже если в документе рядом видна другая дата
-  (например дата выдачи ID-карты/паспорта продавца) — НЕ путай дату выдачи документа
-  с датой рождения. Дата рождения берётся ТОЛЬКО расчётом из ИНН, никогда — из даты
-  выдачи документа.
-- Формула: ИНН состоит из 14 цифр. seller_birth_date = ИНН[1:3] + "." + ИНН[3:5] + "." + ИНН[5:9]
-  (цифры со 2-й по 9-ю по порядку = ДД, ММ, ГГГГ).
-  Пример: ИНН 23101195600076 → цифры 2-9 = "31011956" → ДД=31, ММ=01, ГГГГ=1956
-  → seller_birth_date = "31.01.1956"
-  Пример: ИНН 13008200700377 → цифры 2-9 = "30082007" → seller_birth_date = "30.08.2007"
-  Пример: ИНН 20512199801234 → цифры 2-9 = "05121998" → seller_birth_date = "05.12.1998"
+- ЭТО ПРАВИЛО ПРИМЕНЯЕТСЯ ВСЕГДА. НИКОГДА не используй дату выдачи ID-карты/паспорта
+  как дату рождения. Дата выдачи документа и дата рождения — это РАЗНЫЕ даты.
+  Дата рождения берётся ТОЛЬКО расчётом из ИНН.
+
+- Формула (ИНН состоит из 14 цифр, нумерация с 1):
+  Позиция:  1  2  3  4  5  6  7  8  9  10 11 12 13 14
+  ДД = цифры на позициях 2 и 3
+  ММ = цифры на позициях 4 и 5
+  ГГГГ = цифры на позициях 6, 7, 8 и 9
+  seller_birth_date = ДД.ММ.ГГГГ
+
+- Пример 1: ИНН 20103200600200
+  Позиции: 2=0, 3=1, 4=0, 5=3, 6=2, 7=0, 8=0, 9=6
+  ДД=01, ММ=03, ГГГГ=2006 → seller_birth_date = "01.03.2006"
+
+- Пример 2: ИНН 23101195600076
+  Позиции: 2=3, 3=1, 4=0, 5=1, 6=1, 7=9, 8=5, 9=6
+  ДД=31, ММ=01, ГГГГ=1956 → seller_birth_date = "31.01.1956"
+
+- Пример 3: ИНН 20512199801234
+  Позиции: 2=0, 3=5, 4=1, 5=2, 6=1, 7=9, 8=9, 9=8
+  ДД=05, ММ=12, ГГГГ=1998 → seller_birth_date = "05.12.1998"
+
+- ОБЯЗАТЕЛЬНАЯ ПРОВЕРКА: перед заполнением seller_birth_date напиши себе мысленно
+  каждую цифру ИНН с её позицией (1,2,3...) и убедись что взял правильные позиции.
 
 ВАЖНО про seller_id_number, seller_id_issued_date, seller_id_issued_by (ID-карта продавца):
 - В поле "4. Плательщик" ТПО ПОСЛЕ строки с адресом и СОАТЕ часто идёт отдельная строка вида:
@@ -403,22 +412,6 @@ VIN: ...
                 },
             },
             {
-                "name": "propose_contract_number",
-                "description": (
-                    "Спросить у пользователя дату договора — сегодня или другая. "
-                    "ВСЕГДА вызывай этот инструмент ПЕРЕД create_contract. "
-                    "После выбора даты автоматически определяется номер договора."
-                ),
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "data":           {"type": "object", "description": "Те же данные что передашь в create_contract"},
-                        "commission_pct": {"type": "number", "description": "Комиссия в процентах"},
-                    },
-                    "required": ["data", "commission_pct"],
-                },
-            },
-            {
                 "name": "save_company",
                 "description": "Сохранить реквизиты компании или клиента в память",
                 "input_schema": {
@@ -529,49 +522,25 @@ VIN: ...
     async def _execute_tool(self, tool_name: str, tool_input: dict) -> dict:
 
         if tool_name == "create_contract":
-            # ── Проверяем доступ к Drive ДО начала работы ─────────────────
-            drive_ok = await self.drive.check_access()
-            if not drive_ok:
-                return {
-                    "message": (
-                        "❌ Нет доступа к Google Drive — токен авторизации истёк или отозван.\n\n"
-                        "Необходимо обновить токен:\n"
-                        "1. Сообщите директору — нужно обновить GOOGLE_OAUTH_TOKEN в Railway\n"
-                        "2. После обновления токена повторите создание договора"
-                    )
-                }
+            number = tool_input.get("contract_number") or await self.drive.get_next_contract_number()
 
-            data_input     = dict(tool_input.get("data", {}))
+            logger.debug("DATA KEYS: " + str(list(tool_input.get("data", {}).keys())))
+
+            date           = datetime.now().strftime("%d.%m.%Y")
             commission_pct = float(tool_input.get("commission_pct", 1.0))
-
-            # Дата договора — из data["contract_date"] или сегодня
-            contract_date = data_input.pop("contract_date", None)
-            date = contract_date if contract_date else datetime.now().strftime("%d.%m.%Y")
-
-            # Номер — явный, или по указанной дате, или сегодняшний
-            if tool_input.get("contract_number"):
-                number = tool_input["contract_number"]
-            elif contract_date:
-                number = await self.drive.get_next_number_for_date(contract_date)
-            else:
-                number = await self.drive.get_next_contract_number()
-
-            logger.debug("DATA KEYS: " + str(list(data_input.keys())))
-            logger.info(f"Создаю сделку {number} датой {date}")
-
             deal_folder_id = await self.drive.get_or_create_deal_folder(number)
 
             # ── 1. Строим документы ПОСЛЕДОВАТЕЛЬНО (не параллельно — меньше памяти) ──
             built = {}
             try:
                 logger.info("Строю АГ договор...")
-                built["ag"] = await self.builder.build_contract(data_input, number, date, commission_pct)
+                built["ag"] = await self.builder.build_contract(tool_input["data"], number, date, commission_pct)
 
                 logger.info("Строю ДКП...")
-                built["dkp"] = await self.builder.build_dkp(data_input, number, date)
+                built["dkp"] = await self.builder.build_dkp(tool_input["data"], number, date)
 
                 logger.info("Строю счёт...")
-                built["invoice"] = await self.builder.build_invoice(data_input, number, date, commission_pct)
+                built["invoice"] = await self.builder.build_invoice(tool_input["data"], number, date, commission_pct)
 
             except Exception as e:
                 logger.error(f"Ошибка построения документов для сделки {number}: {e}", exc_info=True)
@@ -653,32 +622,6 @@ VIN: ...
                 "extra_names": extra_names,
                 "drive_link":  ag_link,
                 "message":     f"Сделка {number}: {total_files} файлов отправлено{pdf_note}",
-            }
-
-        elif tool_name == "propose_contract_number":
-            # Проверяем доступ к Drive
-            drive_ok = await self.drive.check_access()
-            if not drive_ok:
-                return {
-                    "message": (
-                        "❌ Нет доступа к Google Drive — токен авторизации истёк или отозван.\n\n"
-                        "Необходимо обновить токен:\n"
-                        "1. Сообщите директору — нужно обновить GOOGLE_OAUTH_TOKEN в Railway\n"
-                        "2. После обновления токена повторите создание договора"
-                    )
-                }
-            # Сохраняем данные сделки во временную память
-            memory.save_company("__pending_deal__", {
-                "data": tool_input["data"],
-                "commission_pct": tool_input["commission_pct"],
-            })
-            today = datetime.now().strftime("%d.%m.%Y")
-            return {
-                "message": f"📅 Дата договора?",
-                "buttons": [
-                    {"text": f"✅ Сегодня {today}", "callback_data": f"deal_date:{today}"},
-                    {"text": "📅 Другая дата", "callback_data": "deal_date:__custom__"},
-                ],
             }
 
         elif tool_name == "save_company":
