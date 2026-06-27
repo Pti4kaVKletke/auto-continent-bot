@@ -1034,31 +1034,24 @@ VIN: ...
 
             if missing:
                 lines = [
-                    f"📋 Сделка {contract_number} от {contract_date}
-",
-                    f"❌ Не заполнено {len(missing)} обязательных полей:
-",
+                    f"📋 Сделка {contract_number} от {contract_date}\n",
+                    f"❌ Не заполнено {len(missing)} обязательных полей:\n",
                 ] + missing + [
-                    f"
-Заполни эти поля в таблице и снова напиши «проверь {contract_number}»."
+                    f"\nЗаполни эти поля в таблице и снова напиши «проверь {contract_number}»."
                 ]
-                return {"message": "
-".join(lines)}
+                return {"message": "\n".join(lines)}
 
             # Всё заполнено — собираем data для create_contract
             data_keys = [r[0] for r in REQUIRED]
             data = {k: deal.get(k, "") for k in data_keys}
 
-            text = "
-".join([
-                f"✅ Сделка {contract_number} от {contract_date} — все поля заполнены.
-",
+            text = "\n".join([
+                f"✅ Сделка {contract_number} от {contract_date} — все поля заполнены.\n",
                 f"👤 Покупатель: {deal.get('buyer_name', '—')}",
                 f"👤 Продавец: {deal.get('seller_name', '—')}",
                 f"🚗 {deal.get('car_model', '—')}, VIN {deal.get('car_vin', '—')}",
                 f"💰 {deal.get('car_price', '—')} руб., {deal.get('cash_amount', '—')} USD",
-                f"📊 Комиссия: {commission_pct}%
-",
+                f"📊 Комиссия: {commission_pct}%\n",
                 "Какие документы создать?",
             ])
             # Сохраняем данные для использования при нажатии кнопки
