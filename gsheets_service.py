@@ -12,49 +12,48 @@ logger = logging.getLogger(__name__)
 
 SPREADSHEET_ID = os.environ.get("GOOGLE_SHEETS_ID", "1OHkExAxQzm_3kiOE-h4aGug-MO3yf4OODB8C_fACz08")
 
-# Порядок колонок в таблице
+# Строка 1 — группы, строка 2 — названия, данные с строки 3
+DATA_START_ROW = 3
+
+# Порядок колонок — должен совпадать с format_sheets.py
+# (ключ для data dict, или специальное имя)
 COLUMNS = [
     "Номер договора",
     "Дата договора",
     "Статус",
-    "Комиссия %",
-    # Покупатель
     "buyer_name",
+    "passport_series",
+    "passport_number",
     "buyer_birth_date",
     "buyer_address",
     "buyer_initials",
-    "passport_series",
-    "passport_number",
     "passport_issued_by",
     "passport_issued_date",
     "passport_code",
-    # Продавец
     "seller_name",
+    "seller_id_number",
     "seller_birth_date",
     "seller_address",
     "seller_initials",
-    "seller_id_number",
     "seller_id_issued_by",
     "seller_id_issued_date",
-    # Автомобиль
     "car_model",
     "car_vin",
     "car_year",
     "car_color",
-    "car_body_number",
     "tpo_number",
+    "car_body_number",
     "tpo_day",
     "tpo_month",
     "tpo_year",
-    # Финансы
     "car_price",
+    "cash_amount",
+    "exchange_rate",
+    "Комиссия %",
     "car_price_words",
     "currency",
-    "cash_amount",
     "cash_amount_words",
     "cash_currency",
-    "exchange_rate",
-    # Банк
     "account_currency",
     "account_number",
     "bank_corr_line1",
@@ -62,7 +61,6 @@ COLUMNS = [
     "bank_corr_line3",
     "bank_ben_line1",
     "bank_ben_line2",
-    # Ссылка на Drive
     "Папка Drive",
     "Комментарий",
 ]
@@ -100,7 +98,6 @@ class GoogleSheetsService:
         return self._service
 
     def _col_letter(self, idx: int) -> str:
-        """0 → A, 25 → Z, 26 → AA ..."""
         result = ""
         idx += 1
         while idx:
@@ -108,31 +105,14 @@ class GoogleSheetsService:
             result = chr(65 + rem) + result
         return result
 
-    def _ensure_header(self, sheet):
-        """Проверяет что первая строка — заголовки, иначе вставляет."""
-        result = sheet.values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range="A1:1",
-        ).execute()
-        existing = result.get("values", [[]])[0] if result.get("values") else []
-        if existing != COLUMNS:
-            sheet.values().update(
-                spreadsheetId=SPREADSHEET_ID,
-                range="A1",
-                valueInputOption="RAW",
-                body={"values": [COLUMNS]},
-            ).execute()
-            logger.info("Заголовки таблицы установлены")
-
     async def save_deal(self, contract_number: str, contract_date: str,
                         data: dict, commission_pct: float,
                         drive_folder_link: str = "") -> bool:
-        """Добавляет строку сделки в таблицу."""
+        """Добавляет строку сделки начиная с DATA_START_ROW."""
         def _do():
             try:
                 svc = self._get_service()
                 sheet = svc.spreadsheets()
-                self._ensure_header(sheet)
 
                 row = []
                 for col in COLUMNS:
@@ -151,9 +131,10 @@ class GoogleSheetsService:
                     else:
                         row.append(str(data.get(col, "")))
 
+                # Добавляем начиная с DATA_START_ROW — строки 1-2 заголовки
                 sheet.values().append(
                     spreadsheetId=SPREADSHEET_ID,
-                    range="A1",
+                    range=f"A{DATA_START_ROW}",
                     valueInputOption="RAW",
                     insertDataOption="INSERT_ROWS",
                     body={"values": [row]},
@@ -167,30 +148,25 @@ class GoogleSheetsService:
         return await asyncio.to_thread(_do)
 
     async def find_deal(self, query: str) -> list[dict]:
-        """
-        Ищет сделки по номеру договора, ФИО покупателя, ФИО продавца, VIN или дате.
-        Возвращает список найденных строк как словари.
-        """
+        """Ищет сделки по номеру, ФИО, VIN или дате."""
         def _do():
             try:
                 svc = self._get_service()
                 sheet = svc.spreadsheets()
                 result = sheet.values().get(
                     spreadsheetId=SPREADSHEET_ID,
-                    range="A1:AZ",
+                    range=f"A{DATA_START_ROW}:AZ",
                 ).execute()
                 rows = result.get("values", [])
                 if not rows:
                     return []
 
-                headers = rows[0]
                 q = query.strip().lower()
                 found = []
 
-                for i, row in enumerate(rows[1:], start=2):
-                    # Дополняем строку до длины заголовков
-                    padded = row + [""] * (len(headers) - len(row))
-                    row_dict = dict(zip(headers, padded))
+                for i, row in enumerate(rows, start=DATA_START_ROW):
+                    padded = row + [""] * (len(COLUMNS) - len(row))
+                    row_dict = dict(zip(COLUMNS, padded))
                     row_dict["__row_index__"] = i
 
                     searchable = " ".join([
@@ -213,26 +189,22 @@ class GoogleSheetsService:
         return await asyncio.to_thread(_do)
 
     async def update_deal(self, contract_number: str, updates: dict) -> bool:
-        """
-        Обновляет поля существующей сделки по номеру договора.
-        updates — словарь {имя_колонки: новое_значение}
-        """
+        """Обновляет поля существующей сделки по номеру договора."""
         def _do():
             try:
                 svc = self._get_service()
                 sheet = svc.spreadsheets()
                 result = sheet.values().get(
                     spreadsheetId=SPREADSHEET_ID,
-                    range="A1:AZ",
+                    range=f"A{DATA_START_ROW}:AZ",
                 ).execute()
                 rows = result.get("values", [])
                 if not rows:
                     return False
 
-                headers = rows[0]
                 target_row = None
-                for i, row in enumerate(rows[1:], start=2):
-                    padded = row + [""] * (len(headers) - len(row))
+                for i, row in enumerate(rows, start=DATA_START_ROW):
+                    padded = row + [""] * (len(COLUMNS) - len(row))
                     if padded[0] == contract_number:
                         target_row = i
                         current_row = padded
@@ -242,15 +214,14 @@ class GoogleSheetsService:
                     logger.warning(f"Сделка {contract_number} не найдена в Sheets")
                     return False
 
-                # Применяем обновления
                 for col_name, new_val in updates.items():
-                    if col_name in headers:
-                        idx = headers.index(col_name)
+                    if col_name in COLUMNS:
+                        idx = COLUMNS.index(col_name)
                         while len(current_row) <= idx:
                             current_row.append("")
                         current_row[idx] = str(new_val)
 
-                last_col = self._col_letter(len(headers) - 1)
+                last_col = self._col_letter(len(COLUMNS) - 1)
                 sheet.values().update(
                     spreadsheetId=SPREADSHEET_ID,
                     range=f"A{target_row}:{last_col}{target_row}",
