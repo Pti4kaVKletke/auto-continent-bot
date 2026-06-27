@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 import memory
 from drive_service import GoogleDriveService
 from doc_builder import DocumentBuilder
+from gsheets_service import GoogleSheetsService
 
 
 class DocumentAgent:
@@ -23,6 +24,7 @@ class DocumentAgent:
     def __init__(self):
         self.client  = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
         self.drive   = GoogleDriveService()
+        self.sheets  = GoogleSheetsService()
         self.builder = DocumentBuilder()
         self.model   = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
         memory.init_db()
@@ -34,11 +36,15 @@ class DocumentAgent:
 
 У тебя есть РЕАЛЬНЫЕ ИНСТРУМЕНТЫ которые ты ОБЯЗАН использовать:
 
-- create_contract — создать полный пакет документов сделки (агентский договор, ДКП и счёт) и сохранить на Google Drive
-- save_company    — сохранить реквизиты компании/клиента в постоянную память
+- create_contract  — создать полный пакет документов сделки (агентский договор, ДКП и счёт) и сохранить на Google Drive
+- find_deal        — найти сделку в журнале по номеру договора, ФИО, VIN или дате
+- update_deal      — обновить данные сделки в журнале и при необходимости перегенерировать документы
+- cancel_deal      — отменить сделку (пометить как отменённую, не удалять)
+- save_company     — сохранить реквизиты компании/клиента в постоянную память
 - save_instruction — сохранить инструкцию для себя
 
 ВАЖНО: Когда пользователь просит создать договор или счёт — ВСЕГДА вызывай соответствующий инструмент.
+Когда пользователь просит найти, исправить или отменить сделку — ВСЕГДА используй инструменты find_deal / update_deal / cancel_deal.
 
 === ОБЯЗАТЕЛЬНЫЕ КЛЮЧИ В ПОЛЕ data ===
 
@@ -152,7 +158,7 @@ buyer_name, buyer_birth_date, buyer_address, passport_series, passport_number, p
 - Различай два типа штампов:
   1) ШТАМП ОТ РУКИ (текст написан вручную, разные почерки) — действительно может быть
      нечитаем, особенно низкого качества.
-  2) МАШИНОПИСНЫЙ ШТАМП (печатный текст, типографский шрифт, как у "ЗАРЕГИСТРИРОВАН ..., 
+  2) МАШИНОПИСНЫЙ ШТАМП (печатный текст, типографский шрифт, как у "ЗАРЕГИСТРИРОВАН ...,
      МО МВД ..., р-н:, улица:, д.:") — такой штамп почти ВСЕГДА читаем, даже если повёрнут
      или с водяным знаком/гербом на фоне. Прочитай его внимательно по частям (район, улица,
      дом) — не сдавайся сразу.
@@ -306,6 +312,25 @@ VIN: ...
 После этого жди ответа пользователя. Только если он подтвердил (написал "да", "верно", "создавай", "всё верно" или аналог) — вызови инструмент request_date_choice чтобы показать кнопки выбора даты договора. НЕ спрашивай дату текстом — всегда через инструмент.
 Если пользователь нажал «Сегодня» — используй {today_str}. Если нажал «Другая дата» или написал дату вручную — используй её. Передавай дату в параметр contract_date при вызове create_contract.
 
+=== РАБОТА С ЖУРНАЛОМ СДЕЛОК ===
+
+После создания каждой сделки она автоматически записывается в Google Sheets журнал.
+
+Когда пользователь просит найти сделку — используй find_deal. Поиск работает по:
+- номеру договора (например "270625001")
+- ФИО покупателя или продавца
+- VIN автомобиля
+- дате договора
+
+Когда пользователь говорит что в сделке ошибка и просит исправить:
+1. Сначала вызови find_deal чтобы найти сделку
+2. Покажи пользователю найденные данные
+3. Уточни что именно исправить
+4. Вызови update_deal с исправленными полями
+5. Спроси нужно ли перегенерировать документы — если да, вызови create_contract с теми же данными но исправленными полями (номер договора и дата остаются прежними)
+
+Когда пользователь просит отменить сделку — вызови cancel_deal, спроси причину.
+
 Если каких-то необязательных данных нет — оставь значение пустой строкой "".
 
 Отвечай на русском языке. Будь краток и по делу."""
@@ -420,6 +445,56 @@ VIN: ...
                         "commission_pct":  {"type": "number",  "description": "Комиссия агента в процентах, например 2.0"},
                     },
                     "required": ["data", "commission_pct"],
+                },
+            },
+            {
+                "name": "find_deal",
+                "description": "Найти сделку в журнале Google Sheets по номеру договора, ФИО покупателя или продавца, VIN или дате.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Поисковый запрос: номер договора, ФИО, VIN или дата",
+                        },
+                    },
+                    "required": ["query"],
+                },
+            },
+            {
+                "name": "update_deal",
+                "description": "Обновить данные сделки в журнале Google Sheets. Используй после find_deal.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "contract_number": {
+                            "type": "string",
+                            "description": "Номер договора (например 270625001)",
+                        },
+                        "updates": {
+                            "type": "object",
+                            "description": "Словарь полей для обновления: {имя_поля: новое_значение}. Имена полей — те же что в data при create_contract, плюс 'Статус' и 'Комментарий'.",
+                        },
+                    },
+                    "required": ["contract_number", "updates"],
+                },
+            },
+            {
+                "name": "cancel_deal",
+                "description": "Отменить сделку — пометить статус как 'отменена'. Не удаляет данные.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "contract_number": {
+                            "type": "string",
+                            "description": "Номер договора",
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "Причина отмены (необязательно)",
+                        },
+                    },
+                    "required": ["contract_number"],
                 },
             },
             {
@@ -568,7 +643,7 @@ VIN: ...
                 memory.clear_pending_scans(chat_id)
                 logger.info(f"Загружено {uploaded_scans} сканов в папку сделки {number}")
 
-            # ── 1. Строим документы ПОСЛЕДОВАТЕЛЬНО (не параллельно — меньше памяти) ──
+            # ── 1. Строим документы ПОСЛЕДОВАТЕЛЬНО ───────────────────────
             built = {}
             try:
                 logger.info("Строю АГ договор...")
@@ -599,9 +674,7 @@ VIN: ...
             dkp_pdf  = f"ДКП_ТС_{number}.pdf"
             inv_pdf  = f"Счёт_{number}.pdf"
 
-            # ── 2. Загружаем docx/xlsx на Drive ПОСЛЕДОВАТЕЛЬНО ────────────
-            # (параллельные запросы через httplib2/googleapiclient в разных
-            #  потоках вызывают сегфолт "double free or corruption")
+            # ── 2. Загружаем на Drive ПОСЛЕДОВАТЕЛЬНО ─────────────────────
             logger.info("Загружаю на Drive...")
             for fpath, fname in (
                 (ag_path,      ag_docx),
@@ -613,7 +686,7 @@ VIN: ...
                 except Exception as e:
                     logger.error(f"Ошибка загрузки на Drive (сделка {number}, файл {fname}): {e}", exc_info=True)
 
-            # ── 3. PDF только если не отключён через SKIP_PDF=1 ───────────
+            # ── 3. PDF ─────────────────────────────────────────────────────
             skip_pdf = os.environ.get("SKIP_PDF", "0") == "1"
             ag_pdf_path = dkp_pdf_path = inv_pdf_path = None
             ag_link = ""
@@ -633,7 +706,22 @@ VIN: ...
             else:
                 logger.info("PDF пропущен (SKIP_PDF=1)")
 
-            # ── 4. Собираем файлы для отправки в Telegram ─────────────────
+            # ── 4. Получаем ссылку на папку сделки ────────────────────────
+            drive_folder_link = f"https://drive.google.com/drive/folders/{deal_folder_id}"
+
+            # ── 5. Записываем в журнал Sheets ─────────────────────────────
+            try:
+                await self.sheets.save_deal(
+                    contract_number=number,
+                    contract_date=date,
+                    data=tool_input["data"],
+                    commission_pct=commission_pct,
+                    drive_folder_link=drive_folder_link,
+                )
+            except Exception as e:
+                logger.error(f"Ошибка записи в Sheets (сделка {number}): {e}", exc_info=True)
+
+            # ── 6. Собираем файлы для Telegram ────────────────────────────
             extra_files = []
             extra_names = []
 
@@ -661,6 +749,46 @@ VIN: ...
                 "drive_link":  ag_link,
                 "message":     f"Сделка {number}: {total_files} файлов отправлено{pdf_note}",
             }
+
+        elif tool_name == "find_deal":
+            query = tool_input.get("query", "")
+            results = await self.sheets.find_deal(query)
+            if not results:
+                return {"message": f"❌ Сделки по запросу «{query}» не найдены в журнале."}
+
+            lines = [f"🔍 Найдено сделок: {len(results)}\n"]
+            for r in results[:5]:  # Показываем максимум 5
+                lines.append(
+                    f"📄 {r.get('Номер договора', '—')} от {r.get('Дата договора', '—')} "
+                    f"[{r.get('Статус', '—')}]\n"
+                    f"  Покупатель: {r.get('buyer_name', '—')}\n"
+                    f"  Продавец: {r.get('seller_name', '—')}\n"
+                    f"  Авто: {r.get('car_model', '—')} VIN {r.get('car_vin', '—')}\n"
+                    f"  Цена: {r.get('car_price', '—')} руб.\n"
+                )
+            if len(results) > 5:
+                lines.append(f"  ...и ещё {len(results) - 5} сделок")
+
+            return {"message": "\n".join(lines)}
+
+        elif tool_name == "update_deal":
+            contract_number = tool_input.get("contract_number", "")
+            updates = tool_input.get("updates", {})
+            ok = await self.sheets.update_deal(contract_number, updates)
+            if ok:
+                fields = ", ".join(updates.keys())
+                return {"message": f"✅ Сделка {contract_number} обновлена. Изменены поля: {fields}"}
+            else:
+                return {"message": f"❌ Сделка {contract_number} не найдена в журнале."}
+
+        elif tool_name == "cancel_deal":
+            contract_number = tool_input.get("contract_number", "")
+            reason = tool_input.get("reason", "")
+            ok = await self.sheets.cancel_deal(contract_number, reason)
+            if ok:
+                return {"message": f"✅ Сделка {contract_number} отменена." + (f" Причина: {reason}" if reason else "")}
+            else:
+                return {"message": f"❌ Сделка {contract_number} не найдена в журнале."}
 
         elif tool_name == "save_company":
             memory.save_company(tool_input["name"], tool_input["data"])
