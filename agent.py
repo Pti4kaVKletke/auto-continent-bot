@@ -327,7 +327,12 @@ VIN: ...
 2. Покажи пользователю найденные данные
 3. Уточни что именно исправить
 4. Вызови update_deal с исправленными полями
-5. Спроси нужно ли перегенерировать документы — если да, вызови create_contract с теми же данными но исправленными полями (номер договора и дата остаются прежними)
+5. Спроси нужно ли перегенерировать документы — если да, вызови create_contract передав ВСЕ данные из find_deal с исправлениями И параметр existing_contract_number = номер сделки. Тогда новый номер не генерируется, файлы загружаются в существующую папку на Drive, строка в Sheets обновляется.
+
+Когда пользователь просит перегенерировать документы для существующей сделки:
+1. Вызови find_deal чтобы получить все данные
+2. Вызови create_contract с данными из find_deal И existing_contract_number = номер сделки
+3. НЕ генерируй новый номер — используй тот что в existing_contract_number
 
 Когда пользователь просит отменить сделку — вызови cancel_deal, спроси причину.
 
@@ -433,7 +438,7 @@ VIN: ...
         return [
             {
                 "name": "create_contract",
-                "description": "Создать полный пакет документов по сделке (АГ договор, ДКП ТС, Счёт на оплату). ВСЕГДА спрашивай размер комиссии в процентах перед вызовом если он не указан.",
+                "description": "Создать полный пакет документов по сделке (АГ договор, ДКП ТС, Счёт на оплату). ВСЕГДА спрашивай размер комиссии в процентах перед вызовом если он не указан. Для перегенерации существующей сделки передай existing_contract_number — тогда новый номер не генерируется, файлы загружаются в существующую папку, строка в Sheets обновляется а не дублируется.",
                 "input_schema": {
                     "type": "object",
                     "properties": {
@@ -441,8 +446,9 @@ VIN: ...
                             "type": "object",
                             "description": "Данные для заполнения документов — строго по ключам из системного промпта"
                         },
-                        "contract_date":   {"type": "string",  "description": "Дата договора в формате ДД.ММ.ГГГГ (опционально, если не указана — используется сегодняшняя дата)"},
-                        "commission_pct":  {"type": "number",  "description": "Комиссия агента в процентах, например 2.0"},
+                        "contract_date":            {"type": "string", "description": "Дата договора в формате ДД.ММ.ГГГГ (опционально, если не указана — используется сегодняшняя дата)"},
+                        "commission_pct":           {"type": "number", "description": "Комиссия агента в процентах, например 2.0"},
+                        "existing_contract_number": {"type": "string", "description": "Номер существующей сделки для перегенерации документов. Если указан — новый номер не генерируется, папка на Drive ищется по этому номеру, строка в Sheets обновляется."},
                     },
                     "required": ["data", "commission_pct"],
                 },
@@ -620,7 +626,14 @@ VIN: ...
 
         if tool_name == "create_contract":
             contract_date = tool_input.get("contract_date") or None
-            number = await self.drive.get_next_contract_number(contract_date)
+            existing_number = tool_input.get("existing_contract_number", "").strip()
+            is_regen = bool(existing_number)
+
+            if is_regen:
+                number = existing_number
+                logger.info(f"Перегенерация документов для существующей сделки {number}")
+            else:
+                number = await self.drive.get_next_contract_number(contract_date)
 
             logger.debug("DATA KEYS: " + str(list(tool_input.get("data", {}).keys())))
 
@@ -709,15 +722,24 @@ VIN: ...
             # ── 4. Получаем ссылку на папку сделки ────────────────────────
             drive_folder_link = f"https://drive.google.com/drive/folders/{deal_folder_id}"
 
-            # ── 5. Записываем в журнал Sheets ─────────────────────────────
+            # ── 5. Записываем/обновляем в журнале Sheets ─────────────────
             try:
-                await self.sheets.save_deal(
-                    contract_number=number,
-                    contract_date=date,
-                    data=tool_input["data"],
-                    commission_pct=commission_pct,
-                    drive_folder_link=drive_folder_link,
-                )
+                if is_regen:
+                    # Перегенерация — обновляем существующую строку
+                    updates = dict(tool_input["data"])
+                    updates["Комиссия %"] = str(commission_pct)
+                    updates["Дата договора"] = date
+                    updates["Папка Drive"] = drive_folder_link
+                    await self.sheets.update_deal(number, updates)
+                else:
+                    # Новая сделка — добавляем строку
+                    await self.sheets.save_deal(
+                        contract_number=number,
+                        contract_date=date,
+                        data=tool_input["data"],
+                        commission_pct=commission_pct,
+                        drive_folder_link=drive_folder_link,
+                    )
             except Exception as e:
                 logger.error(f"Ошибка записи в Sheets (сделка {number}): {e}", exc_info=True)
 
