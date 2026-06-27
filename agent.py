@@ -37,6 +37,7 @@ class DocumentAgent:
 У тебя есть РЕАЛЬНЫЕ ИНСТРУМЕНТЫ которые ты ОБЯЗАН использовать:
 
 - create_contract  — создать полный пакет документов сделки (агентский договор, ДКП и счёт) и сохранить на Google Drive
+- check_deal       — проверить заполненность сделки в таблице и создать документы если всё заполнено
 - import_deal      — занести существующую сделку в журнал Sheets БЕЗ генерации документов (для старых сделок)
 - find_deal        — найти сделку в журнале по номеру договора, ФИО, VIN или дате
 - update_deal      — обновить данные сделки в журнале и при необходимости перегенерировать документы
@@ -47,6 +48,16 @@ class DocumentAgent:
 ВАЖНО: Когда пользователь просит создать договор или счёт — ВСЕГДА вызывай соответствующий инструмент.
 Когда пользователь просит найти, исправить или отменить сделку — ВСЕГДА используй инструменты find_deal / update_deal / cancel_deal.
 Когда пользователь скидывает документ существующей сделки для занесения в журнал — используй import_deal.
+Когда пользователь пишет "проверь сделку", "создай документы для сделки из таблицы", "сделай договор по строке" — используй check_deal.
+Когда пользователь нажал кнопку выбора документов (пришло сообщение "Создай документы для сделки X, тип: Y") — используй generate_docs с contract_number=X и doc_type=Y.
+
+=== ПРОВЕРКА И СОЗДАНИЕ ДОКУМЕНТОВ ИЗ ТАБЛИЦЫ ===
+
+Когда пользователь просит проверить сделку или создать документы на основе данных из таблицы:
+1. Вызови check_deal с номером сделки
+2. Инструмент сам прочитает данные из Sheets и проверит заполненность
+3. Если всё заполнено — спроси подтверждение и создай документы через create_contract с existing_contract_number
+4. Если чего-то не хватает — покажи список недостающих полей и жди пока пользователь их заполнит в таблице
 
 === ИМПОРТ СУЩЕСТВУЮЩИХ СДЕЛОК ===
 
@@ -465,6 +476,40 @@ VIN: ...
                 },
             },
             {
+                "name": "generate_docs",
+                "description": (
+                    "Сгенерировать конкретные документы для сделки из таблицы. "
+                    "Используй после check_deal когда известно какие именно документы нужны. "
+                    "doc_type: all=полный пакет, ag=только АГ договор, dkp=только ДКП, invoice=только счёт."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "contract_number": {"type": "string", "description": "Номер договора"},
+                        "doc_type":        {"type": "string", "description": "Тип документов: all / ag / dkp / invoice"},
+                    },
+                    "required": ["contract_number", "doc_type"],
+                },
+            },
+            {
+                "name": "check_deal",
+                "description": (
+                    "Прочитать данные сделки из таблицы Sheets, проверить заполненность "
+                    "всех обязательных полей и вернуть результат. Используй когда пользователь "
+                    "просит создать документы на основе данных из таблицы."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "contract_number": {
+                            "type": "string",
+                            "description": "Номер договора (например 270625001)",
+                        },
+                    },
+                    "required": ["contract_number"],
+                },
+            },
+            {
                 "name": "find_deal",
                 "description": "Найти сделку в журнале Google Sheets по номеру договора, ФИО покупателя или продавца, VIN или дате.",
                 "input_schema": {
@@ -819,6 +864,217 @@ VIN: ...
                 "drive_link":  ag_link,
                 "message":     f"Сделка {number}: {total_files} файлов отправлено{pdf_note}",
             }
+
+        elif tool_name == "generate_docs":
+            contract_number = tool_input.get("contract_number", "")
+            doc_type        = tool_input.get("doc_type", "all")
+
+            # Берём данные из _pending_check если есть, иначе читаем из Sheets
+            pending = getattr(self, "_pending_check", None)
+            if pending and pending.get("contract_number") == contract_number:
+                data           = pending["data"]
+                contract_date  = pending["contract_date"]
+                commission_pct = pending["commission_pct"]
+            else:
+                deal = await self.sheets.get_deal(contract_number)
+                if not deal:
+                    return {"message": f"❌ Сделка {contract_number} не найдена в журнале."}
+                REQUIRED_KEYS = [
+                    "buyer_name","buyer_initials","buyer_birth_date","buyer_address",
+                    "passport_series","passport_number","passport_issued_by","passport_issued_date","passport_code",
+                    "seller_name","seller_initials","seller_birth_date","seller_address",
+                    "seller_id_number","seller_id_issued_by","seller_id_issued_date",
+                    "car_model","car_vin","car_year","car_color","tpo_number","tpo_day","tpo_month","tpo_year",
+                    "car_price","car_price_words","currency","cash_amount","cash_amount_words",
+                    "cash_currency","exchange_rate","account_currency","account_number",
+                    "bank_corr_line1","bank_corr_line2","bank_corr_line3","bank_ben_line1","bank_ben_line2",
+                ]
+                data           = {k: deal.get(k, "") for k in REQUIRED_KEYS}
+                contract_date  = deal.get("Дата договора", datetime.now().strftime("%d.%m.%Y"))
+                commission_pct = float(deal.get("Комиссия %", 1.0) or 1.0)
+
+            deal_folder_id = await self.drive.get_or_create_deal_folder(contract_number)
+            skip_pdf = os.environ.get("SKIP_PDF", "0") == "1"
+
+            built_files = []   # (local_path, filename, drive_link)
+            extra_files = []
+            extra_names = []
+            first_file  = None
+            first_name  = None
+            ag_link     = ""
+
+            async def _build_and_upload_ag():
+                nonlocal first_file, first_name, ag_link
+                path = await self.builder.build_contract(data, contract_number, contract_date, commission_pct)
+                fname = f"АГ_Договор_{contract_number}.docx"
+                await self.drive.upload_file(path, fname, deal_folder_id)
+                first_file = path; first_name = fname
+                if not skip_pdf:
+                    pdf = await self.builder.convert_to_pdf(path)
+                    if pdf:
+                        pname = f"АГ_Договор_{contract_number}.pdf"
+                        ag_link = await self.drive.upload_file(pdf, pname, deal_folder_id)
+                        extra_files.append(pdf); extra_names.append(pname)
+
+            async def _build_and_upload_dkp():
+                nonlocal first_file, first_name
+                path = await self.builder.build_dkp(data, contract_number, contract_date)
+                fname = f"ДКП_ТС_{contract_number}.docx"
+                await self.drive.upload_file(path, fname, deal_folder_id)
+                if first_file is None:
+                    first_file = path; first_name = fname
+                else:
+                    extra_files.append(path); extra_names.append(fname)
+                if not skip_pdf:
+                    pdf = await self.builder.convert_to_pdf(path)
+                    if pdf:
+                        pname = f"ДКП_ТС_{contract_number}.pdf"
+                        await self.drive.upload_file(pdf, pname, deal_folder_id)
+                        extra_files.append(pdf); extra_names.append(pname)
+
+            async def _build_and_upload_invoice():
+                nonlocal first_file, first_name
+                path = await self.builder.build_invoice(data, contract_number, contract_date, commission_pct)
+                fname = f"Счёт_{contract_number}.xlsx"
+                await self.drive.upload_file(path, fname, deal_folder_id)
+                if first_file is None:
+                    first_file = path; first_name = fname
+                else:
+                    extra_files.append(path); extra_names.append(fname)
+                if not skip_pdf:
+                    pdf = await self.builder.convert_to_pdf(path)
+                    if pdf:
+                        pname = f"Счёт_{contract_number}.pdf"
+                        await self.drive.upload_file(pdf, pname, deal_folder_id)
+                        extra_files.append(pdf); extra_names.append(pname)
+
+            try:
+                if doc_type == "all":
+                    await _build_and_upload_ag()
+                    await _build_and_upload_dkp()
+                    await _build_and_upload_invoice()
+                elif doc_type == "ag":
+                    await _build_and_upload_ag()
+                elif doc_type == "dkp":
+                    await _build_and_upload_dkp()
+                elif doc_type == "invoice":
+                    await _build_and_upload_invoice()
+            except Exception as e:
+                logger.error(f"Ошибка генерации документов ({doc_type}) для {contract_number}: {e}", exc_info=True)
+                return {"message": f"⚠️ Ошибка создания документов: {e}"}
+
+            total = 1 + len(extra_files)
+            pdf_note = " (PDF отключён)" if skip_pdf else ""
+            return {
+                "file":        first_file,
+                "filename":    first_name,
+                "extra_files": extra_files,
+                "extra_names": extra_names,
+                "drive_link":  ag_link,
+                "message":     f"Сделка {contract_number}: {total} файлов отправлено{pdf_note}",
+            }
+
+        elif tool_name == "check_deal":
+            contract_number = tool_input.get("contract_number", "")
+            deal = await self.sheets.get_deal(contract_number)
+
+            if not deal:
+                return {"message": f"❌ Сделка {contract_number} не найдена в журнале."}
+
+            # Обязательные поля
+            REQUIRED = [
+                ("buyer_name",           "ФИО покупателя"),
+                ("buyer_initials",       "Инициалы покупателя"),
+                ("buyer_birth_date",     "Дата рождения покупателя"),
+                ("buyer_address",        "Адрес покупателя"),
+                ("passport_series",      "Серия паспорта"),
+                ("passport_number",      "Номер паспорта"),
+                ("passport_issued_by",   "Кем выдан паспорт"),
+                ("passport_issued_date", "Дата выдачи паспорта"),
+                ("passport_code",        "Код подразделения"),
+                ("seller_name",          "ФИО продавца"),
+                ("seller_initials",      "Инициалы продавца"),
+                ("seller_birth_date",    "Дата рождения продавца"),
+                ("seller_address",       "Адрес продавца"),
+                ("seller_id_number",     "Номер ID карты продавца"),
+                ("seller_id_issued_by",  "Кем выдана ID карта"),
+                ("seller_id_issued_date","Дата выдачи ID карты"),
+                ("car_model",            "Марка/модель авто"),
+                ("car_vin",              "VIN"),
+                ("car_year",             "Год выпуска"),
+                ("car_color",            "Цвет"),
+                ("tpo_number",           "Номер ТПО"),
+                ("tpo_day",              "День ТПО"),
+                ("tpo_month",            "Месяц ТПО"),
+                ("tpo_year",             "Год ТПО"),
+                ("car_price",            "Цена ДКП (руб.)"),
+                ("car_price_words",      "Цена прописью"),
+                ("currency",             "Валюта ДКП"),
+                ("cash_amount",          "Сумма наличных (USD)"),
+                ("cash_amount_words",    "Сумма наличных прописью"),
+                ("cash_currency",        "Валюта наличных"),
+                ("exchange_rate",        "Курс USD/RUB"),
+                ("account_currency",     "Валюта счёта"),
+                ("account_number",       "Номер счёта"),
+                ("bank_corr_line1",      "Банк-корреспондент"),
+                ("bank_corr_line2",      "БИК корр."),
+                ("bank_corr_line3",      "Корр.счёт"),
+                ("bank_ben_line1",       "Банк получателя"),
+                ("bank_ben_line2",       "БИК и корр.счёт получателя"),
+            ]
+
+            missing = []
+            for key, label in REQUIRED:
+                val = deal.get(key, "").strip()
+                if not val or val == "None":
+                    missing.append(f"  — {label} ({key})")
+
+            contract_date = deal.get("Дата договора", "")
+            commission_pct = float(deal.get("Комиссия %", 1.0) or 1.0)
+
+            if missing:
+                lines = [
+                    f"📋 Сделка {contract_number} от {contract_date}
+",
+                    f"❌ Не заполнено {len(missing)} обязательных полей:
+",
+                ] + missing + [
+                    f"
+Заполни эти поля в таблице и снова напиши «проверь {contract_number}»."
+                ]
+                return {"message": "
+".join(lines)}
+
+            # Всё заполнено — собираем data для create_contract
+            data_keys = [r[0] for r in REQUIRED]
+            data = {k: deal.get(k, "") for k in data_keys}
+
+            text = "
+".join([
+                f"✅ Сделка {contract_number} от {contract_date} — все поля заполнены.
+",
+                f"👤 Покупатель: {deal.get('buyer_name', '—')}",
+                f"👤 Продавец: {deal.get('seller_name', '—')}",
+                f"🚗 {deal.get('car_model', '—')}, VIN {deal.get('car_vin', '—')}",
+                f"💰 {deal.get('car_price', '—')} руб., {deal.get('cash_amount', '—')} USD",
+                f"📊 Комиссия: {commission_pct}%
+",
+                "Какие документы создать?",
+            ])
+            # Сохраняем данные для использования при нажатии кнопки
+            self._pending_check = {
+                "contract_number": contract_number,
+                "contract_date": contract_date,
+                "commission_pct": commission_pct,
+                "data": data,
+            }
+            buttons = [
+                {"text": "📄 Полный пакет (АГ + ДКП + Счёт)", "callback_data": f"docmenu:{contract_number}:all"},
+                {"text": "📋 АГ договор",                      "callback_data": f"docmenu:{contract_number}:ag"},
+                {"text": "🚗 ДКП ТС",                         "callback_data": f"docmenu:{contract_number}:dkp"},
+                {"text": "💰 Счёт на оплату",                  "callback_data": f"docmenu:{contract_number}:invoice"},
+            ]
+            return {"message": text, "buttons": buttons}
 
         elif tool_name == "find_deal":
             query = tool_input.get("query", "")

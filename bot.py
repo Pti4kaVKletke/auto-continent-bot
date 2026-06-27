@@ -158,6 +158,22 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             result = await agent.process_message(f"Дата договора: {value}", chat_id=str(update.effective_chat.id))
             await send_result(query.message, result)
 
+    elif data.startswith("docmenu:"):
+        # docmenu:270625001:all  /  :ag  /  :dkp  /  :invoice
+        parts = data.split(":", 2)
+        if len(parts) == 3:
+            contract_number = parts[1]
+            doc_type        = parts[2]
+            labels = {"all": "Полный пакет", "ag": "АГ договор", "dkp": "ДКП ТС", "invoice": "Счёт"}
+            label = labels.get(doc_type, doc_type)
+            await query.edit_message_reply_markup(reply_markup=None)
+            await query.message.reply_text(f"⏳ Создаю {label} для сделки {contract_number}...")
+            result = await agent.process_message(
+                f"Создай документы для сделки {contract_number}, тип: {doc_type}",
+                chat_id=str(update.effective_chat.id),
+            )
+            await send_result(query.message, result)
+
     elif data.startswith("bankprofile:"):
         profile_name = data.split(":", 1)[1]
 
