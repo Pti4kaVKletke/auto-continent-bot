@@ -37,6 +37,7 @@ class DocumentAgent:
 У тебя есть РЕАЛЬНЫЕ ИНСТРУМЕНТЫ которые ты ОБЯЗАН использовать:
 
 - create_contract  — создать полный пакет документов сделки (агентский договор, ДКП и счёт) и сохранить на Google Drive
+- import_deal      — занести существующую сделку в журнал Sheets БЕЗ генерации документов (для старых сделок)
 - find_deal        — найти сделку в журнале по номеру договора, ФИО, VIN или дате
 - update_deal      — обновить данные сделки в журнале и при необходимости перегенерировать документы
 - cancel_deal      — отменить сделку (пометить как отменённую, не удалять)
@@ -45,6 +46,16 @@ class DocumentAgent:
 
 ВАЖНО: Когда пользователь просит создать договор или счёт — ВСЕГДА вызывай соответствующий инструмент.
 Когда пользователь просит найти, исправить или отменить сделку — ВСЕГДА используй инструменты find_deal / update_deal / cancel_deal.
+Когда пользователь скидывает документ существующей сделки для занесения в журнал — используй import_deal.
+
+=== ИМПОРТ СУЩЕСТВУЮЩИХ СДЕЛОК ===
+
+Когда пользователь скидывает документ (АГ договор, ДКП или счёт) существующей сделки и просит занести её в журнал:
+1. Извлеки все данные из документа по стандартным правилам
+2. Номер договора возьми из названия файла или из текста документа (формат ДДММГГ+NNN, например 270625001)
+3. Покажи извлечённые данные пользователю в сводке и спроси подтверждение
+4. После подтверждения вызови import_deal — НЕ create_contract
+5. Ссылку на папку Drive попроси у пользователя или оставь пустой
 
 === ОБЯЗАТЕЛЬНЫЕ КЛЮЧИ В ПОЛЕ data ===
 
@@ -504,6 +515,43 @@ VIN: ...
                 },
             },
             {
+                "name": "import_deal",
+                "description": (
+                    "Занести существующую сделку в журнал Google Sheets БЕЗ создания документов. "
+                    "Используй для старых сделок которые уже есть на Drive но не в таблице."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "contract_number": {
+                            "type": "string",
+                            "description": "Номер договора (например 270625001)",
+                        },
+                        "contract_date": {
+                            "type": "string",
+                            "description": "Дата договора в формате ДД.ММ.ГГГГ",
+                        },
+                        "commission_pct": {
+                            "type": "number",
+                            "description": "Комиссия агента в процентах",
+                        },
+                        "data": {
+                            "type": "object",
+                            "description": "Все данные сделки — те же ключи что в create_contract",
+                        },
+                        "drive_folder_link": {
+                            "type": "string",
+                            "description": "Ссылка на папку сделки на Google Drive (если известна)",
+                        },
+                        "status": {
+                            "type": "string",
+                            "description": "Статус сделки: активна / отменена. По умолчанию активна.",
+                        },
+                    },
+                    "required": ["contract_number", "contract_date", "commission_pct", "data"],
+                },
+            },
+            {
                 "name": "save_company",
                 "description": "Сохранить реквизиты компании или клиента в память",
                 "input_schema": {
@@ -811,6 +859,35 @@ VIN: ...
                 return {"message": f"✅ Сделка {contract_number} отменена." + (f" Причина: {reason}" if reason else "")}
             else:
                 return {"message": f"❌ Сделка {contract_number} не найдена в журнале."}
+
+        elif tool_name == "import_deal":
+            contract_number   = tool_input.get("contract_number", "")
+            contract_date     = tool_input.get("contract_date", "")
+            commission_pct    = float(tool_input.get("commission_pct", 1.0))
+            data              = tool_input.get("data", {})
+            drive_folder_link = tool_input.get("drive_folder_link", "")
+            status            = tool_input.get("status", "активна")
+
+            # Проверяем не занесена ли уже эта сделка
+            existing = await self.sheets.get_deal(contract_number)
+            if existing:
+                return {"message": f"⚠️ Сделка {contract_number} уже есть в журнале (статус: {existing.get('Статус', '?')}). Обновить данные?"}
+
+            ok = await self.sheets.save_deal(
+                contract_number=contract_number,
+                contract_date=contract_date,
+                data=data,
+                commission_pct=commission_pct,
+                drive_folder_link=drive_folder_link,
+            )
+            # Если статус не активна — обновляем
+            if ok and status != "активна":
+                await self.sheets.update_deal(contract_number, {"Статус": status})
+
+            if ok:
+                return {"message": f"✅ Сделка {contract_number} от {contract_date} занесена в журнал."}
+            else:
+                return {"message": f"❌ Ошибка при занесении сделки {contract_number} в журнал."}
 
         elif tool_name == "save_company":
             memory.save_company(tool_input["name"], tool_input["data"])
