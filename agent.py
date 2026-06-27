@@ -42,6 +42,7 @@ class DocumentAgent:
 - find_deal        — найти сделку в журнале по номеру договора, ФИО, VIN или дате
 - update_deal      — обновить данные сделки в журнале и при необходимости перегенерировать документы
 - cancel_deal      — отменить сделку (пометить как отменённую, не удалять)
+- complete_deal    — завершить сделку (деньги получены, авто передано)
 - save_company     — сохранить реквизиты компании/клиента в постоянную память
 - save_instruction — сохранить инструкцию для себя
 
@@ -67,6 +68,8 @@ class DocumentAgent:
 3. Покажи извлечённые данные пользователю в сводке и спроси подтверждение
 4. После подтверждения вызови import_deal — НЕ create_contract
 5. Ссылку на папку Drive попроси у пользователя или оставь пустой
+
+__СТАТУСЫ_PLACEHOLDER__
 
 === ОБЯЗАТЕЛЬНЫЕ КЛЮЧИ В ПОЛЕ data ===
 
@@ -362,6 +365,24 @@ VIN: ...
 
 Отвечай на русском языке. Будь краток и по делу."""
 
+        base = base.replace("__СТАТУСЫ_PLACEHOLDER__", "\n".join([
+            "=== СТАТУСЫ СДЕЛОК ===",
+            "",
+            "Доступные статусы (используй ТОЛЬКО эти значения):",
+            "- черновик  — данные частично заполнены, документы ещё не созданы",
+            "- активна   — документы созданы, сделка в работе (ставится автоматически при create_contract)",
+            "- завершена — деньги получены, авто передано, сделка закрыта",
+            "- отменена  — сделка не состоялась (ставится через cancel_deal)",
+            "",
+            "Правила работы со статусами:",
+            '- При создании новой сделки (create_contract) — статус автоматически "активна"',
+            '- При импорте старой сделки (import_deal) — статус "активна" если документы уже были, иначе "черновик"',
+            '- Когда пользователь говорит "завершить сделку", "закрыть сделку" — вызови update_deal с updates={"Статус": "завершена"}',
+            '- Когда пользователь говорит "черновик", "добавь в черновики" — вызови update_deal со статусом "черновик"',
+            '- Черновики можно найти через find_deal с запросом "черновик"',
+            '- Когда пишут "покажи черновики" или "активные сделки" — вызови find_deal с запросом "черновик" или "активна"',
+        ]))
+
         instructions = memory.get_instructions()
         if instructions:
             base += "\n\nТВОИ ПОСТОЯННЫЕ ИНСТРУКЦИИ (всегда выполняй):\n"
@@ -554,6 +575,24 @@ VIN: ...
                         "reason": {
                             "type": "string",
                             "description": "Причина отмены (необязательно)",
+                        },
+                    },
+                    "required": ["contract_number"],
+                },
+            },
+            {
+                "name": "complete_deal",
+                "description": "Завершить сделку — пометить статус как 'завершена'. Используй когда деньги получены и авто передано.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "contract_number": {
+                            "type": "string",
+                            "description": "Номер договора",
+                        },
+                        "comment": {
+                            "type": "string",
+                            "description": "Комментарий (необязательно)",
                         },
                     },
                     "required": ["contract_number"],
@@ -1137,6 +1176,18 @@ VIN: ...
                 return {"message": f"✅ Сделка {contract_number} от {contract_date} занесена в журнал."}
             else:
                 return {"message": f"❌ Ошибка при занесении сделки {contract_number} в журнал."}
+
+        elif tool_name == "complete_deal":
+            contract_number = tool_input.get("contract_number", "")
+            comment = tool_input.get("comment", "")
+            updates = {"Статус": "завершена"}
+            if comment:
+                updates["Комментарий"] = comment
+            ok = await self.sheets.update_deal(contract_number, updates)
+            if ok:
+                return {"message": f"✅ Сделка {contract_number} завершена." + (f" {comment}" if comment else "")}
+            else:
+                return {"message": f"❌ Сделка {contract_number} не найдена в журнале."}
 
         elif tool_name == "save_company":
             memory.save_company(tool_input["name"], tool_input["data"])
