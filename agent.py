@@ -82,6 +82,7 @@ currency         — валюта ДКП (рублей)
 cash_amount      — сумма наличных в Поручении цифрами (например: 54900). Это ДРУГАЯ сумма — в долларах!
 cash_amount_words — сумма наличных прописью БЕЗ валюты (Пятьдесят четыре тысячи девятьсот)
 cash_currency    — валюта наличных (долларов / сом)
+exchange_rate    — курс доллара к рублю на дату договора (например: 81,40)
 account_currency — валюта счёта для банковского перевода
 account_number   — номер счёта получателя
 bank_corr_line1  — название банка-корреспондента (например "АО «Тинькофф Банк»")
@@ -100,7 +101,7 @@ bank_ben_line2   — БИК и корр.счёт банка получателя
 Покупатель: buyer_name, buyer_initials, buyer_birth_date, buyer_address, passport_series, passport_number, passport_issued_by, passport_issued_date, passport_code
 Продавец:   seller_name, seller_initials, seller_id_issued_date, seller_birth_date, seller_address, seller_id_number, seller_id_issued_by
 Автомобиль: car_model, car_vin, car_year, car_color, tpo_number, tpo_day, tpo_month, tpo_year
-Финансы:    car_price, car_price_words, currency, cash_amount, cash_amount_words, cash_currency, account_currency, account_number, bank_corr_line1, bank_corr_line2, bank_corr_line3, bank_ben_line1, bank_ben_line2
+Финансы:    car_price, car_price_words, currency, cash_amount, cash_amount_words, cash_currency, exchange_rate, account_currency, account_number, bank_corr_line1, bank_corr_line2, bank_corr_line3, bank_ben_line1, bank_ben_line2
 Комиссия:   commission_pct передаётся как отдельный параметр инструмента, НЕ внутри data
 
 НЕОБЯЗАТЕЛЬНЫЕ поля (оставь пустыми если нет):
@@ -292,6 +293,7 @@ VIN: ...
 Сумма наличными агенту (долларов): ...
 Сумма наличными прописью (без валюты): ...
 Комиссия: ...%
+Курс USD/RUB: ... руб./USD
 
 🏦 БАНКОВСКИЕ РЕКВИЗИТЫ:
 Валюта счёта: ...

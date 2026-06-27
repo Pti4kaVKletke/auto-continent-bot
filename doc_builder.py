@@ -493,12 +493,47 @@ class DocumentBuilder:
         }
         return months.get(month_num, month_num)
 
+    @staticmethod
+    def _normalize(value: str) -> str:
+        """
+        Приводит строку к нормальному регистру: первая буква каждого слова — заглавная,
+        остальные — строчные. Нужно потому что в документах КР данные часто написаны КАПСОМ.
+        Не трогает строки где уже есть смешанный регистр (значит уже нормальные).
+        """
+        if not value or not value.strip():
+            return value
+        # Если есть хоть одна строчная буква — строка уже в нормальном регистре, не трогаем
+        if any(c.islower() for c in value):
+            return value
+        # Если нет ни одной буквы — не трогаем (числа, коды и т.п.)
+        if not any(c.isalpha() for c in value):
+            return value
+        # Приводим каждое слово к Title Case
+        # Предлоги/союзы (не первое слово) оставляем строчными
+        lower_words = {"и", "в", "на", "по", "из", "за", "от", "до", "при", "для",
+                       "или", "но", "а", "не", "то", "со", "об", "под", "над"}
+        words = value.split()
+        result = []
+        for i, word in enumerate(words):
+            # Слова с цифрами — capitalize только первую букву если есть
+            if any(c.isdigit() for c in word):
+                result.append(word[0].upper() + word[1:].lower() if word[0].isalpha() else word)
+            elif word.isalpha() and i > 0 and word.lower() in lower_words:
+                result.append(word.lower())
+            else:
+                result.append(word.capitalize())
+        return " ".join(result)
+
     async def _fill_template(self, template_path, data, number, date, output_name,
                               commission_pct: float = 1.0) -> str:
         from lxml import etree
         from copy import deepcopy
 
         doc = Document(str(template_path))
+
+        # Нормализуем регистр текстовых полей — данные из КР-документов часто приходят КАПСОМ
+        n = self._normalize
+
 
         day   = date[0:2]
         month = date[3:5]
@@ -526,34 +561,34 @@ class DocumentBuilder:
             "{{КОМИССИЯ}}": str(commission_pct),
 
             # Покупатель (гражданин РФ)
-            "{{ПОКУПАТЕЛЬ_ФИО}}":           data.get("buyer_name", ""),
+            "{{ПОКУПАТЕЛЬ_ФИО}}":           n(data.get("buyer_name", "")),
             "{{ПОКУПАТЕЛЬ_ДАТА_РОЖДЕНИЯ}}": data.get("buyer_birth_date", ""),
-            "{{ПОКУПАТЕЛЬ_АДРЕС}}":         data.get("buyer_address", ""),
-            "{{ПОКУПАТЕЛЬ_ИНИЦИАЛЫ}}":      data.get("buyer_initials", ""),
-            "{{ПОКУПАТЕЛЬ_ПОЛНЫЕ_ДАННЫЕ}}": data.get("buyer_full_details", data.get("buyer_name", "")),
+            "{{ПОКУПАТЕЛЬ_АДРЕС}}":         n(data.get("buyer_address", "")),
+            "{{ПОКУПАТЕЛЬ_ИНИЦИАЛЫ}}":      n(data.get("buyer_initials", "")),
+            "{{ПОКУПАТЕЛЬ_ПОЛНЫЕ_ДАННЫЕ}}": n(data.get("buyer_full_details", data.get("buyer_name", ""))),
 
             # Паспорт покупателя (РФ)
             "{{ПАСПОРТ_СЕРИЯ}}":       data.get("passport_series", ""),
             "{{ПАСПОРТ_НОМЕР}}":       data.get("passport_number", ""),
-            "{{ПАСПОРТ_ВЫДАН}}":       data.get("passport_issued_by", ""),
+            "{{ПАСПОРТ_ВЫДАН}}":       n(data.get("passport_issued_by", "")),
             "{{ПАСПОРТ_КОД}}":         data.get("passport_code", ""),
             "{{ПАСПОРТ_ДАТА_ВЫДАЧИ}}": data.get("passport_issued_date", ""),
 
             # Продавец (гражданин КР)
-            "{{ПРОДАВЕЦ_ФИО}}":           data.get("seller_name", ""),
+            "{{ПРОДАВЕЦ_ФИО}}":           n(data.get("seller_name", "")),
             "{{ПРОДАВЕЦ_ДАТА_РОЖДЕНИЯ}}": data.get("seller_birth_date", ""),
-            "{{ПРОДАВЕЦ_АДРЕС}}":         data.get("seller_address", ""),
-            "{{ПРОДАВЕЦ_ИНИЦИАЛЫ}}":      data.get("seller_initials", ""),
-            "{{ПРОДАВЕЦ_ПОЛНЫЕ_ДАННЫЕ}}": data.get("seller_full_details", data.get("seller_name", "")),
+            "{{ПРОДАВЕЦ_АДРЕС}}":         n(data.get("seller_address", "")),
+            "{{ПРОДАВЕЦ_ИНИЦИАЛЫ}}":      n(data.get("seller_initials", "")),
+            "{{ПРОДАВЕЦ_ПОЛНЫЕ_ДАННЫЕ}}": n(data.get("seller_full_details", data.get("seller_name", ""))),
 
             # Идентификационная карта продавца (КР)
             "{{ПРОДАВЕЦ_ID}}":        data.get("seller_id_number", data.get("seller_id", "")),
             "{{ПРОДАВЕЦ_ID_НОМЕР}}":  data.get("seller_id_number", data.get("seller_id", "")),
-            "{{ПРОДАВЕЦ_ID_ВЫДАНА}}": data.get("seller_id_issued_by", ""),
+            "{{ПРОДАВЕЦ_ID_ВЫДАНА}}": n(data.get("seller_id_issued_by", "")),
             "{{ПРОДАВЕЦ_ID_ДАТА}}":   data.get("seller_id_issued_date", ""),
 
             # Авто
-            "{{МАРКА_МОДЕЛЬ}}": data.get("car_model", ""),
+            "{{МАРКА_МОДЕЛЬ}}": n(data.get("car_model", "")),
             "{{VIN}}":          data.get("car_vin", ""),
             "{{ГОД_ВЫП}}":      data.get("car_year", ""),
             "{{ЦВЕТ}}":         data.get("car_color", ""),
@@ -571,6 +606,7 @@ class DocumentBuilder:
             "{{СУММА_НАЛИЧНЫМИ_ПРОПИСЬЮ}}": data.get("cash_amount_words", ""),
             "{{СУММА_ПРОПИСЬЮ}}":           data.get("cash_amount_words", ""),
             "{{ВАЛЮТА_НАЛИЧНЫМИ}}":        data.get("cash_currency", data.get("currency", "рублей")),
+            "{{КУРС_ДОЛЛАРА}}":             data.get("exchange_rate", ""),
 
             # Банковские реквизиты
             "{{БАНК_КОРР_СТРОКА1}}": data.get("bank_corr_line1", ""),
