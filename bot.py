@@ -488,7 +488,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         action = parts[2]
 
         if action == "menu":
-            # Загружаем данные сделки и показываем меню действий
             deal = await agent.sheets.get_deal(num)
             if not deal:
                 await query.edit_message_text(f"❌ Сделка {num} не найдена.")
@@ -500,6 +499,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             price  = deal.get("car_price", "—")
             date   = deal.get("Дата договора", "—")
             folder = deal.get("Папка Drive", "")
+
+            # Для старых сделок без ссылки — строим её по номеру договора
+            if not folder:
+                try:
+                    folder_id = await agent.drive.get_or_create_deal_folder(num)
+                    folder = f"https://drive.google.com/drive/folders/{folder_id}"
+                except Exception:
+                    pass
+
             text = (
                 f"📄 *Сделка {num}* от {date}\n\n"
                 f"👤 {buyer}\n"
@@ -527,6 +535,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             deal = await agent.sheets.get_deal(num)
             folder_link = deal.get("Папка Drive", "") if deal else ""
             folder_id = folder_link.split("/folders/")[-1].split("?")[0] if "/folders/" in folder_link else ""
+
+            # Если ссылки нет — ищем/создаём папку по номеру договора
+            if not folder_id:
+                try:
+                    folder_id = await agent.drive.get_or_create_deal_folder(num)
+                except Exception as e:
+                    logger.error(f"Не удалось найти папку для {num}: {e}", exc_info=True)
 
             if not folder_id:
                 await query.edit_message_text(
