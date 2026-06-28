@@ -14,6 +14,18 @@ logger = logging.getLogger(__name__)
 
 agent = DocumentAgent()
 
+# ─── КОНТРОЛЬ ДОСТУПА ────────────────────────────────────────────────────────
+
+ALLOWED_CHAT_ID = int(os.environ.get("ALLOWED_CHAT_ID", "268470621"))
+
+async def check_access(update: Update) -> bool:
+    allowed = set(
+        int(x.strip())
+        for x in os.environ.get("ALLOWED_CHAT_IDS", str(ALLOWED_CHAT_ID)).split(",")
+        if x.strip().lstrip("-").isdigit()
+    )
+    return update.effective_chat.id in allowed
+
 
 # ─── TYPING INDICATOR ────────────────────────────────────────────────────────
 
@@ -67,6 +79,9 @@ def main_menu_keyboard():
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_access(update):
+        await update.message.reply_text("⛔ Доступ запрещён.")
+        return
     await update.message.reply_text(
         MAIN_MENU_TEXT,
         parse_mode="MarkdownV2",
@@ -164,6 +179,9 @@ async def send_result(message, result: dict):
 # ─── ОБРАБОТКА ФАЙЛОВ ────────────────────────────────────────────────────────
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_access(update):
+        await update.message.reply_text("⛔ Доступ запрещён.")
+        return
     message = update.message
     chat_id = str(update.effective_chat.id)
     await message.reply_text("📥 Получил файл, обрабатываю...")
@@ -200,6 +218,9 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    if not await check_access(update):
+        await query.message.reply_text("⛔ Доступ запрещён.")
+        return
 
     data = query.data or ""
 
@@ -355,6 +376,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─── ОБРАБОТКА ТЕКСТА ────────────────────────────────────────────────────────
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_access(update):
+        await update.message.reply_text("⛔ Доступ запрещён.")
+        return
     user_text = update.message.text
     chat_id = str(update.effective_chat.id)
 
