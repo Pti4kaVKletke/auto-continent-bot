@@ -1,6 +1,7 @@
 import os
 import logging
 import asyncio
+import random
 import time
 from pathlib import Path
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -56,10 +57,17 @@ async def typing_while(chat_id, context: ContextTypes.DEFAULT_TYPE, coro):
 
 # ─── ГЛАВНОЕ МЕНЮ ────────────────────────────────────────────────────────────
 
-MAIN_MENU_TEXT = (
-    "👋 *Привет, Александра\\!*\n\n"
-    "Я готова к работе\\. Выбери действие или просто напиши что нужно сделать\\."
-)
+_GREETINGS = [
+    "👋 Привет\\! Я готова к работе\\.",
+    "🤝 На связи\\! Чем могу помочь\\?",
+    "✨ Готова\\! Выбери действие или напиши что нужно\\.",
+    "🚗 На месте\\! Что делаем\\?",
+    "💼 Готова к работе\\. Выбери действие\\.",
+    "👌 Здесь\\! Чем займёмся\\?",
+]
+
+def get_menu_text() -> str:
+    return random.choice(_GREETINGS)
 
 def main_menu_keyboard():
     return InlineKeyboardMarkup([
@@ -83,7 +91,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Доступ запрещён.")
         return
     await update.message.reply_text(
-        MAIN_MENU_TEXT,
+        get_menu_text(),
         parse_mode="MarkdownV2",
         reply_markup=main_menu_keyboard(),
     )
@@ -91,7 +99,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        MAIN_MENU_TEXT,
+        get_menu_text(),
         parse_mode="MarkdownV2",
         reply_markup=main_menu_keyboard(),
     )
@@ -252,16 +260,33 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         elif action == "active":
             await query.edit_message_text("🔄 Загружаю активные сделки...")
-            result = await typing_while(
-                update.effective_chat.id, context,
-                agent.process_message("покажи активные сделки", chat_id=str(update.effective_chat.id))
-            )
-            await query.message.reply_text(
-                result.get("text") or "Активных сделок нет.",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("◀️ Меню", callback_data="menu:back")
-                ]])
-            )
+            deals = await agent.sheets.find_deal("активна")
+            if not deals:
+                await query.edit_message_text(
+                    "Активных сделок нет.",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("◀️ Меню", callback_data="menu:back")
+                    ]])
+                )
+            else:
+                lines = [f"🔄 *Активные сделки: {len(deals)}*\n"]
+                keyboard = []
+                for d in deals:
+                    num   = d.get("Номер договора", "—")
+                    buyer = d.get("buyer_name", "—")
+                    car   = d.get("car_model", "—")
+                    date  = d.get("Дата договора", "")
+                    lines.append(f"📄 `{num}` · {buyer} · {car}")
+                    keyboard.append([InlineKeyboardButton(
+                        f"📄 {num} — {buyer[:20]}",
+                        callback_data=f"dealaction:{num}:menu"
+                    )])
+                keyboard.append([InlineKeyboardButton("◀️ Меню", callback_data="menu:back")])
+                await query.edit_message_text(
+                    "\n".join(lines),
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
 
         elif action == "stats":
             await query.edit_message_text("📊 Считаю статистику...")
@@ -319,7 +344,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         elif action == "back":
             await query.edit_message_text(
-                MAIN_MENU_TEXT,
+                get_menu_text(),
                 parse_mode="MarkdownV2",
                 reply_markup=main_menu_keyboard(),
             )
@@ -357,6 +382,100 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             )
             await send_result(query.message, result)
+
+    # ── Меню действий по сделке ──────────────────────────────────────────────
+    elif data.startswith("dealaction:"):
+        parts = data.split(":", 2)
+        if len(parts) < 3:
+            return
+        num    = parts[1]
+        action = parts[2]
+
+        if action == "menu":
+            # Загружаем данные сделки и показываем меню действий
+            deal = await agent.sheets.get_deal(num)
+            if not deal:
+                await query.edit_message_text(f"❌ Сделка {num} не найдена.")
+                return
+            buyer  = deal.get("buyer_name", "—")
+            seller = deal.get("seller_name", "—")
+            car    = deal.get("car_model", "—")
+            vin    = deal.get("car_vin", "—")
+            price  = deal.get("car_price", "—")
+            date   = deal.get("Дата договора", "—")
+            folder = deal.get("Папка Drive", "")
+            text = (
+                f"📄 *Сделка {num}* от {date}\n\n"
+                f"👤 {buyer}\n"
+                f"👤 {seller}\n"
+                f"🚗 {car} · VIN `{vin}`\n"
+                f"💰 {price} руб."
+            )
+            keyboard = [
+                [InlineKeyboardButton("📋 Создать документы", callback_data=f"dealaction:{num}:docs")],
+                [InlineKeyboardButton("✅ Завершить сделку",  callback_data=f"dealaction:{num}:complete")],
+                [InlineKeyboardButton("❌ Отменить сделку",   callback_data=f"dealaction:{num}:cancel")],
+            ]
+            if folder:
+                keyboard.insert(0, [InlineKeyboardButton("📁 Открыть на Drive", url=folder)])
+            keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="menu:active")])
+            await query.edit_message_text(
+                text,
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+
+        elif action == "docs":
+            await query.edit_message_text(f"⏳ Загружаю данные сделки {num}...")
+            result = await typing_while(
+                update.effective_chat.id, context,
+                agent.process_message(f"проверь сделку {num}", chat_id=str(update.effective_chat.id))
+            )
+            await send_result(query.message, result)
+
+        elif action == "complete":
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ Да, завершить", callback_data=f"dealaction:{num}:complete_yes"),
+                    InlineKeyboardButton("◀️ Отмена",        callback_data=f"dealaction:{num}:menu"),
+                ]
+            ])
+            await query.edit_message_text(
+                f"Завершить сделку *{num}*?\nДеньги получены, авто передано.",
+                parse_mode="Markdown",
+                reply_markup=keyboard
+            )
+
+        elif action == "complete_yes":
+            ok = await agent.sheets.update_deal(num, {"Статус": "завершена"})
+            await query.edit_message_text(
+                f"✅ Сделка {num} завершена." if ok else f"❌ Не удалось завершить сделку {num}.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("◀️ Меню", callback_data="menu:back")
+                ]])
+            )
+
+        elif action == "cancel":
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("❌ Да, отменить", callback_data=f"dealaction:{num}:cancel_yes"),
+                    InlineKeyboardButton("◀️ Назад",        callback_data=f"dealaction:{num}:menu"),
+                ]
+            ])
+            await query.edit_message_text(
+                f"Отменить сделку *{num}*?",
+                parse_mode="Markdown",
+                reply_markup=keyboard
+            )
+
+        elif action == "cancel_yes":
+            ok = await agent.sheets.cancel_deal(num)
+            await query.edit_message_text(
+                f"✅ Сделка {num} отменена." if ok else f"❌ Не удалось отменить сделку {num}.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("◀️ Меню", callback_data="menu:back")
+                ]])
+            )
 
     # ── Выбор банковского профиля ─────────────────────────────────────────────
     elif data.startswith("bankprofile:"):
