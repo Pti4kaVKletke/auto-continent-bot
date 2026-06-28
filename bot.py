@@ -672,11 +672,39 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if context.user_data.get("awaiting_search"):
         context.user_data["awaiting_search"] = False
-        result = await typing_while(
-            update.effective_chat.id, context,
-            agent.process_message(f"найди сделку: {user_text}", chat_id=chat_id)
-        )
-        await send_result(update.message, result, context=context, chat_id=str(update.effective_chat.id))
+        deals = await agent.sheets.find_deal(user_text.strip())
+        if not deals:
+            await update.message.reply_text(
+                f"❌ По запросу «{user_text}» ничего не найдено.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔍 Искать снова", callback_data="menu:find_deal"),
+                    InlineKeyboardButton("◀️ Меню",         callback_data="menu:back"),
+                ]])
+            )
+        else:
+            lines = [f"🔍 *Найдено: {len(deals)}*\n"]
+            keyboard = []
+            for d in deals[:10]:
+                num    = d.get("Номер договора", "—")
+                status = d.get("Статус", "—")
+                car    = d.get("car_model", "—")
+                vin    = d.get("car_vin", "—")
+                init   = d.get("buyer_initials") or d.get("buyer_name", "—")
+                date   = d.get("Дата договора", "")
+                lines.append(f"📄 `{num}` {init}\n    🚗 {car} · `...{vin[-6:]}` · {date} [{status}]")
+                label = f"📄 {num} · {init}"[:32]
+                keyboard.append([InlineKeyboardButton(label, callback_data=f"dealaction:{num}:menu")])
+            if len(deals) > 10:
+                lines.append(f"\n_...и ещё {len(deals)-10}. Уточни запрос._")
+            keyboard.append([
+                InlineKeyboardButton("🔍 Искать снова", callback_data="menu:find_deal"),
+                InlineKeyboardButton("◀️ Меню",         callback_data="menu:back"),
+            ])
+            await update.message.reply_text(
+                "\n".join(lines),
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
         return
 
     result = await typing_while(
