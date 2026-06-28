@@ -315,9 +315,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             context.user_data["awaiting_search"] = True
 
-        elif action == "active":
+        elif action == "active" or action.startswith("active:"):
+            page = int(action.split(":")[1]) if ":" in action else 0
+            per_page = 5
+
             await query.edit_message_text("🔄 Загружаю активные сделки...")
             deals = await agent.sheets.find_deal("активна")
+            # Фильтруем строго по статусу
+            deals = [d for d in deals if d.get("Статус", "").strip().lower() == "активна"]
+
             if not deals:
                 await query.edit_message_text(
                     "Активных сделок нет.",
@@ -326,19 +332,40 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     ]])
                 )
             else:
-                lines = [f"🔄 *Активные сделки: {len(deals)}*\n"]
+                total   = len(deals)
+                total_pages = (total + per_page - 1) // per_page
+                page    = max(0, min(page, total_pages - 1))
+                chunk   = deals[page * per_page : (page + 1) * per_page]
+
+                # Текст сообщения — 5 сделок подробно
+                lines = [f"🔄 *Активные сделки* · {total} шт · стр. {page+1}/{total_pages}\n"]
+                for d in chunk:
+                    num      = d.get("Номер договора", "—")
+                    car      = d.get("car_model", "—")
+                    vin      = d.get("car_vin", "—")
+                    # Фамилия И.О.
+                    full     = d.get("buyer_initials") or d.get("buyer_name", "—")
+                    lines.append(f"📄 `{num}` {full}\n    🚗 {car} · `...{vin[-6:]}`")
+
+                # Кнопки — номер + Фамилия И.О.
                 keyboard = []
-                for d in deals:
+                for d in chunk:
                     num   = d.get("Номер договора", "—")
-                    buyer = d.get("buyer_name", "—")
-                    car   = d.get("car_model", "—")
-                    date  = d.get("Дата договора", "")
-                    lines.append(f"📄 `{num}` · {buyer} · {car}")
-                    keyboard.append([InlineKeyboardButton(
-                        f"📄 {num} — {buyer[:20]}",
-                        callback_data=f"dealaction:{num}:menu"
-                    )])
+                    init  = d.get("buyer_initials") or d.get("buyer_name", "—")
+                    # Обрезаем до 25 символов чтобы влезло в кнопку
+                    label = f"📄 {num} · {init}"[:32]
+                    keyboard.append([InlineKeyboardButton(label, callback_data=f"dealaction:{num}:menu")])
+
+                # Навигация
+                nav = []
+                if page > 0:
+                    nav.append(InlineKeyboardButton("← Пред.", callback_data=f"menu:active:{page-1}"))
+                if page < total_pages - 1:
+                    nav.append(InlineKeyboardButton("След. →", callback_data=f"menu:active:{page+1}"))
+                if nav:
+                    keyboard.append(nav)
                 keyboard.append([InlineKeyboardButton("◀️ Меню", callback_data="menu:back")])
+
                 await query.edit_message_text(
                     "\n".join(lines),
                     parse_mode="Markdown",
