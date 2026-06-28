@@ -157,8 +157,12 @@ async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─── ОТПРАВКА РЕЗУЛЬТАТА ─────────────────────────────────────────────────────
 
-async def send_result(message, result: dict):
+async def send_result(message, result: dict, context=None, chat_id=None):
     """Отправляет файлы и текст результата."""
+    # Если договор создан — сбрасываем флаг активной сделки
+    if result.get("files") and context and chat_id:
+        context.user_data.pop("deal_in_progress", None)
+
     if result.get("files"):
         for f_info in result["files"]:
             try:
@@ -186,14 +190,8 @@ async def send_result(message, result: dict):
 
 # ─── ОБРАБОТКА ФАЙЛОВ ────────────────────────────────────────────────────────
 
-async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_access(update):
-        await update.message.reply_text("⛔ Доступ запрещён.")
-        return
-    message = update.message
-    chat_id = str(update.effective_chat.id)
-    await message.reply_text("📥 Получил файл, обрабатываю...")
-
+async def _save_file_locally(message, chat_id: str) -> tuple[str, str] | None:
+    """Скачивает файл, сохраняет в pending_scans, возвращает (filepath, filename)."""
     if message.document:
         file = await message.document.get_file()
         filename = message.document.file_name
@@ -201,24 +199,83 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file = await message.photo[-1].get_file()
         filename = "photo.jpg"
     else:
-        await message.reply_text("❌ Неподдерживаемый тип файла")
-        return
+        return None
 
     scans_dir = Path("/data/pending_scans")
     scans_dir.mkdir(parents=True, exist_ok=True)
     safe_filename = f"{int(time.time())}_{filename}"
     filepath = str(scans_dir / safe_filename)
     await file.download_to_drive(filepath)
-
     memory.add_pending_scan(chat_id, filepath, filename)
     logger.info(f"Скан сохранён: {filepath} (chat_id={chat_id})")
+    return filepath, filename
 
+
+async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_access(update):
+        await update.message.reply_text("⛔ Доступ запрещён.")
+        return
+    message = update.message
+    chat_id = str(update.effective_chat.id)
+
+    saved = await _save_file_locally(message, chat_id)
+    if not saved:
+        await message.reply_text("❌ Неподдерживаемый тип файла")
+        return
+    filepath, filename = saved
+
+    # ── Сценарий А: ждём скан для конкретной сделки (кнопка "📎 Загрузить скан") ──
+    if context.user_data.get("awaiting_scan_for_deal"):
+        contract_number = context.user_data.pop("awaiting_scan_for_deal")
+        deal_folder_id  = context.user_data.pop("awaiting_scan_folder_id", None)
+
+        if deal_folder_id:
+            try:
+                scans_folder_id = await agent.drive._get_or_create_folder("Сканы", deal_folder_id)
+                link = await agent.drive.upload_file(filepath, filename, scans_folder_id)
+                await message.reply_text(
+                    f"✅ Скан загружен в папку сделки *{contract_number}*",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("◀️ К сделке", callback_data=f"dealaction:{contract_number}:menu")
+                    ]])
+                )
+            except Exception as e:
+                logger.error(f"Ошибка загрузки скана для сделки {contract_number}: {e}", exc_info=True)
+                await message.reply_text(f"⚠️ Не удалось загрузить скан: {e}")
+        else:
+            await message.reply_text(f"⚠️ Папка сделки {contract_number} не найдена на Drive.")
+        return
+
+    # ── Сценарий Б: идёт создание новой сделки — молча в pending_scans ──
+    if context.user_data.get("deal_in_progress"):
+        await message.reply_text("📎 Скан сохранён — добавлю в папку сделки при создании договора.")
+        return
+
+    # ── Сценарий В: ждём номер сделки для привязки скана ──
+    if context.user_data.get("awaiting_scan_deal_number"):
+        context.user_data.pop("awaiting_scan_deal_number")
+        context.user_data["awaiting_scan_filepath"] = filepath
+        context.user_data["awaiting_scan_filename"]  = filename
+        await message.reply_text(
+            "📎 Файл получен. Теперь укажи номер сделки (например: `280626001`):",
+            parse_mode="Markdown",
+        )
+        return
+
+    # ── Сценарий Г: файл без контекста — спрашиваем что делать ──
     caption = message.caption or ""
-    result = await typing_while(
-        update.effective_chat.id, context,
-        agent.process_file(filepath, filename, caption, chat_id=chat_id)
-    )
-    await send_result(message, result)
+
+    # Если пришёл с подписью типа "скан 280626001" — сразу спрашиваем номер
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📂 В существующую сделку", callback_data="scan_route:existing")],
+        [InlineKeyboardButton("📄 Читать и начать новую сделку", callback_data="scan_route:new")],
+    ])
+    context.user_data["last_scan_filepath"] = filepath
+    context.user_data["last_scan_filename"]  = filename
+    context.user_data["last_scan_caption"]   = caption
+    await message.reply_text("📎 Получила файл. Что с ним делать?", reply_markup=keyboard)
+
 
 
 # ─── ОБРАБОТКА CALLBACK-КНОПОК ───────────────────────────────────────────────
@@ -413,6 +470,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             keyboard = [
                 [InlineKeyboardButton("📋 Создать документы", callback_data=f"dealaction:{num}:docs")],
+                [InlineKeyboardButton("📎 Загрузить скан",    callback_data=f"dealaction:{num}:scan")],
                 [InlineKeyboardButton("✅ Завершить сделку",  callback_data=f"dealaction:{num}:complete")],
                 [InlineKeyboardButton("❌ Отменить сделку",   callback_data=f"dealaction:{num}:cancel")],
             ]
@@ -423,6 +481,25 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text,
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+
+        elif action == "scan":
+            # Получаем folder_id для этой сделки
+            deal = await agent.sheets.get_deal(num)
+            folder_link = deal.get("Папка Drive", "") if deal else ""
+            # Извлекаем folder_id из ссылки Drive
+            folder_id = folder_link.split("/folders/")[-1].split("?")[0] if "/folders/" in folder_link else ""
+            if not folder_id:
+                # Создаём папку если нет ссылки
+                folder_id = await agent.drive.get_or_create_deal_folder(num)
+            context.user_data["awaiting_scan_for_deal"]  = num
+            context.user_data["awaiting_scan_folder_id"] = folder_id
+            await query.edit_message_text(
+                f"📎 Отправь скан для сделки *{num}*\n\nЖду файл или фото...",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("◀️ Отмена", callback_data=f"dealaction:{num}:menu")
+                ]])
             )
 
         elif action == "docs":
@@ -477,6 +554,33 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ]])
             )
 
+    # ── Маршрутизация скана (существующая / новая сделка) ────────────────────
+    elif data.startswith("scan_route:"):
+        route = data.split(":", 1)[1]
+        filepath = context.user_data.pop("last_scan_filepath", None)
+        filename  = context.user_data.pop("last_scan_filename", "file")
+        caption   = context.user_data.pop("last_scan_caption", "")
+
+        if route == "existing":
+            # Запоминаем файл и ждём номер сделки текстом
+            context.user_data["awaiting_scan_for_existing"] = True
+            context.user_data["pending_existing_filepath"]  = filepath
+            context.user_data["pending_existing_filename"]  = filename
+            await query.edit_message_text(
+                "Укажи номер сделки (например: `280626001`):",
+                parse_mode="Markdown",
+            )
+
+        elif route == "new":
+            # Передаём файл агенту как обычно для новой сделки
+            context.user_data["deal_in_progress"] = True
+            await query.edit_message_text("📥 Читаю документ...")
+            result = await typing_while(
+                update.effective_chat.id, context,
+                agent.process_file(filepath, filename, caption, chat_id=str(update.effective_chat.id))
+            )
+            await send_result(query.message, result)
+
     # ── Выбор банковского профиля ─────────────────────────────────────────────
     elif data.startswith("bankprofile:"):
         profile_name = data.split(":", 1)[1]
@@ -501,13 +605,42 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
     chat_id = str(update.effective_chat.id)
 
+    if context.user_data.get("awaiting_scan_for_existing"):
+        context.user_data.pop("awaiting_scan_for_existing")
+        contract_number = user_text.strip()
+        filepath = context.user_data.pop("pending_existing_filepath", None)
+        filename  = context.user_data.pop("pending_existing_filename", "file")
+
+        if not filepath or not Path(filepath).exists():
+            await update.message.reply_text("⚠️ Файл не найден, попробуй загрузить снова.")
+            return
+
+        try:
+            deal_folder_id  = await agent.drive.get_or_create_deal_folder(contract_number)
+            scans_folder_id = await agent.drive._get_or_create_folder("Сканы", deal_folder_id)
+            await typing_while(
+                update.effective_chat.id, context,
+                agent.drive.upload_file(filepath, filename, scans_folder_id)
+            )
+            await update.message.reply_text(
+                f"✅ Скан загружен в папку сделки *{contract_number}*",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("◀️ Меню", callback_data="menu:back")
+                ]])
+            )
+        except Exception as e:
+            logger.error(f"Ошибка загрузки скана: {e}", exc_info=True)
+            await update.message.reply_text(f"⚠️ Ошибка загрузки: {e}")
+        return
+
     if context.user_data.get("awaiting_deal_date"):
         context.user_data["awaiting_deal_date"] = False
         result = await typing_while(
             update.effective_chat.id, context,
             agent.process_message(f"Дата договора: {user_text.strip()}", chat_id=chat_id)
         )
-        await send_result(update.message, result)
+        await send_result(update.message, result, context=context, chat_id=str(update.effective_chat.id))
         return
 
     if context.user_data.get("awaiting_search"):
@@ -516,14 +649,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update.effective_chat.id, context,
             agent.process_message(f"найди сделку: {user_text}", chat_id=chat_id)
         )
-        await send_result(update.message, result)
+        await send_result(update.message, result, context=context, chat_id=str(update.effective_chat.id))
         return
 
     result = await typing_while(
         update.effective_chat.id, context,
         agent.process_message(user_text, chat_id=chat_id)
     )
-    await send_result(update.message, result)
+    await send_result(update.message, result, context=context, chat_id=str(update.effective_chat.id))
 
 
 # ─── ОБРАБОТЧИК ОШИБОК ───────────────────────────────────────────────────────
