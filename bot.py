@@ -184,6 +184,11 @@ async def send_result(message, result: dict, context=None, chat_id=None):
                 [InlineKeyboardButton(b["text"], callback_data=b["callback_data"])]
                 for b in result["buttons"]
             ]
+            # Добавляем кнопку назад если её нет среди кнопок агента
+            has_back = any("menu:back" in b["callback_data"] or "◀️" in b["text"]
+                           for b in result["buttons"])
+            if not has_back:
+                keyboard.append([InlineKeyboardButton("◀️ Меню", callback_data="menu:back")])
             reply_markup = InlineKeyboardMarkup(keyboard)
         await message.reply_text(result["text"], reply_markup=reply_markup)
 
@@ -270,6 +275,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("📂 В существующую сделку", callback_data="scan_route:existing")],
         [InlineKeyboardButton("📄 Читать и начать новую сделку", callback_data="scan_route:new")],
+        [InlineKeyboardButton("◀️ Меню", callback_data="menu:back")],
     ])
     context.user_data["last_scan_filepath"] = filepath
     context.user_data["last_scan_filename"]  = filename
@@ -301,6 +307,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "• ТПО и/или таможенную декларацию продавца\n\n"
                 "Или напиши данные текстом — я извлеку всё нужное.",
                 parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("◀️ Меню", callback_data="menu:back")
+                ]])
             )
 
         elif action == "find_deal":
@@ -312,6 +321,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "• VIN автомобиля\n"
                 "• Дату договора",
                 parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("◀️ Меню", callback_data="menu:back")
+                ]])
             )
             context.user_data["awaiting_search"] = True
 
