@@ -497,7 +497,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             keyboard = [
                 [InlineKeyboardButton("📋 Создать документы", callback_data=f"dealaction:{num}:docs")],
-                [InlineKeyboardButton("📎 Загрузить скан",    callback_data=f"dealaction:{num}:scan")],
+                [InlineKeyboardButton("📎 Загрузить скан",    callback_data=f"dealaction:{num}:scan"),
+                 InlineKeyboardButton("🗂 Сканы",             callback_data=f"dealaction:{num}:scans")],
                 [InlineKeyboardButton("✅ Завершить сделку",  callback_data=f"dealaction:{num}:complete")],
                 [InlineKeyboardButton("❌ Отменить сделку",   callback_data=f"dealaction:{num}:cancel")],
             ]
@@ -508,6 +509,83 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text,
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+
+        elif action == "scans":
+            deal = await agent.sheets.get_deal(num)
+            folder_link = deal.get("Папка Drive", "") if deal else ""
+            folder_id = folder_link.split("/folders/")[-1].split("?")[0] if "/folders/" in folder_link else ""
+
+            if not folder_id:
+                await query.edit_message_text(
+                    f"❌ Папка сделки {num} не найдена на Drive.",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("◀️ Назад", callback_data=f"dealaction:{num}:menu")
+                    ]])
+                )
+                return
+
+            # Ищем папку Сканы внутри папки сделки
+            def _list_scans():
+                svc = agent.drive.service
+                # Находим папку Сканы
+                q = (f"name='Сканы' and mimeType='application/vnd.google-apps.folder' "
+                     f"and '{folder_id}' in parents and trashed=false")
+                res = svc.files().list(q=q, fields="files(id,name)").execute()
+                scans_folders = res.get("files", [])
+                if not scans_folders:
+                    return None, []
+                scans_id = scans_folders[0]["id"]
+                # Список файлов в папке Сканы
+                q2 = f"'{scans_id}' in parents and trashed=false"
+                res2 = svc.files().list(
+                    q=q2,
+                    fields="files(id,name,mimeType,size,webViewLink,createdTime)",
+                    orderBy="createdTime desc"
+                ).execute()
+                return scans_id, res2.get("files", [])
+
+            try:
+                scans_id, files = await asyncio.to_thread(_list_scans)
+            except Exception as e:
+                logger.error(f"Ошибка чтения сканов для {num}: {e}", exc_info=True)
+                await query.edit_message_text(
+                    f"⚠️ Не удалось прочитать папку сканов: {e}",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("◀️ Назад", callback_data=f"dealaction:{num}:menu")
+                    ]])
+                )
+                return
+
+            if scans_id is None:
+                text = f"🗂 *Сканы сделки {num}*\n\nПапка «Сканы» не найдена."
+            elif not files:
+                text = f"🗂 *Сканы сделки {num}*\n\nПапка пуста — сканов нет."
+            else:
+                lines = [f"🗂 *Сканы сделки {num}* · {len(files)} файл(ов)\n"]
+                for f in files:
+                    name = f.get("name", "—")
+                    size = f.get("size", "")
+                    size_str = f" · {int(size)//1024} КБ" if size else ""
+                    link = f.get("webViewLink", "")
+                    if link:
+                        lines.append(f"📄 [{name}]({link}){size_str}")
+                    else:
+                        lines.append(f"📄 {name}{size_str}")
+                text = "\n".join(lines)
+
+            scans_folder_url = f"https://drive.google.com/drive/folders/{scans_id}" if scans_id else ""
+            kb = []
+            if scans_folder_url:
+                kb.append([InlineKeyboardButton("📁 Открыть папку Сканы", url=scans_folder_url)])
+            kb.append([InlineKeyboardButton("📎 Загрузить скан", callback_data=f"dealaction:{num}:scan")])
+            kb.append([InlineKeyboardButton("◀️ Назад",          callback_data=f"dealaction:{num}:menu")])
+
+            await query.edit_message_text(
+                text,
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(kb),
+                disable_web_page_preview=True,
             )
 
         elif action == "scan":
