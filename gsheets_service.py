@@ -176,9 +176,10 @@ class GoogleSheetsService:
                         row_dict.get("car_vin", ""),
                         row_dict.get("Дата договора", ""),
                         row_dict.get("car_model", ""),
+                        row_dict.get("Статус", ""),
                     ]).lower()
 
-                    if q in searchable:
+                    if not q or q in searchable:
                         found.append(row_dict)
 
                 return found
