@@ -732,15 +732,16 @@ VIN: ...
                         "drive_link": tool_result.get("drive_link", ""),
                     })
 
-                for f_path, f_name in zip(
+                for f_path, f_name, f_link in zip(
                     tool_result.get("extra_files", []),
                     tool_result.get("extra_names", []),
+                    tool_result.get("extra_links", [""] * len(tool_result.get("extra_files", []))),
                 ):
                     if Path(f_path).exists():
                         result["files"].append({
                             "file":       f_path,
                             "filename":   f_name,
-                            "drive_link": "",
+                            "drive_link": f_link,
                         })
 
                 if tool_result.get("buttons"):
@@ -938,54 +939,67 @@ VIN: ...
             built_files = []   # (local_path, filename, drive_link)
             extra_files = []
             extra_names = []
+            extra_links = []   # ссылки Drive для extra_files
             first_file  = None
             first_name  = None
-            ag_link     = ""
+            first_link  = ""   # ссылка Drive для первого файла
 
             async def _build_and_upload_ag():
-                nonlocal first_file, first_name, ag_link
+                nonlocal first_file, first_name, first_link
                 path = await self.builder.build_contract(data, contract_number, contract_date, commission_pct)
                 fname = f"АГ_Договор_{contract_number}.docx"
-                await self.drive.upload_file(path, fname, deal_folder_id)
+                link = await self.drive.upload_file(path, fname, deal_folder_id)
                 first_file = path; first_name = fname
+                if not first_link:
+                    first_link = link
                 if not skip_pdf:
                     pdf = await self.builder.convert_to_pdf(path)
                     if pdf:
                         pname = f"АГ_Договор_{contract_number}.pdf"
-                        ag_link = await self.drive.upload_file(pdf, pname, deal_folder_id)
-                        extra_files.append(pdf); extra_names.append(pname)
+                        plink = await self.drive.upload_file(pdf, pname, deal_folder_id)
+                        if not first_link:
+                            first_link = plink
+                        extra_files.append(pdf); extra_names.append(pname); extra_links.append(plink)
 
             async def _build_and_upload_dkp():
-                nonlocal first_file, first_name
+                nonlocal first_file, first_name, first_link
                 path = await self.builder.build_dkp(data, contract_number, contract_date)
                 fname = f"ДКП_ТС_{contract_number}.docx"
-                await self.drive.upload_file(path, fname, deal_folder_id)
+                link = await self.drive.upload_file(path, fname, deal_folder_id)
                 if first_file is None:
                     first_file = path; first_name = fname
+                    if not first_link:
+                        first_link = link
                 else:
-                    extra_files.append(path); extra_names.append(fname)
+                    extra_files.append(path); extra_names.append(fname); extra_links.append(link)
                 if not skip_pdf:
                     pdf = await self.builder.convert_to_pdf(path)
                     if pdf:
                         pname = f"ДКП_ТС_{contract_number}.pdf"
-                        await self.drive.upload_file(pdf, pname, deal_folder_id)
-                        extra_files.append(pdf); extra_names.append(pname)
+                        plink = await self.drive.upload_file(pdf, pname, deal_folder_id)
+                        if not first_link:
+                            first_link = plink
+                        extra_files.append(pdf); extra_names.append(pname); extra_links.append(plink)
 
             async def _build_and_upload_invoice():
-                nonlocal first_file, first_name
+                nonlocal first_file, first_name, first_link
                 path = await self.builder.build_invoice(data, contract_number, contract_date, commission_pct)
                 fname = f"Счёт_{contract_number}.xlsx"
-                await self.drive.upload_file(path, fname, deal_folder_id)
+                link = await self.drive.upload_file(path, fname, deal_folder_id)
                 if first_file is None:
                     first_file = path; first_name = fname
+                    if not first_link:
+                        first_link = link
                 else:
-                    extra_files.append(path); extra_names.append(fname)
+                    extra_files.append(path); extra_names.append(fname); extra_links.append(link)
                 if not skip_pdf:
                     pdf = await self.builder.convert_to_pdf(path)
                     if pdf:
                         pname = f"Счёт_{contract_number}.pdf"
-                        await self.drive.upload_file(pdf, pname, deal_folder_id)
-                        extra_files.append(pdf); extra_names.append(pname)
+                        plink = await self.drive.upload_file(pdf, pname, deal_folder_id)
+                        if not first_link:
+                            first_link = plink
+                        extra_files.append(pdf); extra_names.append(pname); extra_links.append(plink)
 
             try:
                 if doc_type == "all":
@@ -1007,9 +1021,10 @@ VIN: ...
             return {
                 "file":        first_file,
                 "filename":    first_name,
+                "drive_link":  first_link,
                 "extra_files": extra_files,
                 "extra_names": extra_names,
-                "drive_link":  ag_link,
+                "extra_links": extra_links,
                 "message":     f"Сделка {contract_number}: {total} файлов отправлено{pdf_note}",
             }
 
