@@ -248,6 +248,15 @@ class DocumentBuilder:
         """
         is_direct = not data.get("bank_corr_line1", "").strip()
 
+        # ── ОТЛАДКА: выводим все bank поля ────────────────────────────────
+        logger.info(f"build_invoice DEBUG: number={number}, is_direct={is_direct}")
+        logger.info(f"  bank_corr_line1={repr(data.get('bank_corr_line1', 'ОТСУТСТВУЕТ'))}")
+        logger.info(f"  bank_corr_line2={repr(data.get('bank_corr_line2', 'ОТСУТСТВУЕТ'))}")
+        logger.info(f"  bank_corr_line3={repr(data.get('bank_corr_line3', 'ОТСУТСТВУЕТ'))}")
+        logger.info(f"  bank_ben_line1={repr(data.get('bank_ben_line1', 'ОТСУТСТВУЕТ'))}")
+        logger.info(f"  bank_kpp={repr(data.get('bank_kpp', 'ОТСУТСТВУЕТ'))}")
+        logger.info(f"  account_number={repr(data.get('account_number', 'ОТСУТСТВУЕТ'))}")
+
         if is_direct:
             template = self.templates_dir / "invoice_template_direct.xlsx"
             if not template.exists():
