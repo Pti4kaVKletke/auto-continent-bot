@@ -7,7 +7,15 @@ from pathlib import Path
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
-from agent import DocumentAgent
+
+AGENT_VERSION = os.environ.get("AGENT_VERSION", "v1")
+if AGENT_VERSION == "v2":
+    from agent_v2 import DocumentAgent
+    logging.getLogger(__name__).info("Используется agent_v2")
+else:
+    from agent import DocumentAgent
+    logging.getLogger(__name__).info("Используется agent_v1")
+
 import memory
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
