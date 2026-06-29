@@ -949,6 +949,7 @@ VIN: ...
                     "car_price","car_price_words","currency","cash_amount","cash_amount_words",
                     "cash_currency","exchange_rate","account_currency","account_number",
                     "bank_corr_line1","bank_corr_line2","bank_corr_line3","bank_ben_line1","bank_ben_line2",
+                    "bank_kpp",
                 ]
                 data           = {k: deal.get(k, "") for k in REQUIRED_KEYS}
                 contract_date  = deal.get("Дата договора", datetime.now().strftime("%d.%m.%Y"))
