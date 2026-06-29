@@ -61,6 +61,7 @@ COLUMNS = [
     "bank_corr_line3",
     "bank_ben_line1",
     "bank_ben_line2",
+    "bank_kpp",
     "Папка Drive",
     "Комментарий",
 ]
