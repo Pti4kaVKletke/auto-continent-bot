@@ -1188,8 +1188,67 @@ VIN: ...
             if not results:
                 return {"message": f"❌ Сделки по запросу «{query}» не найдены в журнале."}
 
+            def _val(r, key):
+                v = r.get(key, "")
+                return v if v and v != "None" else "не указано"
+
+            # Одна сделка — показываем ВСЕ поля, чтобы пользователь получил нужное
+            if len(results) == 1:
+                r = results[0]
+                lines = [
+                    f"📄 Сделка {_val(r, 'Номер договора')} от {_val(r, 'Дата договора')} [{_val(r, 'Статус')}]\n",
+                    "👤 ПОКУПАТЕЛЬ:",
+                    f"  ФИО: {_val(r, 'buyer_name')}",
+                    f"  Инициалы: {_val(r, 'buyer_initials')}",
+                    f"  Дата рождения: {_val(r, 'buyer_birth_date')}",
+                    f"  Адрес: {_val(r, 'buyer_address')}",
+                    f"  Паспорт: {_val(r, 'passport_series')} {_val(r, 'passport_number')}",
+                    f"  Выдан: {_val(r, 'passport_issued_by')}",
+                    f"  Дата выдачи: {_val(r, 'passport_issued_date')}",
+                    f"  Код подразделения: {_val(r, 'passport_code')}",
+                    "",
+                    "👤 ПРОДАВЕЦ:",
+                    f"  ФИО: {_val(r, 'seller_name')}",
+                    f"  Инициалы: {_val(r, 'seller_initials')}",
+                    f"  Дата рождения: {_val(r, 'seller_birth_date')}",
+                    f"  Адрес: {_val(r, 'seller_address')}",
+                    f"  ID карта №: {_val(r, 'seller_id_number')}",
+                    f"  Кем выдана: {_val(r, 'seller_id_issued_by')}",
+                    f"  Дата выдачи: {_val(r, 'seller_id_issued_date')}",
+                    "",
+                    "🚗 АВТОМОБИЛЬ:",
+                    f"  Марка/модель: {_val(r, 'car_model')}",
+                    f"  VIN: {_val(r, 'car_vin')}",
+                    f"  Год: {_val(r, 'car_year')}",
+                    f"  Цвет: {_val(r, 'car_color')}",
+                    f"  ТПО №: {_val(r, 'tpo_number')} от {_val(r, 'tpo_day')} {_val(r, 'tpo_month')} {_val(r, 'tpo_year')}",
+                    "",
+                    "💰 ФИНАНСЫ:",
+                    f"  Цена ДКП: {_val(r, 'car_price')} {_val(r, 'currency')}",
+                    f"  Прописью: {_val(r, 'car_price_words')}",
+                    f"  Наличными: {_val(r, 'cash_amount')} {_val(r, 'cash_currency')}",
+                    f"  Прописью: {_val(r, 'cash_amount_words')}",
+                    f"  Курс USD/RUB: {_val(r, 'exchange_rate')}",
+                    f"  Комиссия: {_val(r, 'Комиссия %')}%",
+                    "",
+                    "🏦 РЕКВИЗИТЫ:",
+                    f"  Валюта счёта: {_val(r, 'account_currency')}",
+                    f"  Номер счёта: {_val(r, 'account_number')}",
+                    f"  КПП: {_val(r, 'bank_kpp')}",
+                    f"  Банк-корреспондент: {_val(r, 'bank_corr_line1')}",
+                    f"  БИК корр.: {_val(r, 'bank_corr_line2')}",
+                    f"  Корр.счёт: {_val(r, 'bank_corr_line3')}",
+                    f"  Банк получателя: {_val(r, 'bank_ben_line1')}",
+                    f"  БИК/корр.счёт получателя: {_val(r, 'bank_ben_line2')}",
+                    "",
+                    f"📁 Drive: {_val(r, 'Папка Drive')}",
+                    f"💬 Комментарий: {_val(r, 'Комментарий')}",
+                ]
+                return {"message": "\n".join(lines)}
+
+            # Несколько сделок — краткий список
             lines = [f"🔍 Найдено сделок: {len(results)}\n"]
-            for r in results[:5]:  # Показываем максимум 5
+            for r in results[:5]:
                 lines.append(
                     f"📄 {r.get('Номер договора', '—')} от {r.get('Дата договора', '—')} "
                     f"[{r.get('Статус', '—')}]\n"
