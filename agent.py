@@ -301,18 +301,6 @@ seller_name, seller_birth_date, seller_address, seller_id_number, seller_id_issu
    - НИКОГДА не ставь car_price в поле cash_amount. Это всегда разные числа.
    - cash_amount_words — сумма прописью БЕЗ названия валюты. Только число словами: "Пятьдесят четыре тысячи девятьсот". Валюта указывается отдельно в поле cash_currency.
 
-2. СУММЫ ПРОПИСЬЮ — ГЕНЕРИРУЙ САМ, не спрашивай у пользователя:
-   - car_price_words: генерируй из car_price самостоятельно.
-     Алгоритм: разбей число на миллиарды/миллионы/тысячи/единицы, запиши каждую группу словами.
-     Пример: 4955000 → "Четыре миллиона девятьсот пятьдесят пять тысяч рублей"
-     Пример: 3200000 → "Три миллиона двести тысяч рублей"
-     Пример: 850000  → "Восемьсот пятьдесят тысяч рублей"
-   - cash_amount_words: генерируй из cash_amount самостоятельно, БЕЗ валюты.
-     Пример: 54000 → "Пятьдесят четыре тысячи"
-     Пример: 62200 → "Шестьдесят две тысячи двести"
-     Пример: 48500 → "Сорок восемь тысяч пятьсот"
-   - НИКОГДА не спрашивай пользователя как написать сумму прописью — всегда генерируй сам.
-
 2. Если пользователь не назвал цвет автомобиля — обязательно спроси.
 3. Если пользователь не назвал сумму наличных (cash_amount) отдельно — спроси.
 4. Собери все недостающие поля в ОДНОМ вопросе, не задавай по одному.
@@ -789,6 +777,15 @@ VIN: ...
                 number = await self.drive.get_next_contract_number(contract_date)
 
             logger.debug("DATA KEYS: " + str(list(tool_input.get("data", {}).keys())))
+
+            # Защита: агент иногда передаёт поля напрямую в tool_input вместо вложенного data
+            data = tool_input.get("data")
+            if not data or not isinstance(data, dict):
+                # Берём всё из tool_input, исключая служебные поля
+                excluded = {"contract_date", "commission_pct", "existing_contract_number"}
+                data = {k: v for k, v in tool_input.items() if k not in excluded}
+                logger.warning(f"create_contract: поле 'data' отсутствует, извлекаю из tool_input напрямую. Ключи: {list(data.keys())}")
+            tool_input["data"] = data
 
             date           = tool_input.get("contract_date") or datetime.now().strftime("%d.%m.%Y")
             commission_pct = float(tool_input.get("commission_pct", 1.0))
