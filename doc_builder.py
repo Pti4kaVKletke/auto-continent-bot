@@ -324,14 +324,14 @@ class DocumentBuilder:
 
         # Заголовок счёта
         if is_direct:
-            ws["B13"] = f"Счет на оплату № {number} от {date_str} г."
-            ws["G19"] = buyer
-            ws["D22"] = f"Оплата по Агентскому договору {number} от {date_str} г. на оплату автомобиля {car}"
-            ws["Z22"] = price_val
-            ws["D23"] = f"Комиссия по Агентскому договору {number} от {date_str} г."
-            ws["Z23"] = commission
-            ws["B28"] = f"Всего наименований 2, на сумму {total_fmt} {acc_cur}"
-            ws["B29"] = total_words
+            ws["B14"] = f"Счет на оплату № {number} от {date_str} г."
+            ws["G20"] = buyer
+            ws["D23"] = f"Оплата по Агентскому договору {number} от {date_str} г. на оплату автомобиля {car}"
+            ws["Z23"] = price_val
+            ws["D24"] = f"Комиссия по Агентскому договору {number} от {date_str} г."
+            ws["Z24"] = commission
+            ws["B29"] = f"Всего наименований 2, на сумму {total_fmt} {acc_cur}"
+            ws["B30"] = total_words
         else:
             ws["B16"] = f"Счет на оплату № {number} от {date_str} г."
             ws["G22"] = buyer
@@ -373,7 +373,9 @@ class DocumentBuilder:
                     box_size=4,
                     border=2,
                 )
-                qr.add_data(qr_str)
+                # ГОСТ Р 56042 требует кодировку Windows-1251
+                qr.add_data(qr_str.encode("cp1251"), optimize=0)
+                qr.mode = None
                 qr.make(fit=True)
                 img = qr.make_image(fill_color="black", back_color="white")
 
