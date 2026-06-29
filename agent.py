@@ -358,6 +358,28 @@ VIN: ...
 - VIN автомобиля
 - дате договора
 
+Когда пользователь просит ПОКАЗАТЬ или СООБЩИТЬ какие-то данные из существующей сделки:
+1. Вызови find_deal с номером сделки
+2. Возьми из найденных данных только те поля что попросили
+3. Выведи их в чат форматировано
+
+Примеры запросов и какие поля показывать:
+- "покажи реквизиты сделки 240626001" / "напиши банковские реквизиты" →
+  account_number, account_currency, bank_corr_line1, bank_corr_line2, bank_corr_line3, bank_ben_line1, bank_ben_line2, bank_kpp
+- "какая машина в сделке 240626001" / "данные авто" →
+  car_model, car_vin, car_year, car_color, tpo_number
+- "покажи данные покупателя" / "кто покупатель" →
+  buyer_name, buyer_birth_date, buyer_address, passport_series, passport_number, passport_issued_by, passport_issued_date
+- "покажи данные продавца" / "кто продавец" →
+  seller_name, seller_birth_date, seller_address, seller_id_number, seller_id_issued_by, seller_id_issued_date
+- "какая сумма" / "цена сделки" →
+  car_price, car_price_words, cash_amount, cash_amount_words, exchange_rate, "Комиссия %"
+- "статус сделки" → "Статус"
+- "когда была сделка" / "дата" → "Дата договора"
+
+Если поле пустое — пиши "не указано", не пропускай.
+НЕ вызывай update_deal на запросы вида "покажи/напиши/выведи" — это только просмотр.
+
 Когда пользователь говорит что в сделке ошибка и просит исправить:
 1. Сначала вызови find_deal чтобы найти сделку
 2. Покажи пользователю найденные данные
