@@ -373,22 +373,24 @@ class DocumentBuilder:
                 bic     = data.get("bank_corr_line2", "")
                 corr    = data.get("bank_corr_line3", "")
                 kpp     = data.get("bank_kpp", "")
+                bank_name = data.get("bank_ben_line1", "")
                 sum_kopecks = int(round(total * 100))
 
                 # ГОСТ Р 56042 — порядок обязательных полей:
                 # ST00012 → Name → PersonalAcc → BankName → BIC → CorrespAcc
                 # Затем опциональные: PayeeINN, KPP, Sum, Purpose
+                car_vin = data.get("car_vin", "")
                 qr_str = (
                     "ST00012|"
                     "Name=ОсОО Авто Континент|"
                     f"PersonalAcc={account}|"
-                    "BankName=Банк ВТБ ПАО|"
+                    f"BankName={bank_name}|"
                     f"BIC={bic}|"
                     f"CorrespAcc={corr}|"
                     "PayeeINN=9909768607|"
                     f"KPP={kpp}|"
                     f"Sum={sum_kopecks}|"
-                    f"Purpose=Оплата по договору {number} от {date}"
+                    f"Purpose=Оплата по счету №{number} от {date} по Агентскому договору №{number} от {date} за автомобиль VIN {car_vin}. Без НДС."
                 )
 
                 # Кодируем в cp1251 как требует ГОСТ
