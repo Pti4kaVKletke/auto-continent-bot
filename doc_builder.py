@@ -322,6 +322,16 @@ class DocumentBuilder:
                         if ph in c.value:
                             c.value = c.value.replace(ph, str(val))
 
+        # Для прямого счёта дополнительно пишем БИК и корр.счёт напрямую
+        # на случай если ячейки объединены и замена плейсхолдера не сработала
+        if is_direct:
+            bik  = data.get("bank_corr_line2", "")
+            corr = data.get("bank_corr_line3", "")
+            if bik and ws["S4"].value in ("", None, "{{BANK_DIRECT_BIK}}"):
+                ws["S4"] = bik
+            if corr and ws["S6"].value in ("", None, "{{BANK_DIRECT_CORR}}"):
+                ws["S6"] = corr
+
         # Заголовок счёта
         if is_direct:
             ws["B14"] = f"Счет на оплату № {number} от {date_str} г."
@@ -352,19 +362,18 @@ class DocumentBuilder:
                 account   = data.get("account_number", "")
                 bic       = data.get("bank_corr_line2", "")
                 corr      = data.get("bank_corr_line3", "")
-                bank_name = data.get("bank_ben_line1", "")
                 sum_kopecks = int(round(total * 100))
-                purpose   = f"Оплата по договору {number} от {date}"
 
+                # Только латиница для максимальной совместимости с банковскими приложениями
                 qr_str = (
                     f"ST00012|"
-                    f"Name=ОсОО Авто Континент|"
+                    f"Name=OsOO Avto Continent|"
                     f"PersonalAcc={account}|"
-                    f"BankName={bank_name}|"
+                    f"BankName=FILIAL TSENTRALNY BANKA VTB PAO|"
                     f"BIC={bic}|"
                     f"CorrespAcc={corr}|"
                     f"Sum={sum_kopecks}|"
-                    f"Purpose={purpose}"
+                    f"Purpose=Oplata po dogovoru {number} ot {date}"
                 )
 
                 qr = qrcode.QRCode(
@@ -373,9 +382,9 @@ class DocumentBuilder:
                     box_size=4,
                     border=2,
                 )
-                # ГОСТ Р 56042 требует кодировку Windows-1251
-                qr.add_data(qr_str.encode("cp1251"), optimize=0)
-                qr.mode = None
+                # ГОСТ Р 56042: передаём строку, qrcode сам закодирует
+                # Используем только ASCII-совместимые данные в полях где возможно
+                qr.add_data(qr_str)
                 qr.make(fit=True)
                 img = qr.make_image(fill_color="black", back_color="white")
 
