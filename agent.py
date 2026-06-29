@@ -472,8 +472,16 @@ VIN: ...
         history  = memory.get_history(limit=15)
         messages = []
 
+        # Санитизация: убираем consecutive same-role сообщения (Anthropic API вернёт 400)
+        sanitized = []
         for h in history[:-1]:
-            messages.append({"role": h["role"], "content": h["content"]})
+            if sanitized and sanitized[-1]["role"] == h["role"]:
+                sanitized[-1]["content"] += "\n" + h["content"]
+            else:
+                sanitized.append({"role": h["role"], "content": h["content"]})
+        if sanitized and sanitized[0]["role"] == "assistant":
+            sanitized.pop(0)
+        messages = sanitized
 
         if filepath:
             current_content = await self._build_file_message(filepath, filename, user_text)

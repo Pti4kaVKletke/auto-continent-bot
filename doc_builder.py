@@ -633,6 +633,12 @@ class DocumentBuilder:
             "ТПО", "ДКП", "АГ",
         }
 
+        # Слова со специальным (нестандартным) регистром
+        SPECIAL_CASE_WORDS = {
+            "ОСОО": "ОсОО",
+            "ОсОО": "ОсОО",
+        }
+
         # Предлоги/союзы (не первое слово) оставляем строчными
         lower_words = {"и", "в", "на", "по", "из", "за", "от", "до", "при", "для",
                        "или", "но", "а", "не", "то", "со", "об", "под", "над"}
@@ -644,7 +650,12 @@ class DocumentBuilder:
         result = []
         for i, word in enumerate(words):
             clean = word.strip('.,;:()«»"\'')
-            if clean.upper() in UPPER_WORDS:
+            if clean.upper() in SPECIAL_CASE_WORDS:
+                # Слова с нестандартным регистром (например ОсОО)
+                prefix = word[:len(word) - len(word.lstrip('.,;:()«»"\''))]
+                suffix = word[len(word.rstrip('.,;:()«»"\'')):]
+                result.append(prefix + SPECIAL_CASE_WORDS[clean.upper()] + suffix)
+            elif clean.upper() in UPPER_WORDS:
                 # Аббревиатура — всегда верхний регистр
                 # Сохраняем знаки препинания по краям
                 prefix = word[:len(word) - len(word.lstrip('.,;:()«»"\''))]

@@ -158,137 +158,154 @@ class GoogleSheetsService:
             result = chr(65 + rem) + result
         return result
 
+    async def _sheets_retry(self, fn, *args, retries=3, **kwargs):
+        """Выполняет синхронную функцию в потоке с retry при временных ошибках Sheets."""
+        import time
+        for attempt in range(retries):
+            try:
+                return await asyncio.to_thread(fn, *args, **kwargs)
+            except Exception as e:
+                err_str = str(e)
+                # Повторяем только при rate limit (429) или сетевых ошибках
+                if attempt < retries - 1 and any(x in err_str for x in ["429", "503", "quota", "Connection"]):
+                    wait = 2 ** attempt  # 1с, 2с
+                    logger.warning(f"Sheets ошибка (попытка {attempt+1}/{retries}), жду {wait}с: {e}")
+                    await asyncio.sleep(wait)
+                    self._service = None  # Сбрасываем кэш сервиса
+                else:
+                    raise
+        return None
+
     async def save_deal(self, contract_number: str, contract_date: str,
                         data: dict, commission_pct: float,
                         drive_folder_link: str = "") -> bool:
         """Добавляет строку сделки начиная с DATA_START_ROW."""
         def _do():
-            try:
-                svc = self._get_service()
-                sheet = svc.spreadsheets()
+            svc = self._get_service()
+            sheet = svc.spreadsheets()
 
-                row = []
-                for col in COLUMNS:
-                    if col == "Номер договора":
-                        row.append(contract_number)
-                    elif col == "Дата договора":
-                        row.append(contract_date)
-                    elif col == "Статус":
-                        row.append("активна")
-                    elif col == "Комиссия %":
-                        row.append(str(commission_pct))
-                    elif col == "Папка Drive":
-                        row.append(drive_folder_link)
-                    elif col == "Комментарий":
-                        row.append("")
-                    else:
-                        row.append(str(data.get(col, "")))
+            row = []
+            for col in COLUMNS:
+                if col == "Номер договора":
+                    row.append(contract_number)
+                elif col == "Дата договора":
+                    row.append(contract_date)
+                elif col == "Статус":
+                    row.append("активна")
+                elif col == "Комиссия %":
+                    row.append(str(commission_pct))
+                elif col == "Папка Drive":
+                    row.append(drive_folder_link)
+                elif col == "Комментарий":
+                    row.append("")
+                else:
+                    row.append(str(data.get(col, "")))
 
-                # Добавляем начиная с DATA_START_ROW — строки 1-2 заголовки
-                sheet.values().append(
-                    spreadsheetId=SPREADSHEET_ID,
-                    range=f"A{DATA_START_ROW}",
-                    valueInputOption="RAW",
-                    insertDataOption="INSERT_ROWS",
-                    body={"values": [row]},
-                ).execute()
-                logger.info(f"Сделка {contract_number} записана в Sheets")
-                return True
-            except Exception as e:
-                logger.error(f"Ошибка записи в Sheets: {e}", exc_info=True)
-                return False
+            sheet.values().append(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"A{DATA_START_ROW}",
+                valueInputOption="RAW",
+                insertDataOption="INSERT_ROWS",
+                body={"values": [row]},
+            ).execute()
+            logger.info(f"Сделка {contract_number} записана в Sheets")
+            return True
 
-        return await asyncio.to_thread(_do)
+        try:
+            return await self._sheets_retry(_do)
+        except Exception as e:
+            logger.error(f"Ошибка записи в Sheets: {e}", exc_info=True)
+            return False
 
     async def find_deal(self, query: str) -> list[dict]:
         """Ищет сделки по номеру, ФИО, VIN или дате."""
         def _do():
-            try:
-                svc = self._get_service()
-                sheet = svc.spreadsheets()
-                result = sheet.values().get(
-                    spreadsheetId=SPREADSHEET_ID,
-                    range=f"A{DATA_START_ROW}:AZ",
-                ).execute()
-                rows = result.get("values", [])
-                if not rows:
-                    return []
-
-                q = query.strip().lower()
-                found = []
-
-                for i, row in enumerate(rows, start=DATA_START_ROW):
-                    padded = row + [""] * (len(COLUMNS) - len(row))
-                    row_dict = dict(zip(COLUMNS, padded))
-                    row_dict["__row_index__"] = i
-
-                    searchable = " ".join([
-                        row_dict.get("Номер договора", ""),
-                        row_dict.get("buyer_name", ""),
-                        row_dict.get("seller_name", ""),
-                        row_dict.get("car_vin", ""),
-                        row_dict.get("Дата договора", ""),
-                        row_dict.get("car_model", ""),
-                        row_dict.get("Статус", ""),
-                    ]).lower()
-
-                    if not q or q in searchable:
-                        found.append(row_dict)
-
-                return found
-            except Exception as e:
-                logger.error(f"Ошибка поиска в Sheets: {e}", exc_info=True)
+            svc = self._get_service()
+            sheet = svc.spreadsheets()
+            result = sheet.values().get(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"A{DATA_START_ROW}:AZ",
+            ).execute()
+            rows = result.get("values", [])
+            if not rows:
                 return []
 
-        return await asyncio.to_thread(_do)
+            q = query.strip().lower()
+            found = []
+
+            for i, row in enumerate(rows, start=DATA_START_ROW):
+                padded = row + [""] * (len(COLUMNS) - len(row))
+                row_dict = dict(zip(COLUMNS, padded))
+                row_dict["__row_index__"] = i
+
+                searchable = " ".join([
+                    row_dict.get("Номер договора", ""),
+                    row_dict.get("buyer_name", ""),
+                    row_dict.get("seller_name", ""),
+                    row_dict.get("car_vin", ""),
+                    row_dict.get("Дата договора", ""),
+                    row_dict.get("car_model", ""),
+                    row_dict.get("Статус", ""),
+                ]).lower()
+
+                if not q or q in searchable:
+                    found.append(row_dict)
+
+            return found
+
+        try:
+            return await self._sheets_retry(_do) or []
+        except Exception as e:
+            logger.error(f"Ошибка поиска в Sheets: {e}", exc_info=True)
+            return []
 
     async def update_deal(self, contract_number: str, updates: dict) -> bool:
         """Обновляет поля существующей сделки по номеру договора."""
         def _do():
-            try:
-                svc = self._get_service()
-                sheet = svc.spreadsheets()
-                result = sheet.values().get(
-                    spreadsheetId=SPREADSHEET_ID,
-                    range=f"A{DATA_START_ROW}:AZ",
-                ).execute()
-                rows = result.get("values", [])
-                if not rows:
-                    return False
-
-                target_row = None
-                for i, row in enumerate(rows, start=DATA_START_ROW):
-                    padded = row + [""] * (len(COLUMNS) - len(row))
-                    if padded[0] == contract_number:
-                        target_row = i
-                        current_row = padded
-                        break
-
-                if target_row is None:
-                    logger.warning(f"Сделка {contract_number} не найдена в Sheets")
-                    return False
-
-                for col_name, new_val in updates.items():
-                    if col_name in COLUMNS:
-                        idx = COLUMNS.index(col_name)
-                        while len(current_row) <= idx:
-                            current_row.append("")
-                        current_row[idx] = str(new_val)
-
-                last_col = self._col_letter(len(COLUMNS) - 1)
-                sheet.values().update(
-                    spreadsheetId=SPREADSHEET_ID,
-                    range=f"A{target_row}:{last_col}{target_row}",
-                    valueInputOption="RAW",
-                    body={"values": [current_row]},
-                ).execute()
-                logger.info(f"Сделка {contract_number} обновлена в Sheets")
-                return True
-            except Exception as e:
-                logger.error(f"Ошибка обновления Sheets: {e}", exc_info=True)
+            svc = self._get_service()
+            sheet = svc.spreadsheets()
+            result = sheet.values().get(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"A{DATA_START_ROW}:AZ",
+            ).execute()
+            rows = result.get("values", [])
+            if not rows:
                 return False
 
-        return await asyncio.to_thread(_do)
+            target_row = None
+            for i, row in enumerate(rows, start=DATA_START_ROW):
+                padded = row + [""] * (len(COLUMNS) - len(row))
+                if padded[0] == contract_number:
+                    target_row = i
+                    current_row = padded
+                    break
+
+            if target_row is None:
+                logger.warning(f"Сделка {contract_number} не найдена в Sheets")
+                return False
+
+            for col_name, new_val in updates.items():
+                if col_name in COLUMNS:
+                    idx = COLUMNS.index(col_name)
+                    while len(current_row) <= idx:
+                        current_row.append("")
+                    current_row[idx] = str(new_val)
+
+            last_col = self._col_letter(len(COLUMNS) - 1)
+            sheet.values().update(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"A{target_row}:{last_col}{target_row}",
+                valueInputOption="RAW",
+                body={"values": [current_row]},
+            ).execute()
+            logger.info(f"Сделка {contract_number} обновлена в Sheets")
+            return True
+
+        try:
+            return await self._sheets_retry(_do)
+        except Exception as e:
+            logger.error(f"Ошибка обновления Sheets: {e}", exc_info=True)
+            return False
 
     async def cancel_deal(self, contract_number: str, reason: str = "") -> bool:
         """Помечает сделку как отменённую."""
