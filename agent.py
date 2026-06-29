@@ -358,27 +358,16 @@ VIN: ...
 - VIN автомобиля
 - дате договора
 
-Когда пользователь просит ПОКАЗАТЬ или СООБЩИТЬ какие-то данные из существующей сделки:
-1. Вызови find_deal с номером сделки
-2. Возьми из найденных данных только те поля что попросили
-3. Выведи их в чат форматировано
-
-Примеры запросов и какие поля показывать:
-- "покажи реквизиты сделки 240626001" / "напиши банковские реквизиты" →
-  account_number, account_currency, bank_corr_line1, bank_corr_line2, bank_corr_line3, bank_ben_line1, bank_ben_line2, bank_kpp
-- "какая машина в сделке 240626001" / "данные авто" →
-  car_model, car_vin, car_year, car_color, tpo_number
-- "покажи данные покупателя" / "кто покупатель" →
-  buyer_name, buyer_birth_date, buyer_address, passport_series, passport_number, passport_issued_by, passport_issued_date
-- "покажи данные продавца" / "кто продавец" →
-  seller_name, seller_birth_date, seller_address, seller_id_number, seller_id_issued_by, seller_id_issued_date
-- "какая сумма" / "цена сделки" →
-  car_price, car_price_words, cash_amount, cash_amount_words, exchange_rate, "Комиссия %"
-- "статус сделки" → "Статус"
-- "когда была сделка" / "дата" → "Дата договора"
-
-Если поле пустое — пиши "не указано", не пропускай.
-НЕ вызывай update_deal на запросы вида "покажи/напиши/выведи" — это только просмотр.
+Когда пользователь просит ПОКАЗАТЬ или СООБЩИТЬ данные из существующей сделки:
+1. Вызови find_deal с номером сделки И параметром section — выбери нужный раздел:
+   - "покажи данные покупателя" / "кто покупатель" / "паспорт" → section="buyer"
+   - "покажи данные продавца" / "кто продавец" / "ID карта" → section="seller"
+   - "какая машина" / "данные авто" / "VIN" / "ТПО" → section="car"
+   - "какая сумма" / "цена" / "финансы" / "курс" → section="finances"
+   - "реквизиты" / "банк" / "счёт" / "куда перевести" → section="bank"
+   - "все данные" / "полная информация" / общий запрос без уточнения → section="all"
+2. Инструмент сам отфильтрует и вернёт только нужный раздел
+3. НЕ вызывай update_deal на запросы вида "покажи/напиши/выведи" — это только просмотр
 
 Когда пользователь говорит что в сделке ошибка и просит исправить:
 1. Сначала вызови find_deal чтобы найти сделку
@@ -573,13 +562,21 @@ VIN: ...
             },
             {
                 "name": "find_deal",
-                "description": "Найти сделку в журнале Google Sheets по номеру договора, ФИО покупателя или продавца, VIN или дате.",
+                "description": (
+                    "Найти сделку в журнале Google Sheets по номеру договора, ФИО покупателя или продавца, VIN или дате. "
+                    "Параметр section указывает какой раздел показать пользователю: "
+                    "buyer=покупатель, seller=продавец, car=авто, finances=финансы, bank=реквизиты, all=всё."
+                ),
                 "input_schema": {
                     "type": "object",
                     "properties": {
                         "query": {
                             "type": "string",
                             "description": "Поисковый запрос: номер договора, ФИО, VIN или дата",
+                        },
+                        "section": {
+                            "type": "string",
+                            "description": "Какой раздел показать: buyer / seller / car / finances / bank / all (по умолчанию all)",
                         },
                     },
                     "required": ["query"],
@@ -1191,7 +1188,8 @@ VIN: ...
             return {"message": text, "buttons": buttons}
 
         elif tool_name == "find_deal":
-            query = tool_input.get("query", "")
+            query   = tool_input.get("query", "")
+            section = tool_input.get("section", "all")
             results = await self.sheets.find_deal(query)
             if not results:
                 return {"message": f"❌ Сделки по запросу «{query}» не найдены в журнале."}
@@ -1200,11 +1198,8 @@ VIN: ...
                 v = r.get(key, "")
                 return v if v and v != "None" else "не указано"
 
-            # Одна сделка — показываем ВСЕ поля, чтобы пользователь получил нужное
-            if len(results) == 1:
-                r = results[0]
-                lines = [
-                    f"📄 Сделка {_val(r, 'Номер договора')} от {_val(r, 'Дата договора')} [{_val(r, 'Статус')}]\n",
+            def _section_buyer(r):
+                return [
                     "👤 ПОКУПАТЕЛЬ:",
                     f"  ФИО: {_val(r, 'buyer_name')}",
                     f"  Инициалы: {_val(r, 'buyer_initials')}",
@@ -1214,7 +1209,10 @@ VIN: ...
                     f"  Выдан: {_val(r, 'passport_issued_by')}",
                     f"  Дата выдачи: {_val(r, 'passport_issued_date')}",
                     f"  Код подразделения: {_val(r, 'passport_code')}",
-                    "",
+                ]
+
+            def _section_seller(r):
+                return [
                     "👤 ПРОДАВЕЦ:",
                     f"  ФИО: {_val(r, 'seller_name')}",
                     f"  Инициалы: {_val(r, 'seller_initials')}",
@@ -1223,14 +1221,20 @@ VIN: ...
                     f"  ID карта №: {_val(r, 'seller_id_number')}",
                     f"  Кем выдана: {_val(r, 'seller_id_issued_by')}",
                     f"  Дата выдачи: {_val(r, 'seller_id_issued_date')}",
-                    "",
+                ]
+
+            def _section_car(r):
+                return [
                     "🚗 АВТОМОБИЛЬ:",
                     f"  Марка/модель: {_val(r, 'car_model')}",
                     f"  VIN: {_val(r, 'car_vin')}",
                     f"  Год: {_val(r, 'car_year')}",
                     f"  Цвет: {_val(r, 'car_color')}",
                     f"  ТПО №: {_val(r, 'tpo_number')} от {_val(r, 'tpo_day')} {_val(r, 'tpo_month')} {_val(r, 'tpo_year')}",
-                    "",
+                ]
+
+            def _section_finances(r):
+                return [
                     "💰 ФИНАНСЫ:",
                     f"  Цена ДКП: {_val(r, 'car_price')} {_val(r, 'currency')}",
                     f"  Прописью: {_val(r, 'car_price_words')}",
@@ -1238,7 +1242,10 @@ VIN: ...
                     f"  Прописью: {_val(r, 'cash_amount_words')}",
                     f"  Курс USD/RUB: {_val(r, 'exchange_rate')}",
                     f"  Комиссия: {_val(r, 'Комиссия %')}%",
-                    "",
+                ]
+
+            def _section_bank(r):
+                return [
                     "🏦 РЕКВИЗИТЫ:",
                     f"  Валюта счёта: {_val(r, 'account_currency')}",
                     f"  Номер счёта: {_val(r, 'account_number')}",
@@ -1248,10 +1255,34 @@ VIN: ...
                     f"  Корр.счёт: {_val(r, 'bank_corr_line3')}",
                     f"  Банк получателя: {_val(r, 'bank_ben_line1')}",
                     f"  БИК/корр.счёт получателя: {_val(r, 'bank_ben_line2')}",
-                    "",
-                    f"📁 Drive: {_val(r, 'Папка Drive')}",
-                    f"💬 Комментарий: {_val(r, 'Комментарий')}",
                 ]
+
+            # Одна сделка — показываем нужный раздел
+            if len(results) == 1:
+                r = results[0]
+                header = [f"📄 Сделка {_val(r, 'Номер договора')} от {_val(r, 'Дата договора')} [{_val(r, 'Статус')}]\n"]
+
+                section_map = {
+                    "buyer":    _section_buyer,
+                    "seller":   _section_seller,
+                    "car":      _section_car,
+                    "finances": _section_finances,
+                    "bank":     _section_bank,
+                }
+
+                if section in section_map:
+                    lines = header + section_map[section](r)
+                else:  # all
+                    lines = (
+                        header
+                        + _section_buyer(r) + [""]
+                        + _section_seller(r) + [""]
+                        + _section_car(r) + [""]
+                        + _section_finances(r) + [""]
+                        + _section_bank(r) + [""]
+                        + [f"📁 Drive: {_val(r, 'Папка Drive')}",
+                           f"💬 Комментарий: {_val(r, 'Комментарий')}"]
+                    )
                 return {"message": "\n".join(lines)}
 
             # Несколько сделок — краткий список
