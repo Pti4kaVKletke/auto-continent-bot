@@ -151,8 +151,18 @@ async def del_instruction(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_chat.id)
     memory.clear_history()
-    await update.message.reply_text("✅ История диалога очищена")
+    memory.clear_pending_scans(chat_id)
+    context.user_data.clear()
+    await update.message.reply_text(
+        "✅ История диалога очищена\n"
+        "✅ Сохранённые сканы удалены\n"
+        "✅ Текущий контекст сброшен",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("◀️ Меню", callback_data="menu:back")
+        ]])
+    )
 
 
 # ─── ОТПРАВКА РЕЗУЛЬТАТА ─────────────────────────────────────────────────────
@@ -251,16 +261,19 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Сценарий Г: файл без контекста — спрашиваем что делать ──
     caption = message.caption or ""
 
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📄 Читать и начать новую сделку",      callback_data="scan_route:new")],
-        [InlineKeyboardButton("➕ Читать и добавить к текущей сделке", callback_data="scan_route:add")],
-        [InlineKeyboardButton("📂 Сохранить скан в существующую сделку", callback_data="scan_route:existing")],
-        [InlineKeyboardButton("◀️ Меню", callback_data="menu:back")],
-    ])
+    has_history = len(memory.get_history(limit=3)) > 0
+    buttons = [
+        [InlineKeyboardButton("📄 Читать и начать новую сделку", callback_data="scan_route:new")],
+    ]
+    if has_history:
+        buttons.append([InlineKeyboardButton("➕ Читать и добавить к текущей сделке", callback_data="scan_route:add")])
+    buttons.append([InlineKeyboardButton("📂 Сохранить скан в существующую сделку", callback_data="scan_route:existing")])
+    buttons.append([InlineKeyboardButton("◀️ Меню", callback_data="menu:back")])
+
     context.user_data["last_scan_filepath"] = filepath
     context.user_data["last_scan_filename"]  = filename
     context.user_data["last_scan_caption"]   = caption
-    await message.reply_text("📎 Получила файл. Что с ним делать?", reply_markup=keyboard)
+    await message.reply_text("📎 Получила файл. Что с ним делать?", reply_markup=InlineKeyboardMarkup(buttons))
 
 
 
