@@ -695,6 +695,40 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ]])
             )
 
+    # ── Смена реквизитов в существующей сделке ───────────────────────────────
+    elif data.startswith("editbank:"):
+        parts = data.split(":", 2)
+        if len(parts) == 3:
+            contract_number = parts[1]
+            profile_name    = parts[2]
+
+            if profile_name == "__new__":
+                await query.edit_message_reply_markup(reply_markup=None)
+                context.user_data["awaiting_edit_deal"] = contract_number
+                await query.message.reply_text(
+                    "Введи новые реквизиты текстом — я обновлю их в сделке."
+                )
+                return
+
+            # Берём реквизиты из профиля и обновляем сделку
+            profile = memory.get_bank_profile(profile_name)
+            if not profile:
+                await query.answer("Профиль не найден", show_alert=True)
+                return
+
+            await query.edit_message_reply_markup(reply_markup=None)
+            ok = await agent.sheets.update_deal(contract_number, profile)
+            if ok:
+                await query.message.reply_text(
+                    f"✅ Реквизиты сделки *{contract_number}* обновлены на *{profile_name}*",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("◀️ К сделке", callback_data=f"dealaction:{contract_number}:menu")
+                    ]])
+                )
+            else:
+                await query.message.reply_text(f"❌ Не удалось обновить сделку {contract_number}")
+
     # ── Маршрутизация скана (существующая / новая сделка) ────────────────────
     elif data.startswith("scan_route:"):
         route    = data.split(":", 1)[1]
@@ -759,7 +793,28 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
 
     if context.user_data.get("awaiting_edit_deal"):
-        contract_number = context.user_data.pop("awaiting_edit_deal")
+        contract_number = context.user_data.get("awaiting_edit_deal")
+
+        # Если пользователь хочет сменить реквизиты — показываем кнопки профилей
+        if any(word in user_text.lower() for word in ["реквизит", "банк", "счёт", "счет"]):
+            context.user_data.pop("awaiting_edit_deal")
+            context.user_data["edit_deal_bank_number"] = contract_number
+            profiles = memory.list_bank_profiles()
+            buttons = [{"text": name, "callback_data": f"editbank:{contract_number}:{name}"} for name in profiles]
+            buttons.append({"text": "🆕 Новые реквизиты", "callback_data": f"editbank:{contract_number}:__new__"})
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton(b["text"], callback_data=b["callback_data"])]
+                for b in buttons
+            ])
+            await update.message.reply_text(
+                f"Какие реквизиты использовать для сделки *{contract_number}*?",
+                parse_mode="Markdown",
+                reply_markup=keyboard
+            )
+            return
+
+        # Иначе передаём агенту как обычно
+        context.user_data.pop("awaiting_edit_deal")
         result = await typing_while(
             update.effective_chat.id, context,
             agent.process_message(
