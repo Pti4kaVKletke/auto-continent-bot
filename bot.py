@@ -510,6 +510,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             keyboard = [
                 [InlineKeyboardButton("📋 Создать документы", callback_data=f"dealaction:{num}:docs")],
+                [InlineKeyboardButton("✏️ Изменить данные",   callback_data=f"dealaction:{num}:edit")],
                 [InlineKeyboardButton("📎 Загрузить скан",    callback_data=f"dealaction:{num}:scan"),
                  InlineKeyboardButton("🗂 Сканы",             callback_data=f"dealaction:{num}:scans")],
                 [InlineKeyboardButton("✅ Завершить сделку",  callback_data=f"dealaction:{num}:complete")],
@@ -627,6 +628,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ]])
             )
 
+        elif action == "edit":
+            await query.edit_message_text(
+                f"✏️ *Изменить данные сделки {num}*\n\n"
+                "Напиши что именно нужно изменить. Например:\n"
+                "• `реквизиты на ВТБ`\n"
+                "• `имя покупателя Иванов Иван Иванович`\n"
+                "• `цену на 4500000`\n"
+                "• `статус на завершена`",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("◀️ Отмена", callback_data=f"dealaction:{num}:menu")
+                ]])
+            )
+            context.user_data["awaiting_edit_deal"] = num
+
         elif action == "docs":
             await query.edit_message_text(f"⏳ Загружаю данные сделки {num}...")
             result = await typing_while(
@@ -741,6 +757,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user_text = update.message.text
     chat_id = str(update.effective_chat.id)
+
+    if context.user_data.get("awaiting_edit_deal"):
+        contract_number = context.user_data.pop("awaiting_edit_deal")
+        result = await typing_while(
+            update.effective_chat.id, context,
+            agent.process_message(
+                f"Обнови данные сделки {contract_number}: {user_text}",
+                chat_id=chat_id
+            )
+        )
+        await send_result(update.message, result, context=context, chat_id=chat_id)
+        return
 
     if context.user_data.get("awaiting_scan_for_existing"):
         context.user_data.pop("awaiting_scan_for_existing")
