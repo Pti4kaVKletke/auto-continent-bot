@@ -159,10 +159,6 @@ async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def send_result(message, result: dict, context=None, chat_id=None):
     """Отправляет файлы и текст результата."""
-    # Если договор создан — сбрасываем флаг активной сделки
-    if result.get("files") and context and chat_id:
-        context.user_data.pop("deal_in_progress", None)
-
     if result.get("files"):
         for f_info in result["files"]:
             try:
@@ -252,29 +248,13 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await message.reply_text(f"⚠️ Папка сделки {contract_number} не найдена на Drive.")
         return
 
-    # ── Сценарий Б: идёт создание новой сделки — молча в pending_scans ──
-    if context.user_data.get("deal_in_progress"):
-        await message.reply_text("📎 Скан сохранён — добавлю в папку сделки при создании договора.")
-        return
-
-    # ── Сценарий В: ждём номер сделки для привязки скана ──
-    if context.user_data.get("awaiting_scan_deal_number"):
-        context.user_data.pop("awaiting_scan_deal_number")
-        context.user_data["awaiting_scan_filepath"] = filepath
-        context.user_data["awaiting_scan_filename"]  = filename
-        await message.reply_text(
-            "📎 Файл получен. Теперь укажи номер сделки (например: `280626001`):",
-            parse_mode="Markdown",
-        )
-        return
-
     # ── Сценарий Г: файл без контекста — спрашиваем что делать ──
     caption = message.caption or ""
 
-    # Если пришёл с подписью типа "скан 280626001" — сразу спрашиваем номер
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📂 В существующую сделку", callback_data="scan_route:existing")],
-        [InlineKeyboardButton("📄 Читать и начать новую сделку", callback_data="scan_route:new")],
+        [InlineKeyboardButton("📄 Читать и начать новую сделку",      callback_data="scan_route:new")],
+        [InlineKeyboardButton("➕ Читать и добавить к текущей сделке", callback_data="scan_route:add")],
+        [InlineKeyboardButton("📂 Сохранить скан в существующую сделку", callback_data="scan_route:existing")],
         [InlineKeyboardButton("◀️ Меню", callback_data="menu:back")],
     ])
     context.user_data["last_scan_filepath"] = filepath
@@ -688,13 +668,35 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Маршрутизация скана (существующая / новая сделка) ────────────────────
     elif data.startswith("scan_route:"):
-        route = data.split(":", 1)[1]
+        route    = data.split(":", 1)[1]
         filepath = context.user_data.pop("last_scan_filepath", None)
-        filename  = context.user_data.pop("last_scan_filename", "file")
-        caption   = context.user_data.pop("last_scan_caption", "")
+        filename = context.user_data.pop("last_scan_filename", "file")
+        caption  = context.user_data.pop("last_scan_caption", "")
 
-        if route == "existing":
-            # Запоминаем файл и ждём номер сделки текстом
+        if route == "new":
+            # Новая сделка — читаем документ с нуля
+            await query.edit_message_text("📥 Читаю документ...")
+            result = await typing_while(
+                update.effective_chat.id, context,
+                agent.process_file(filepath, filename, caption, chat_id=str(update.effective_chat.id))
+            )
+            await send_result(query.message, result)
+
+        elif route == "add":
+            # Добавляем данные к текущей сделке — читаем документ в контексте истории
+            await query.edit_message_text("📥 Читаю документ и добавляю данные...")
+            result = await typing_while(
+                update.effective_chat.id, context,
+                agent.process_file(
+                    filepath, filename,
+                    caption or "Извлеки данные из документа и дополни уже собранные данные для сделки.",
+                    chat_id=str(update.effective_chat.id)
+                )
+            )
+            await send_result(query.message, result)
+
+        elif route == "existing":
+            # Сохраняем скан в папку существующей сделки
             context.user_data["awaiting_scan_for_existing"] = True
             context.user_data["pending_existing_filepath"]  = filepath
             context.user_data["pending_existing_filename"]  = filename
@@ -702,16 +704,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Укажи номер сделки (например: `280626001`):",
                 parse_mode="Markdown",
             )
-
-        elif route == "new":
-            # Передаём файл агенту как обычно для новой сделки
-            context.user_data["deal_in_progress"] = True
-            await query.edit_message_text("📥 Читаю документ...")
-            result = await typing_while(
-                update.effective_chat.id, context,
-                agent.process_file(filepath, filename, caption, chat_id=str(update.effective_chat.id))
-            )
-            await send_result(query.message, result)
 
     # ── Выбор банковского профиля ─────────────────────────────────────────────
     elif data.startswith("bankprofile:"):
