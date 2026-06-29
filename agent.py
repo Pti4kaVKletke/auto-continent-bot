@@ -1122,9 +1122,19 @@ VIN: ...
                 ]
                 return {"message": "\n".join(lines)}
 
-            # Всё заполнено — собираем data для create_contract
-            data_keys = [r[0] for r in REQUIRED]
-            data = {k: deal.get(k, "") for k in data_keys}
+            # Всё заполнено — собираем data из ВСЕХ нужных полей (а не только из REQUIRED)
+            ALL_DATA_KEYS = [
+                "buyer_name","buyer_initials","buyer_birth_date","buyer_address",
+                "passport_series","passport_number","passport_issued_by","passport_issued_date","passport_code",
+                "seller_name","seller_initials","seller_birth_date","seller_address",
+                "seller_id_number","seller_id_issued_by","seller_id_issued_date",
+                "car_model","car_vin","car_year","car_color","tpo_number","tpo_day","tpo_month","tpo_year",
+                "car_price","car_price_words","currency","cash_amount","cash_amount_words",
+                "cash_currency","exchange_rate","account_currency","account_number",
+                "bank_corr_line1","bank_corr_line2","bank_corr_line3",
+                "bank_ben_line1","bank_ben_line2","bank_kpp",
+            ]
+            data = {k: deal.get(k, "") for k in ALL_DATA_KEYS}
 
             text = "\n".join([
                 f"✅ Сделка {contract_number} от {contract_date} — все поля заполнены.\n",

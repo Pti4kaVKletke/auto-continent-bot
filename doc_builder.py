@@ -365,7 +365,6 @@ class DocumentBuilder:
         if is_direct and qr_cell_coord:
             try:
                 import qrcode
-                import qrcode.image.pil
                 from qrcode.constants import ERROR_CORRECT_M
                 from openpyxl.drawing.image import Image as XLImage
                 import io
@@ -373,20 +372,26 @@ class DocumentBuilder:
                 account = data.get("account_number", "")
                 bic     = data.get("bank_corr_line2", "")
                 corr    = data.get("bank_corr_line3", "")
+                kpp     = data.get("bank_kpp", "")
                 sum_kopecks = int(round(total * 100))
 
-                # ГОСТ Р 56042 — кириллица в cp1251, байтовый режим
+                # ГОСТ Р 56042 — порядок обязательных полей:
+                # ST00012 → Name → PersonalAcc → BankName → BIC → CorrespAcc
+                # Затем опциональные: PayeeINN, KPP, Sum, Purpose
                 qr_str = (
-                    f"ST00012|"
-                    f"Name=ОсОО Авто Континент|"
+                    "ST00012|"
+                    "Name=ОсОО Авто Континент|"
                     f"PersonalAcc={account}|"
-                    f"BankName=ФИЛИАЛ ЦЕНТРАЛЬНЫЙ БАНКА ВТБ ПАО|"
+                    "BankName=Банк ВТБ ПАО|"
                     f"BIC={bic}|"
                     f"CorrespAcc={corr}|"
+                    "PayeeINN=9909768607|"
+                    f"KPP={kpp}|"
                     f"Sum={sum_kopecks}|"
                     f"Purpose=Оплата по договору {number} от {date}"
                 )
 
+                # Кодируем в cp1251 как требует ГОСТ
                 qr_bytes = qr_str.encode("cp1251")
 
                 qr = qrcode.QRCode(
@@ -395,7 +400,6 @@ class DocumentBuilder:
                     box_size=4,
                     border=2,
                 )
-                # Передаём байты cp1251 напрямую — это байтовый режим QR
                 qr.add_data(qr_bytes, optimize=0)
                 qr.make(fit=True)
                 img = qr.make_image(fill_color="black", back_color="white")
@@ -408,7 +412,8 @@ class DocumentBuilder:
                 xl_img.width  = 90
                 xl_img.height = 90
                 ws.add_image(xl_img, qr_cell_coord)
-                logger.info(f"QR код (cp1251, {len(qr_bytes)} байт) вставлен в {qr_cell_coord} для счёта {number}")
+                logger.info(f"QR код вставлен в {qr_cell_coord} ({len(qr_bytes)} байт)")
+                logger.info(f"QR содержимое: {qr_str}")
             except ImportError:
                 logger.warning("Библиотека qrcode не установлена — QR пропущен")
             except Exception as e:
