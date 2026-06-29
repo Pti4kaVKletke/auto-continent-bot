@@ -839,6 +839,7 @@ VIN: ...
 
             # ── 2. Загружаем на Drive ПОСЛЕДОВАТЕЛЬНО ─────────────────────
             logger.info("Загружаю на Drive...")
+            dkp_link = inv_link = ""
             for fpath, fname in (
                 (ag_path,      ag_docx),
                 (dkp_path,     dkp_docx),
@@ -852,7 +853,7 @@ VIN: ...
             # ── 3. PDF ─────────────────────────────────────────────────────
             skip_pdf = os.environ.get("SKIP_PDF", "0") == "1"
             ag_pdf_path = dkp_pdf_path = inv_pdf_path = None
-            ag_link = ""
+            ag_link = dkp_pdf_link = inv_pdf_link = ""
 
             if not skip_pdf:
                 logger.info("Конвертирую в PDF...")
@@ -863,9 +864,9 @@ VIN: ...
                 if ag_pdf_path:
                     ag_link = await self.drive.upload_file(ag_pdf_path, ag_pdf, deal_folder_id)
                 if dkp_pdf_path:
-                    await self.drive.upload_file(dkp_pdf_path, dkp_pdf, deal_folder_id)
+                    dkp_pdf_link = await self.drive.upload_file(dkp_pdf_path, dkp_pdf, deal_folder_id)
                 if inv_pdf_path:
-                    await self.drive.upload_file(inv_pdf_path, inv_pdf, deal_folder_id)
+                    inv_pdf_link = await self.drive.upload_file(inv_pdf_path, inv_pdf, deal_folder_id)
             else:
                 logger.info("PDF пропущен (SKIP_PDF=1)")
 
@@ -875,14 +876,12 @@ VIN: ...
             # ── 5. Записываем/обновляем в журнале Sheets ─────────────────
             try:
                 if is_regen:
-                    # Перегенерация — обновляем существующую строку
                     updates = dict(tool_input["data"])
                     updates["Комиссия %"] = str(commission_pct)
                     updates["Дата договора"] = date
                     updates["Папка Drive"] = drive_folder_link
                     await self.sheets.update_deal(number, updates)
                 else:
-                    # Новая сделка — добавляем строку
                     await self.sheets.save_deal(
                         contract_number=number,
                         contract_date=date,
@@ -893,22 +892,23 @@ VIN: ...
             except Exception as e:
                 logger.error(f"Ошибка записи в Sheets (сделка {number}): {e}", exc_info=True)
 
-            # ── 6. Собираем файлы для Telegram ────────────────────────────
+            # ── 6. Собираем файлы для Telegram со ссылками Drive ──────────
             extra_files = []
             extra_names = []
+            extra_links = []
 
             if ag_pdf_path and Path(ag_pdf_path).exists():
-                extra_files.append(ag_pdf_path);   extra_names.append(ag_pdf)
+                extra_files.append(ag_pdf_path);  extra_names.append(ag_pdf);  extra_links.append(ag_link)
 
             if Path(dkp_path).exists():
-                extra_files.append(dkp_path);      extra_names.append(dkp_docx)
+                extra_files.append(dkp_path);     extra_names.append(dkp_docx); extra_links.append("")
             if dkp_pdf_path and Path(dkp_pdf_path).exists():
-                extra_files.append(dkp_pdf_path);  extra_names.append(dkp_pdf)
+                extra_files.append(dkp_pdf_path); extra_names.append(dkp_pdf);  extra_links.append(dkp_pdf_link)
 
             if Path(invoice_path).exists():
-                extra_files.append(invoice_path);  extra_names.append(inv_xlsx)
+                extra_files.append(invoice_path); extra_names.append(inv_xlsx); extra_links.append("")
             if inv_pdf_path and Path(inv_pdf_path).exists():
-                extra_files.append(inv_pdf_path);  extra_names.append(inv_pdf)
+                extra_files.append(inv_pdf_path); extra_names.append(inv_pdf);  extra_links.append(inv_pdf_link)
 
             total_files = 1 + len(extra_files)
             pdf_note = " (PDF отключён)" if skip_pdf else ("" if ag_pdf_path else " (LibreOffice недоступен)")
@@ -916,9 +916,10 @@ VIN: ...
             return {
                 "file":        ag_path,
                 "filename":    ag_docx,
+                "drive_link":  ag_link,
                 "extra_files": extra_files,
                 "extra_names": extra_names,
-                "drive_link":  ag_link,
+                "extra_links": extra_links,
                 "message":     f"Сделка {number}: {total_files} файлов отправлено{pdf_note}",
             }
 
