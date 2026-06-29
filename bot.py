@@ -492,6 +492,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             price  = deal.get("car_price", "—")
             date   = deal.get("Дата договора", "—")
             folder = deal.get("Папка Drive", "")
+            account_number = deal.get("account_number", "")
+            bank_ben       = deal.get("bank_ben_line1", "")
+
+            # Определяем название профиля реквизитов по номеру счёта
+            profile_name = "—"
+            for pname in memory.list_bank_profiles():
+                p = memory.get_bank_profile(pname)
+                if p and p.get("account_number") == account_number and account_number:
+                    profile_name = pname
+                    break
 
             # Для старых сделок без ссылки — строим её по номеру договора
             if not folder:
@@ -501,13 +511,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     pass
 
+            # Краткое название банка для отображения
+            bank_short = bank_ben[:40] + "..." if len(bank_ben) > 43 else bank_ben
             text = (
                 f"📄 *Сделка {num}* от {date}\n\n"
                 f"👤 {buyer}\n"
                 f"👤 {seller}\n"
                 f"🚗 {car} · VIN `{vin}`\n"
-                f"💰 {price} руб."
+                f"💰 {price} руб.\n"
+                f"🏦 {profile_name}"
             )
+            if bank_short:
+                text += f"\n   _{bank_short}_"
+            if account_number:
+                text += f"\n   Счёт: `{account_number}`"
             keyboard = [
                 [InlineKeyboardButton("📋 Создать документы", callback_data=f"dealaction:{num}:docs")],
                 [InlineKeyboardButton("✏️ Изменить данные",   callback_data=f"dealaction:{num}:edit")],
