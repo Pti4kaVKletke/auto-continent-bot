@@ -432,6 +432,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
         elif action == "back":
+            context.user_data.pop("current_deal", None)
             await query.edit_message_text(
                 get_menu_text(),
                 parse_mode="MarkdownV2",
@@ -481,6 +482,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         action = parts[2]
 
         if action == "menu":
+            context.user_data["current_deal"] = num
             deal = await agent.sheets.get_deal(num)
             if not deal:
                 await query.edit_message_text(f"❌ Сделка {num} не найдена.")
@@ -917,9 +919,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
+    # Если есть открытая сделка и пользователь задал короткий вопрос — добавляем контекст
+    current_deal = context.user_data.get("current_deal")
+    message_to_agent = user_text
+    if current_deal and len(user_text) < 200:
+        # Если в тексте уже есть номер сделки (6+ цифр) — оставляем как есть
+        import re
+        if not re.search(r"\d{6,}", user_text):
+            message_to_agent = f"{user_text} (контекст: сделка {current_deal})"
+
     result = await typing_while(
         update.effective_chat.id, context,
-        agent.process_message(user_text, chat_id=chat_id)
+        agent.process_message(message_to_agent, chat_id=chat_id)
     )
     await send_result(update.message, result, context=context, chat_id=str(update.effective_chat.id))
 
