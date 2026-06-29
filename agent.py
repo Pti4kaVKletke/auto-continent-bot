@@ -116,6 +116,8 @@ cash_currency    — валюта наличных (долларов / сом)
 exchange_rate    — курс доллара к рублю на дату договора (например: 81,40)
 account_currency — валюта счёта для банковского перевода
 account_number   — номер счёта получателя
+bank_kpp         — КПП банка получателя (только для прямых российских счетов, например ВТБ; для счетов через корреспондента оставь пустым)
+account_number   — номер счёта получателя
 bank_corr_line1  — название банка-корреспондента (например "АО «Тинькофф Банк»")
 bank_corr_line2  — БИК банка-корреспондента (только число, например "044525974")
 bank_corr_line3  — корр.счёт банка-корреспондента (например "30101810145250000974")
@@ -133,6 +135,7 @@ bank_ben_line2   — БИК и корр.счёт банка получателя
 Продавец:   seller_name, seller_initials, seller_id_issued_date, seller_birth_date, seller_address, seller_id_number, seller_id_issued_by
 Автомобиль: car_model, car_vin, car_year, car_color, tpo_number, tpo_day, tpo_month, tpo_year
 Финансы:    car_price, car_price_words, currency, cash_amount, cash_amount_words, cash_currency, exchange_rate, account_currency, account_number, bank_corr_line1, bank_corr_line2, bank_corr_line3, bank_ben_line1, bank_ben_line2
+Банк:       bank_kpp (необязательное, только для прямых российских счетов)
 Комиссия:   commission_pct передаётся как отдельный параметр инструмента, НЕ внутри data
 
 НЕОБЯЗАТЕЛЬНЫЕ поля (оставь пустыми если нет):
@@ -684,7 +687,7 @@ VIN: ...
                             "description": (
                                 "Реквизиты: account_number, account_currency, "
                                 "bank_corr_line1, bank_corr_line2, bank_corr_line3, "
-                                "bank_ben_line1, bank_ben_line2"
+                                "bank_ben_line1, bank_ben_line2, bank_kpp (КПП для прямых российских счетов)"
                             ),
                         },
                     },

@@ -291,7 +291,7 @@ class DocumentBuilder:
                 "{{BANK_DIRECT_BIK}}":  data.get("bank_corr_line2", ""),
                 "{{BANK_DIRECT_CORR}}": data.get("bank_corr_line3", ""),
                 "{{BANK_BEN_INN}}":     "9909768607",
-                "{{BANK_DIRECT_KPP}}":  "665887001",
+                "{{BANK_DIRECT_KPP}}":  data.get("bank_kpp", ""),
                 "{{ACCOUNT_NUMBER}}":   data.get("account_number", ""),
                 "{{QR_CODE}}":          "",  # будет заменён изображением ниже
             }
