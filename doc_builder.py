@@ -242,15 +242,26 @@ class DocumentBuilder:
 
     async def build_invoice(self, data: dict, number: str, date: str, commission_pct: float = 1.0) -> str:
         """
-        Формирует счёт на оплату из шаблона invoice_template.xlsx
-        (содержит реальную печать и подпись директора).
+        Формирует счёт на оплату.
+        Если bank_corr_line1 пустой — прямой счёт (ВТБ), используем invoice_template_direct.xlsx
+        и генерируем QR код по стандарту ГОСТ Р 56042.
         """
-        template = self.templates_dir / "invoice_template.xlsx"
-        logger.info(f"Загружаю шаблон счёта: {template} (существует: {template.exists()}, "
-                    f"размер: {template.stat().st_size if template.exists() else 0} байт)")
+        is_direct = not data.get("bank_corr_line1", "").strip()
+
+        if is_direct:
+            template = self.templates_dir / "invoice_template_direct.xlsx"
+            if not template.exists():
+                # Фолбэк на основной шаблон
+                template = self.templates_dir / "invoice_template.xlsx"
+                is_direct = False
+        else:
+            template = self.templates_dir / "invoice_template.xlsx"
+
+        logger.info(f"Шаблон счёта: {template.name} (прямой={is_direct}), "
+                    f"размер: {template.stat().st_size if template.exists() else 0} байт")
         wb = openpyxl.load_workbook(str(template))
         ws = wb.active
-        logger.info(f"Шаблон счёта загружен, изображений: {len(ws._images)}")
+        logger.info(f"Шаблон загружен, изображений: {len(ws._images)}")
 
         price_str = str(data.get("car_price", "0")).replace(" ", "").replace(",", ".")
         try:
@@ -274,15 +285,35 @@ class DocumentBuilder:
         total_fmt   = f"{total:,.2f}".replace(",", " ")
         total_words = amount_to_words_rub(total) if acc_cur == "RUB" else ""
 
-        replacements = {
-            "{{BANK_CORR_NAME}}":    data.get("bank_corr_line1", ""),
-            "{{BANK_CORR_BIK}}":     data.get("bank_corr_line2", ""),
-            "{{BANK_CORR_ACC}}":     data.get("bank_corr_line3", ""),
-            "{{BANK_BEN_NAME}}":     data.get("bank_ben_line1", ""),
-            "{{BANK_BEN_LINE2}}":    data.get("bank_ben_line2", ""),
-            "{{BANK_BEN_INN}}":      "01905202610324",
-            "{{ACCOUNT_NUMBER}}":    data.get("account_number", ""),
-        }
+        if is_direct:
+            replacements = {
+                "{{BANK_DIRECT_NAME}}": data.get("bank_ben_line1", ""),
+                "{{BANK_DIRECT_BIK}}":  data.get("bank_corr_line2", ""),
+                "{{BANK_DIRECT_CORR}}": data.get("bank_corr_line3", ""),
+                "{{BANK_BEN_INN}}":     "9909768607",
+                "{{BANK_DIRECT_KPP}}":  "665887001",
+                "{{ACCOUNT_NUMBER}}":   data.get("account_number", ""),
+                "{{QR_CODE}}":          "",  # будет заменён изображением ниже
+            }
+        else:
+            replacements = {
+                "{{BANK_CORR_NAME}}":    data.get("bank_corr_line1", ""),
+                "{{BANK_CORR_BIK}}":     data.get("bank_corr_line2", ""),
+                "{{BANK_CORR_ACC}}":     data.get("bank_corr_line3", ""),
+                "{{BANK_BEN_NAME}}":     data.get("bank_ben_line1", ""),
+                "{{BANK_BEN_LINE2}}":    data.get("bank_ben_line2", ""),
+                "{{BANK_BEN_INN}}":      "01905202610324",
+                "{{ACCOUNT_NUMBER}}":    data.get("account_number", ""),
+            }
+
+        # Находим координату ячейки с {{QR_CODE}} до замены
+        qr_cell_coord = None
+        if is_direct:
+            for row in ws.iter_rows():
+                for cell in row:
+                    if cell.value == "{{QR_CODE}}":
+                        qr_cell_coord = cell.coordinate
+                        break
 
         for row in ws.iter_rows():
             for c in row:
@@ -292,24 +323,75 @@ class DocumentBuilder:
                             c.value = c.value.replace(ph, str(val))
 
         # Заголовок счёта
-        ws["B16"] = f"Счет на оплату № {number} от {date_str} г."
+        if is_direct:
+            ws["B13"] = f"Счет на оплату № {number} от {date_str} г."
+            ws["G19"] = buyer
+            ws["D22"] = f"Оплата по Агентскому договору {number} от {date_str} г. на оплату автомобиля {car}"
+            ws["Z22"] = price_val
+            ws["D23"] = f"Комиссия по Агентскому договору {number} от {date_str} г."
+            ws["Z23"] = commission
+            ws["B28"] = f"Всего наименований 2, на сумму {total_fmt} {acc_cur}"
+            ws["B29"] = total_words
+        else:
+            ws["B16"] = f"Счет на оплату № {number} от {date_str} г."
+            ws["G22"] = buyer
+            ws["D25"] = f"Оплата по Агентскому договору {number} от {date_str} г. на оплату автомобиля {car}"
+            ws["Z25"] = price_val
+            ws["D26"] = f"Комиссия по Агентскому договору {number} от {date_str} г."
+            ws["Z26"] = commission
+            ws["B31"] = f"Всего наименований 2, на сумму {total_fmt} {acc_cur}"
+            ws["B32"] = total_words
 
-        # Покупатель
-        ws["G22"] = buyer
+        # ── QR код для прямого счёта ──────────────────────────────────────
+        if is_direct and qr_cell_coord:
+            try:
+                import qrcode
+                from openpyxl.drawing.image import Image as XLImage
+                import io
 
-        # Таблица: позиция автомобиля
-        ws["D25"] = f"Оплата по Агентскому договору {number} от {date_str} г. на оплату автомобиля {car}"
-        ws["Z25"] = price_val
+                account   = data.get("account_number", "")
+                bic       = data.get("bank_corr_line2", "")
+                corr      = data.get("bank_corr_line3", "")
+                bank_name = data.get("bank_ben_line1", "")
+                sum_kopecks = int(round(total * 100))
+                purpose   = f"Оплата по договору {number} от {date}"
 
-        # Комиссия
-        ws["D26"] = f"Комиссия по Агентскому договору {number} от {date_str} г."
-        ws["Z26"] = commission
+                qr_str = (
+                    f"ST00012|"
+                    f"Name=ОсОО Авто Континент|"
+                    f"PersonalAcc={account}|"
+                    f"BankName={bank_name}|"
+                    f"BIC={bic}|"
+                    f"CorrespAcc={corr}|"
+                    f"Sum={sum_kopecks}|"
+                    f"Purpose={purpose}"
+                )
 
-        # Итоговая строка и сумма прописью
-        ws["B31"] = f"Всего наименований 2, на сумму {total_fmt} {acc_cur}"
-        ws["B32"] = total_words
+                qr = qrcode.QRCode(
+                    version=None,
+                    error_correction=qrcode.constants.ERROR_CORRECT_M,
+                    box_size=4,
+                    border=2,
+                )
+                qr.add_data(qr_str)
+                qr.make(fit=True)
+                img = qr.make_image(fill_color="black", back_color="white")
 
-        # Настройка области печати для корректного PDF-экспорта через LibreOffice
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+                buf.seek(0)
+
+                xl_img = XLImage(buf)
+                xl_img.width  = 90
+                xl_img.height = 90
+                ws.add_image(xl_img, qr_cell_coord)
+                logger.info(f"QR код вставлен в ячейку {qr_cell_coord} для счёта {number}")
+            except ImportError:
+                logger.warning("Библиотека qrcode не установлена — QR пропущен")
+            except Exception as e:
+                logger.warning(f"Ошибка генерации QR: {e}")
+
+        # Настройка области печати
         try:
             from openpyxl.worksheet.properties import WorksheetProperties, PageSetupProperties
             if ws.sheet_properties is None:
@@ -332,7 +414,7 @@ class DocumentBuilder:
         logger.info(f"Счёт сохранён, изображений в файле: {n_images}")
 
         if n_images == 0 and template.exists():
-            logger.warning("Изображения потерялись при сохранении — восстанавливаю вручную из шаблона")
+            logger.warning("Изображения потерялись — восстанавливаю из шаблона")
             self._restore_images_from_template(path, template)
 
         return str(path)
