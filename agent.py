@@ -486,7 +486,7 @@ VIN: ...
             try:
                 response = await self.client.with_options(timeout=120.0).messages.create(
                     model=self.model,
-                    max_tokens=1024,
+                    max_tokens=4096,
                     system=self._build_system_prompt(),
                     tools=self._get_tools(),
                     messages=messages,

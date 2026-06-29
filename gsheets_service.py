@@ -2,6 +2,7 @@ import os
 import json
 import logging
 import asyncio
+import urllib.request
 from datetime import datetime
 
 from google.oauth2.credentials import Credentials
@@ -11,6 +12,55 @@ from googleapiclient.discovery import build
 logger = logging.getLogger(__name__)
 
 SPREADSHEET_ID = os.environ.get("GOOGLE_SHEETS_ID", "1OHkExAxQzm_3kiOE-h4aGug-MO3yf4OODB8C_fACz08")
+
+
+def _save_token_to_railway(creds: Credentials, original_token_data: dict):
+    """Сохраняет обновлённый OAuth токен обратно в Railway (аналогично drive_service.py)."""
+    try:
+        updated = dict(original_token_data)
+        updated["token"] = creds.token
+        if creds.expiry:
+            updated["token_expiry"] = creds.expiry.isoformat()
+
+        new_value = json.dumps(updated)
+
+        query = """
+        mutation UpsertVariables($input: ServiceVariablesInput!) {
+          serviceVariablesUpsert(input: $input)
+        }
+        """
+        railway_token = os.environ.get("RAILWAY_API_TOKEN", "")
+        railway_service_id = os.environ.get("RAILWAY_SERVICE_ID", "")
+        if not railway_token or not railway_service_id:
+            logger.warning("RAILWAY_API_TOKEN или RAILWAY_SERVICE_ID не заданы — токен Sheets не сохранён в Railway")
+            return
+
+        variables = {
+            "input": {
+                "serviceId": railway_service_id,
+                "environmentId": os.environ.get("RAILWAY_ENVIRONMENT_ID", ""),
+                "variables": {"GOOGLE_OAUTH_TOKEN": new_value},
+            }
+        }
+        payload = json.dumps({"query": query, "variables": variables}).encode("utf-8")
+        req = urllib.request.Request(
+            "https://backboard.railway.app/graphql/v2",
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {railway_token}",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read())
+            if "errors" in result:
+                logger.warning(f"Railway API (Sheets): ошибки: {result['errors']}")
+            else:
+                os.environ["GOOGLE_OAUTH_TOKEN"] = new_value
+                logger.info("Sheets OAuth токен сохранён в Railway")
+    except Exception as e:
+        logger.warning(f"Не удалось сохранить Sheets токен в Railway: {e}")
 
 # Строка 1 — группы, строка 2 — названия, данные с строки 3
 DATA_START_ROW = 3
@@ -83,6 +133,8 @@ def _build_sheets_service():
     if creds.expired and creds.refresh_token:
         try:
             creds.refresh(Request())
+            logger.info("Sheets OAuth токен обновлён")
+            _save_token_to_railway(creds, token_data)
         except Exception as e:
             logger.warning(f"Не удалось обновить токен для Sheets: {e}")
     return build("sheets", "v4", credentials=creds)

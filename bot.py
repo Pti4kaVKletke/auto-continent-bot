@@ -244,6 +244,8 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 scans_folder_id = await agent.drive._get_or_create_folder("Сканы", deal_folder_id)
                 link = await agent.drive.upload_file(filepath, filename, scans_folder_id)
+                # Удаляем из pending_scans — файл уже загружен напрямую, не нужно повторять при create_contract
+                memory.clear_pending_scans(chat_id)
                 await message.reply_text(
                     f"✅ Скан загружен в папку сделки *{contract_number}*",
                     parse_mode="Markdown",

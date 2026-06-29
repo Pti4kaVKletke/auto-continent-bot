@@ -20,8 +20,8 @@ MONTHS_RU = {
     "10": "Октябрь","11": "Ноябрь",  "12": "Декабрь"
 }
 
-RAILWAY_API_TOKEN = "41dcf97e-e951-4a7c-9b91-629e84fa9c5c"
-RAILWAY_SERVICE_ID = "f723c9cd-c80c-4080-a72e-befb3e4a4c87"
+RAILWAY_API_TOKEN = os.environ.get("RAILWAY_API_TOKEN", "")
+RAILWAY_SERVICE_ID = os.environ.get("RAILWAY_SERVICE_ID", "f723c9cd-c80c-4080-a72e-befb3e4a4c87")
 
 
 def _save_token_to_railway(creds: Credentials, original_token_data: dict):
