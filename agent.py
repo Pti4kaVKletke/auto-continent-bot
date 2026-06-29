@@ -134,8 +134,8 @@ bank_ben_line2   — БИК и корр.счёт банка получателя
 Покупатель: buyer_name, buyer_initials, buyer_birth_date, buyer_address, passport_series, passport_number, passport_issued_by, passport_issued_date, passport_code
 Продавец:   seller_name, seller_initials, seller_id_issued_date, seller_birth_date, seller_address, seller_id_number, seller_id_issued_by
 Автомобиль: car_model, car_vin, car_year, car_color, tpo_number, tpo_day, tpo_month, tpo_year
-Финансы:    car_price, car_price_words, currency, cash_amount, cash_amount_words, cash_currency, exchange_rate, account_currency, account_number, bank_corr_line1, bank_corr_line2, bank_corr_line3, bank_ben_line1, bank_ben_line2
-Банк:       bank_kpp (необязательное, только для прямых российских счетов)
+Финансы:    car_price, car_price_words, currency, cash_amount, cash_amount_words, cash_currency, exchange_rate, account_currency, account_number, bank_ben_line1
+Банк (если есть корреспондент): bank_corr_line1, bank_corr_line2, bank_corr_line3, bank_ben_line2 (необязательны для прямых счетов без корреспондента)
 Комиссия:   commission_pct передаётся как отдельный параметр инструмента, НЕ внутри data
 
 НЕОБЯЗАТЕЛЬНЫЕ поля (оставь пустыми если нет):
@@ -1091,12 +1091,17 @@ VIN: ...
                 ("exchange_rate",        "Курс USD/RUB"),
                 ("account_currency",     "Валюта счёта"),
                 ("account_number",       "Номер счёта"),
-                ("bank_corr_line1",      "Банк-корреспондент"),
-                ("bank_corr_line2",      "БИК корр."),
-                ("bank_corr_line3",      "Корр.счёт"),
                 ("bank_ben_line1",       "Банк получателя"),
-                ("bank_ben_line2",       "БИК и корр.счёт получателя"),
             ]
+
+            # bank_corr обязателен только если это не прямой счёт
+            is_direct = not deal.get("bank_corr_line1", "").strip()
+            if not is_direct:
+                REQUIRED += [
+                    ("bank_corr_line2",  "БИК корр."),
+                    ("bank_corr_line3",  "Корр.счёт"),
+                    ("bank_ben_line2",   "БИК и корр.счёт получателя"),
+                ]
 
             missing = []
             for key, label in REQUIRED:
