@@ -114,7 +114,19 @@ class DocumentBuilder:
     # ─── АГЕНТСКИЙ ДОГОВОР ────────────────────────────────────────────────
 
     async def build_contract(self, data: dict, number: str, date: str, commission_pct: float = 1.0) -> str:
-        template = self.templates_dir / "contract_template.docx"
+        # Если bank_corr_line1 пустой — прямой счёт (ВТБ), используем contract_template_direct.docx
+        is_direct = not data.get("bank_corr_line1", "").strip()
+
+        if is_direct:
+            template = self.templates_dir / "contract_template_direct.docx"
+            if not template.exists():
+                logger.warning("contract_template_direct.docx не найден, использую стандартный")
+                template = self.templates_dir / "contract_template.docx"
+        else:
+            template = self.templates_dir / "contract_template.docx"
+
+        logger.info(f"Шаблон АГ договора: {template.name} (прямой={is_direct})")
+
         if template.exists():
             return await self._fill_template(template, data, number, date,
                                              f"АГ_Договор_{number}", commission_pct)
@@ -762,6 +774,12 @@ class DocumentBuilder:
             "{{БАНК_КОРР_СТРОКА3}}": data.get("bank_corr_line3", ""),
             "{{БАНК_ПОЛ_СТРОКА1}}":  data.get("bank_ben_line1", ""),
             "{{БАНК_ПОЛ_СТРОКА2}}":  data.get("bank_ben_line2", ""),
+            # Для прямого шаблона (ВТБ без корреспондента)
+            "{{БАНК_ПРЯМОЙ_НАЗВАНИЕ}}": data.get("bank_ben_line1", ""),
+            "{{БАНК_ПРЯМОЙ_БИК}}":      data.get("bank_corr_line2", ""),
+            "{{БАНК_ПРЯМОЙ_КОРР}}":     data.get("bank_corr_line3", ""),
+            "{{БАНК_ПРЯМОЙ_ИНН}}":      "9909768607",
+            "{{БАНК_ПРЯМОЙ_КПП}}":      data.get("bank_kpp", ""),
             "{{СЧЕТ_ВАЛЮТА}}":       data.get("account_currency", ""),
             "{{СЧЕТ_НОМЕР}}":        data.get("account_number", ""),
         }
