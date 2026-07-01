@@ -214,7 +214,7 @@ class GoogleSheetsService:
             sheet.values().append(
                 spreadsheetId=SPREADSHEET_ID,
                 range=f"A{DATA_START_ROW}",
-                valueInputOption="RAW",
+                valueInputOption="USER_ENTERED",
                 insertDataOption="INSERT_ROWS",
                 body={"values": [row]},
             ).execute()
@@ -318,7 +318,7 @@ class GoogleSheetsService:
             sheet.values().update(
                 spreadsheetId=SPREADSHEET_ID,
                 range=f"A{target_row}:{last_col}{target_row}",
-                valueInputOption="RAW",
+                valueInputOption="USER_ENTERED",
                 body={"values": [current_row]},
             ).execute()
             logger.info(f"Сделка {contract_number} обновлена в Sheets")
