@@ -502,6 +502,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             car    = deal.get("car_model", "—")
             vin    = deal.get("car_vin", "—")
             price  = deal.get("car_price", "—")
+            total_sum = deal.get("Сумма Договора", "")
             date   = deal.get("Дата договора", "—")
             folder = deal.get("Папка Drive", "")
             account_number = deal.get("account_number", "")
@@ -530,9 +531,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"👤 {buyer}\n"
                 f"👤 {seller}\n"
                 f"🚗 {car} · VIN `{vin}`\n"
-                f"💰 {price} руб.\n"
-                f"🏦 {profile_name}"
+                f"💰 Цена авто: {price} руб."
             )
+            if total_sum:
+                text += f"\n💵 Итого к оплате: *{total_sum}* руб."
+            text += f"\n🏦 {profile_name}"
             if bank_short:
                 text += f"\n   _{bank_short}_"
             if account_number:

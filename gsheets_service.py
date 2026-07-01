@@ -70,6 +70,7 @@ DATA_START_ROW = 3
 COLUMNS = [
     "Номер договора",
     "Дата договора",
+    "Сумма Договора",
     "Статус",
     "buyer_name",
     "passport_series",
@@ -185,11 +186,20 @@ class GoogleSheetsService:
             sheet = svc.spreadsheets()
 
             row = []
+            # Вычисляем итоговую сумму: цена + комиссия
+            try:
+                price_val = float(str(data.get("car_price", "0")).replace(" ", "").replace(",", "."))
+            except Exception:
+                price_val = 0.0
+            total_sum = round(price_val * (1 + commission_pct / 100), 2)
+
             for col in COLUMNS:
                 if col == "Номер договора":
                     row.append(contract_number)
                 elif col == "Дата договора":
                     row.append(contract_date)
+                elif col == "Сумма Договора":
+                    row.append(f"{total_sum:.2f}" if total_sum > 0 else "")
                 elif col == "Статус":
                     row.append("активна")
                 elif col == "Комиссия %":
@@ -290,6 +300,19 @@ class GoogleSheetsService:
                     while len(current_row) <= idx:
                         current_row.append("")
                     current_row[idx] = str(new_val)
+
+            # Пересчитываем "Сумма Договора" если менялась цена или комиссия
+            if "car_price" in updates or "Комиссия %" in updates:
+                try:
+                    price_idx = COLUMNS.index("car_price")
+                    comm_idx  = COLUMNS.index("Комиссия %")
+                    sum_idx   = COLUMNS.index("Сумма Договора")
+                    price_val = float(str(current_row[price_idx]).replace(" ", "").replace(",", "."))
+                    comm_pct  = float(str(current_row[comm_idx] or "1").replace(",", "."))
+                    total_sum = round(price_val * (1 + comm_pct / 100), 2)
+                    current_row[sum_idx] = f"{total_sum:.2f}" if total_sum > 0 else ""
+                except Exception as e:
+                    logger.warning(f"Не удалось пересчитать сумму договора: {e}")
 
             last_col = self._col_letter(len(COLUMNS) - 1)
             sheet.values().update(
