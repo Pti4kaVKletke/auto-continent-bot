@@ -816,6 +816,30 @@ VIN: ...
             else:
                 number = await self.drive.get_next_contract_number(contract_date)
 
+                # ── Защита от перезаписи существующей сделки ────────────
+                existing = await self.sheets.get_deal(number)
+                if existing:
+                    buyer  = existing.get("buyer_name", "—")
+                    car    = existing.get("car_model", "—")
+                    vin    = existing.get("car_vin", "—")
+                    date_e = existing.get("Дата договора", "—")
+                    status = existing.get("Статус", "—")
+                    logger.warning(f"Попытка создать сделку с существующим номером {number}")
+                    return {
+                        "error": (
+                            f"⚠️ *ВНИМАНИЕ!* Сделка *{number}* уже существует в журнале:\n\n"
+                            f"📄 От {date_e} · статус: {status}\n"
+                            f"👤 {buyer}\n"
+                            f"🚗 {car} · VIN {vin}\n\n"
+                            f"Что нужно сделать?\n"
+                            f"1️⃣ Перегенерировать существующую — передай "
+                            f"existing_contract_number=\"{number}\" при повторном вызове create_contract\n"
+                            f"2️⃣ Создать новую сделку — уточни у пользователя новую дату договора (номер сгенерируется автоматически)\n"
+                            f"3️⃣ Отменить операцию\n\n"
+                            f"НЕ создавай новую сделку с этим номером без подтверждения пользователя."
+                        )
+                    }
+
             logger.debug("DATA KEYS: " + str(list(tool_input.get("data", {}).keys())))
 
             # Защита: агент иногда передаёт поля напрямую в tool_input вместо вложенного data
