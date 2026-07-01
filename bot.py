@@ -508,13 +508,28 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             account_number = deal.get("account_number", "")
             bank_ben       = deal.get("bank_ben_line1", "")
 
-            # Определяем название профиля реквизитов по номеру счёта
+            # Определяем название профиля реквизитов по номеру счёта и банку-корреспонденту
             profile_name = "—"
+            deal_corr = deal.get("bank_corr_line1", "").strip().lower()
             for pname in memory.list_bank_profiles():
                 p = memory.get_bank_profile(pname)
-                if p and p.get("account_number") == account_number and account_number:
+                if not p or not account_number:
+                    continue
+                # Совпадение по счёту
+                if p.get("account_number") != account_number:
+                    continue
+                # Совпадение по банку-корреспонденту (для разных карт с одним счётом)
+                p_corr = (p.get("bank_corr_line1", "") or "").strip().lower()
+                if p_corr == deal_corr:
                     profile_name = pname
                     break
+            # Если по паре не нашли — берём первый по номеру счёта (фолбэк)
+            if profile_name == "—":
+                for pname in memory.list_bank_profiles():
+                    p = memory.get_bank_profile(pname)
+                    if p and p.get("account_number") == account_number and account_number:
+                        profile_name = pname
+                        break
 
             # Для старых сделок без ссылки — строим её по номеру договора
             if not folder:
