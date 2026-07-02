@@ -19,6 +19,79 @@ from doc_builder import DocumentBuilder
 from gsheets_service import GoogleSheetsService
 
 
+# ══ УЧЁТ ПОСТУПЛЕНИЙ (платежей по сделкам) ═══════════════════════════════
+
+_PAYMENT_RE = re.compile(r"^([\d\.,]+)\s*\((\d{2}\.\d{2}\.\d{4})\)$")
+
+
+def _parse_payments(text: str) -> list:
+    """Парсит текст '500000 (01.07.2026); 300000 (15.07.2026)' в
+    список словарей [{'amount': 500000.0, 'date': '01.07.2026'}, ...]."""
+    if not text or not str(text).strip():
+        return []
+    result = []
+    for chunk in str(text).split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        m = _PAYMENT_RE.match(chunk)
+        if not m:
+            continue
+        try:
+            amount = float(m.group(1).replace(",", "."))
+            result.append({"amount": amount, "date": m.group(2)})
+        except ValueError:
+            continue
+    return result
+
+
+def _format_payments(payments: list) -> str:
+    """Форматирует список платежей обратно в строку для хранения."""
+    parts = []
+    for p in payments:
+        amount = p["amount"]
+        amount_str = f"{amount:.0f}" if amount == int(amount) else f"{amount:.2f}"
+        parts.append(f"{amount_str} ({p['date']})")
+    return "; ".join(parts)
+
+
+def _fmt_money(x: float) -> str:
+    """Форматирует сумму с разделением тысяч: 1000000 → '1 000 000'."""
+    try:
+        x = float(x)
+    except (TypeError, ValueError):
+        return str(x)
+    if x == int(x):
+        return f"{int(x):,}".replace(",", " ")
+    return f"{x:,.2f}".replace(",", " ")
+
+
+def _calc_total_amount(deal: dict) -> float:
+    """Возвращает Сумму Договора.
+
+    Приоритет: значение из колонки "Сумма Договора" (её пишет и пересчитывает
+    gsheets_service при save_deal / update_deal). Если ячейка пустая — вычисляем
+    fallback: car_price + car_price * commission/100 (для старых сделок или
+    ручных правок, где сумма могла быть стёрта).
+    """
+    def _num(v):
+        try:
+            return float(str(v).replace(",", ".").replace(" ", ""))
+        except (TypeError, ValueError):
+            return 0.0
+    stored = _num(deal.get("Сумма Договора", 0))
+    if stored > 0:
+        return stored
+    price = _num(deal.get("car_price", 0))
+    commission = _num(deal.get("Комиссия %", 0))
+    return price + price * commission / 100.0
+
+
+def _num_for_sheet(x: float) -> str:
+    """Форматирует число для записи в Sheets: целое без .0, дробное с 2 знаками."""
+    return f"{x:.0f}" if x == int(x) else f"{x:.2f}"
+
+
 class DocumentAgent:
 
     def __init__(self):
@@ -365,6 +438,7 @@ VIN: ...
    - "какая машина" / "данные авто" / "VIN" / "ТПО" → section="car"
    - "какая сумма" / "цена" / "финансы" / "курс" → section="finances"
    - "реквизиты" / "банк" / "счёт" / "куда перевести" → section="bank"
+   - "платежи" / "поступления" / "оплата" / "баланс" / "сколько получено" → section="payments"
    - "все данные" / "полная информация" / общий запрос без уточнения → section="all"
 2. Инструмент сам отфильтрует и вернёт только нужный раздел
 3. НЕ вызывай update_deal на запросы вида "покажи/напиши/выведи" — это только просмотр
@@ -392,6 +466,14 @@ VIN: ...
 3. НЕ генерируй новый номер — используй тот что в existing_contract_number
 
 Когда пользователь просит отменить сделку — вызови cancel_deal, спроси причину.
+
+УЧЁТ ПОСТУПЛЕНИЙ (платежей по сделкам):
+- Когда пользователь говорит "по сделке NNN пришло N руб DD.MM" или "записать поступление N сегодня по сделке NNN" — вызывай add_payment(contract_number, amount, date).
+- Дата ВСЕГДА в формате ДД.ММ.ГГГГ. Если пользователь не указал год — используй текущий (2026). Если сказал "сегодня" — используй сегодняшнюю дату.
+- После add_payment система автоматически считает Получено и Остаток. Если Остаток становится ≤ 0 — статус сделки автоматически меняется на "завершена".
+- Чтобы посмотреть текущие платежи и баланс — вызывай find_deal с section="payments".
+- Чтобы удалить ошибочный платёж — вызывай remove_payment(contract_number, index). Если пользователь не помнит номер платежа — сначала покажи список через find_deal с section="payments", потом уточни какой удалять.
+- НЕ обновляй Платежи/Получено/Остаток через update_deal напрямую — это может сломать баланс. Используй ТОЛЬКО add_payment и remove_payment.
 
 Если каких-то необязательных данных нет — оставь значение пустой строкой "".
 
@@ -575,7 +657,7 @@ VIN: ...
                 "description": (
                     "Найти сделку в журнале Google Sheets по номеру договора, ФИО покупателя или продавца, VIN или дате. "
                     "Параметр section указывает какой раздел показать пользователю: "
-                    "buyer=покупатель, seller=продавец, car=авто, finances=финансы, bank=реквизиты, all=всё."
+                    "buyer=покупатель, seller=продавец, car=авто, finances=финансы, bank=реквизиты, payments=платежи и баланс, all=всё."
                 ),
                 "input_schema": {
                     "type": "object",
@@ -586,7 +668,7 @@ VIN: ...
                         },
                         "section": {
                             "type": "string",
-                            "description": "Какой раздел показать: buyer / seller / car / finances / bank / all (по умолчанию all)",
+                            "description": "Какой раздел показать: buyer / seller / car / finances / bank / payments / all (по умолчанию all)",
                         },
                     },
                     "required": ["query"],
@@ -759,6 +841,62 @@ VIN: ...
                 "input_schema": {
                     "type": "object",
                     "properties": {},
+                },
+            },
+            {
+                "name": "add_payment",
+                "description": (
+                    "Записать поступление денег по сделке. Вызывай когда пользователь "
+                    "говорит что-то вроде «по сделке NNN пришло 500000 руб 01.07» или "
+                    "«записать поступление 300000 сегодня по сделке NNN». "
+                    "Если год в дате не указан — используй текущий (2026). "
+                    "Если дата = «сегодня» — используй сегодняшнюю дату. "
+                    "После добавления бот покажет актуальный баланс (получено / остаток). "
+                    "При полной оплате сделка автоматически переходит в статус «завершена»."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "contract_number": {
+                            "type": "string",
+                            "description": "Номер сделки (формат ДДММГГ+NNN, например 270625001)",
+                        },
+                        "amount": {
+                            "type": "number",
+                            "description": "Сумма поступления в валюте сделки (положительное число)",
+                        },
+                        "date": {
+                            "type": "string",
+                            "description": "Дата поступления в формате ДД.ММ.ГГГГ",
+                        },
+                    },
+                    "required": ["contract_number", "amount", "date"],
+                },
+            },
+            {
+                "name": "remove_payment",
+                "description": (
+                    "Удалить платёж из сделки по его номеру в списке (1-based). "
+                    "Используй когда пользователь говорит «убрать последний платёж», "
+                    "«удалить второй платёж по сделке NNN» или «отменить платёж». "
+                    "Если непонятно какой платёж удалять — сначала покажи список через "
+                    "find_deal с section=\"payments\". "
+                    "Если после удаления сделка перестаёт быть полностью оплаченной, "
+                    "статус автоматически возвращается на «активна»."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "contract_number": {
+                            "type": "string",
+                            "description": "Номер сделки",
+                        },
+                        "index": {
+                            "type": "integer",
+                            "description": "Номер платежа в списке, начиная с 1",
+                        },
+                    },
+                    "required": ["contract_number", "index"],
                 },
             },
         ]
@@ -1296,6 +1434,29 @@ VIN: ...
                     f"  БИК/корр.счёт получателя: {_val(r, 'bank_ben_line2')}",
                 ]
 
+            def _section_payments(r):
+                payments = _parse_payments(r.get("Платежи", ""))
+                total = _calc_total_amount(r)
+                received = sum(p["amount"] for p in payments)
+                remainder = total - received
+                currency = (r.get("currency") or "руб").strip()
+
+                lines = ["💳 ПЛАТЕЖИ:"]
+                if not payments:
+                    lines.append("  Поступлений ещё не было")
+                else:
+                    for i, p in enumerate(payments, 1):
+                        lines.append(
+                            f"  {i}. {_fmt_money(p['amount'])} {currency} от {p['date']}"
+                        )
+                lines += [
+                    "",
+                    f"  💰 Сумма договора: {_fmt_money(total)} {currency}",
+                    f"  📥 Получено: {_fmt_money(received)} {currency}",
+                    f"  ⏳ Остаток: {_fmt_money(remainder)} {currency}",
+                ]
+                return lines
+
             # Одна сделка — показываем нужный раздел
             if len(results) == 1:
                 r = results[0]
@@ -1307,6 +1468,7 @@ VIN: ...
                     "car":      _section_car,
                     "finances": _section_finances,
                     "bank":     _section_bank,
+                    "payments": _section_payments,
                 }
 
                 if section in section_map:
@@ -1319,6 +1481,7 @@ VIN: ...
                         + _section_car(r) + [""]
                         + _section_finances(r) + [""]
                         + _section_bank(r) + [""]
+                        + _section_payments(r) + [""]
                         + [f"📁 Drive: {_val(r, 'Папка Drive')}",
                            f"💬 Комментарий: {_val(r, 'Комментарий')}"]
                     )
@@ -1432,6 +1595,124 @@ VIN: ...
                 "message": "📅 Дата договора:",
                 "buttons": buttons,
             }
+
+        elif tool_name == "add_payment":
+            contract_number = (tool_input.get("contract_number") or "").strip()
+            amount_in = tool_input.get("amount")
+            date = (tool_input.get("date") or "").strip()
+
+            if not contract_number:
+                return {"error": "⚠️ Не указан номер сделки"}
+            if not re.match(r"^\d{2}\.\d{2}\.\d{4}$", date):
+                return {"error": f"⚠️ Неверный формат даты: «{date}». Ожидается ДД.ММ.ГГГГ"}
+            try:
+                amount = float(amount_in)
+                if amount <= 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                return {"error": f"⚠️ Неверная сумма: «{amount_in}». Должно быть положительное число"}
+
+            deal = await self.sheets.get_deal(contract_number)
+            if not deal:
+                return {"error": f"⚠️ Сделка *{contract_number}* не найдена в журнале"}
+
+            payments = _parse_payments(deal.get("Платежи", ""))
+            payments.append({"amount": amount, "date": date})
+
+            total = _calc_total_amount(deal)
+            received = sum(p["amount"] for p in payments)
+            remainder = total - received
+
+            updates = {
+                "Платежи": _format_payments(payments),
+                "Получено": _num_for_sheet(received),
+                "Остаток": _num_for_sheet(remainder),
+            }
+
+            # Полная оплата → статус "завершена"
+            current_status = (deal.get("Статус") or "").strip().lower()
+            status_msg = None
+            if remainder <= 0.01 and current_status != "завершена":
+                updates["Статус"] = "завершена"
+                status_msg = "🎉 Сделка полностью оплачена — статус сменён на «завершена»"
+
+            ok = await self.sheets.update_deal(contract_number, updates)
+            if not ok:
+                return {"error": f"⚠️ Не удалось обновить сделку {contract_number}"}
+
+            currency = (deal.get("currency") or "руб").strip()
+            lines = [f"✅ Платёж №{len(payments)} записан: {_fmt_money(amount)} {currency} от {date}"]
+            if status_msg:
+                lines.append(status_msg)
+            lines += [
+                "",
+                f"💰 Сумма договора: {_fmt_money(total)} {currency}",
+                f"📥 Получено: {_fmt_money(received)} {currency}",
+                f"⏳ Остаток: {_fmt_money(remainder)} {currency}",
+            ]
+            return {"message": "\n".join(lines)}
+
+        elif tool_name == "remove_payment":
+            contract_number = (tool_input.get("contract_number") or "").strip()
+            idx_in = tool_input.get("index")
+
+            if not contract_number:
+                return {"error": "⚠️ Не указан номер сделки"}
+            try:
+                index = int(idx_in)
+                if index < 1:
+                    raise ValueError
+            except (TypeError, ValueError):
+                return {"error": f"⚠️ Неверный номер платежа: «{idx_in}». Должно быть целое ≥ 1"}
+
+            deal = await self.sheets.get_deal(contract_number)
+            if not deal:
+                return {"error": f"⚠️ Сделка *{contract_number}* не найдена"}
+
+            payments = _parse_payments(deal.get("Платежи", ""))
+            if not payments:
+                return {"error": f"⚠️ По сделке *{contract_number}* нет зарегистрированных платежей"}
+            if index > len(payments):
+                return {"error": (
+                    f"⚠️ Платёж №{index} не существует. Всего платежей: {len(payments)}"
+                )}
+
+            removed = payments.pop(index - 1)
+            total = _calc_total_amount(deal)
+            received = sum(p["amount"] for p in payments)
+            remainder = total - received
+
+            updates = {
+                "Платежи": _format_payments(payments),
+                "Получено": _num_for_sheet(received),
+                "Остаток": _num_for_sheet(remainder),
+            }
+
+            # Если статус был "завершена" и теперь остаток > 0 → возвращаем "активна"
+            current_status = (deal.get("Статус") or "").strip().lower()
+            status_msg = None
+            if current_status == "завершена" and remainder > 0.01:
+                updates["Статус"] = "активна"
+                status_msg = "Статус возвращён на «активна» (сделка больше не полностью оплачена)"
+
+            ok = await self.sheets.update_deal(contract_number, updates)
+            if not ok:
+                return {"error": f"⚠️ Не удалось обновить сделку {contract_number}"}
+
+            currency = (deal.get("currency") or "руб").strip()
+            lines = [
+                f"✅ Платёж №{index} удалён: {_fmt_money(removed['amount'])} {currency} "
+                f"от {removed['date']}"
+            ]
+            if status_msg:
+                lines.append(status_msg)
+            lines += [
+                "",
+                f"💰 Сумма договора: {_fmt_money(total)} {currency}",
+                f"📥 Получено: {_fmt_money(received)} {currency}",
+                f"⏳ Остаток: {_fmt_money(remainder)} {currency}",
+            ]
+            return {"message": "\n".join(lines)}
 
         return {"message": "Выполнено"}
 

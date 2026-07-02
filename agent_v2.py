@@ -40,6 +40,8 @@ TERMINAL_TOOLS = {
     "import_deal",
     "cancel_deal",
     "complete_deal",
+    "add_payment",       # результат уже содержит баланс, повторный вызов не нужен
+    "remove_payment",
 }
 
 # ── ContextVar-хранилище состояния, изолированное per-async-task ─────────
