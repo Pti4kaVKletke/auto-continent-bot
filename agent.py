@@ -792,7 +792,12 @@ VIN: ...
                             "drive_link": f_link,
                         })
 
-                if tool_result.get("buttons"):
+                if tool_result.get("error"):
+                    # Ошибка от инструмента (например, попытка создать сделку
+                    # с уже существующим номером). Показываем пользователю
+                    # напрямую — без "✅" префикса, текст уже содержит нужные значки.
+                    result["text"] += f"\n{tool_result['error']}"
+                elif tool_result.get("buttons"):
                     result["buttons"] = tool_result["buttons"]
                     if tool_result.get("message"):
                         result["text"] += f"\n{tool_result['message']}"
