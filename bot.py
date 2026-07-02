@@ -16,6 +16,9 @@ else:
     from agent import DocumentAgent
     logging.getLogger(__name__).info("Используется agent_v1")
 
+# Хелперы форматирования платежей (для локального рендера подменю оплат)
+from agent import _parse_payments, _calc_total_amount, _fmt_money
+
 import memory
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -560,6 +563,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("✏️ Изменить данные",   callback_data=f"dealaction:{num}:edit")],
                 [InlineKeyboardButton("📎 Загрузить скан",    callback_data=f"dealaction:{num}:scan"),
                  InlineKeyboardButton("🗂 Сканы",             callback_data=f"dealaction:{num}:scans")],
+                [InlineKeyboardButton("💳 Оплаты",            callback_data=f"dealaction:{num}:payments")],
                 [InlineKeyboardButton("✅ Завершить сделку",  callback_data=f"dealaction:{num}:complete")],
                 [InlineKeyboardButton("❌ Отменить сделку",   callback_data=f"dealaction:{num}:cancel")],
             ]
@@ -742,6 +746,99 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ]])
             )
 
+        # ── ОПЛАТЫ ────────────────────────────────────────────────────────
+        elif action == "payments":
+            deal = await agent.sheets.get_deal(num)
+            if not deal:
+                await query.edit_message_text(f"❌ Сделка {num} не найдена.")
+                return
+
+            payments = _parse_payments(deal.get("Платежи", ""))
+            total    = _calc_total_amount(deal)
+            received = sum(p["amount"] for p in payments)
+            remainder = total - received
+            currency = (deal.get("currency") or "руб").strip()
+
+            lines = [f"💳 *Оплаты по сделке {num}*", ""]
+            if not payments:
+                lines.append("_Поступлений ещё не было_")
+            else:
+                for i, p in enumerate(payments, 1):
+                    lines.append(f"  {i}. {_fmt_money(p['amount'])} {currency}  от  {p['date']}")
+            lines += [
+                "",
+                f"💰 Сумма договора: *{_fmt_money(total)}* {currency}",
+                f"📥 Получено: *{_fmt_money(received)}* {currency}",
+                f"⏳ Остаток: *{_fmt_money(remainder)}* {currency}",
+            ]
+
+            kb = [[InlineKeyboardButton("➕ Добавить оплату", callback_data=f"dealaction:{num}:pay_add")]]
+            if payments:
+                kb.append([InlineKeyboardButton("❌ Удалить оплату", callback_data=f"dealaction:{num}:pay_del")])
+            kb.append([InlineKeyboardButton("◀️ К сделке", callback_data=f"dealaction:{num}:menu")])
+
+            await query.edit_message_text(
+                "\n".join(lines),
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(kb),
+            )
+
+        elif action == "pay_add":
+            context.user_data["awaiting_payment_for_deal"] = num
+            await query.edit_message_text(
+                f"➕ *Добавить оплату по сделке {num}*\n\n"
+                "Напиши сумму и дату поступления одним сообщением.\n\n"
+                "Примеры:\n"
+                "• `500000 сегодня`\n"
+                "• `500000 01.07`\n"
+                "• `1500000 02.07.2026`",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("◀️ Отмена", callback_data=f"dealaction:{num}:payments")
+                ]]),
+            )
+
+        elif action == "pay_del":
+            deal = await agent.sheets.get_deal(num)
+            payments = _parse_payments(deal.get("Платежи", "")) if deal else []
+            if not payments:
+                await query.answer("Нет платежей для удаления", show_alert=True)
+                return
+
+            currency = (deal.get("currency") or "руб").strip()
+            kb = []
+            for i, p in enumerate(payments, 1):
+                label = f"❌ №{i}: {_fmt_money(p['amount'])} {currency} от {p['date']}"
+                kb.append([InlineKeyboardButton(label, callback_data=f"payrm:{num}:{i}")])
+            kb.append([InlineKeyboardButton("◀️ Назад", callback_data=f"dealaction:{num}:payments")])
+
+            await query.edit_message_text(
+                f"❌ *Удалить оплату по сделке {num}*\n\nВыбери платёж:",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(kb),
+            )
+
+    # ── Удаление конкретной оплаты по индексу ────────────────────────────────
+    elif data.startswith("payrm:"):
+        parts = data.split(":", 2)
+        if len(parts) == 3:
+            contract_number = parts[1]
+            try:
+                index = int(parts[2])
+            except ValueError:
+                await query.answer("Ошибка", show_alert=True)
+                return
+
+            await query.edit_message_text(f"⏳ Удаляю платёж №{index} из сделки {contract_number}...")
+            result = await typing_while(
+                update.effective_chat.id, context,
+                agent.process_message(
+                    f"удали платёж №{index} из сделки {contract_number}",
+                    chat_id=str(update.effective_chat.id),
+                ),
+            )
+            await send_result(query.message, result)
+
     # ── Смена реквизитов в существующей сделке ───────────────────────────────
     elif data.startswith("editbank:"):
         parts = data.split(":", 2)
@@ -838,6 +935,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user_text = update.message.text
     chat_id = str(update.effective_chat.id)
+
+    # ── Ожидание ввода суммы+даты для новой оплаты ──────────────────────────
+    if context.user_data.get("awaiting_payment_for_deal"):
+        contract_number = context.user_data.pop("awaiting_payment_for_deal")
+        result = await typing_while(
+            update.effective_chat.id, context,
+            agent.process_message(
+                f"добавь платёж по сделке {contract_number}: {user_text}",
+                chat_id=chat_id,
+            ),
+        )
+        await send_result(update.message, result, context=context, chat_id=chat_id)
+        return
 
     if context.user_data.get("awaiting_edit_deal"):
         contract_number = context.user_data.get("awaiting_edit_deal")
