@@ -835,6 +835,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 agent.process_message(
                     f"удали платёж №{index} из сделки {contract_number}",
                     chat_id=str(update.effective_chat.id),
+                    force_tool="remove_payment",   # защита от галлюцинации
                 ),
             )
             await send_result(query.message, result)
@@ -944,6 +945,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             agent.process_message(
                 f"добавь платёж по сделке {contract_number}: {user_text}",
                 chat_id=chat_id,
+                force_tool="add_payment",   # защита от галлюцинации: LLM обязана вызвать инструмент
             ),
         )
         await send_result(update.message, result, context=context, chat_id=chat_id)

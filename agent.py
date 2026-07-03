@@ -579,7 +579,9 @@ VIN: ...
 
         return base
 
-    async def process_message(self, user_text: str, filepath: str = None, filename: str = None, chat_id: str = "") -> dict:
+    async def process_message(self, user_text: str, filepath: str = None, filename: str = None, chat_id: str = "", force_tool: str = None) -> dict:
+        # force_tool игнорируется в v1 — параметр есть только для совместимости
+        # сигнатуры с v2; в v2 он форсирует конкретный tool_choice на первой итерации.
         self._current_chat_id = chat_id
         memory.add_to_history("user", user_text if not filepath else f"[файл: {filename}] {user_text}")
 

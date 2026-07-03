@@ -128,7 +128,16 @@ class DocumentAgent(_AgentV1):
         filepath: str = None,
         filename: str = None,
         chat_id: str = "",
+        force_tool: str = None,
     ) -> dict:
+        """
+        Обрабатывает сообщение через agentic loop.
+
+        force_tool: если задан — на ПЕРВОЙ итерации LLM обязана вызвать именно этот
+        инструмент (tool_choice type=tool). Защита от галлюцинации Haiku, когда
+        она пишет "успех" без реального вызова. Используется bot.py для гарантированных
+        путей (кнопка "Добавить оплату" → force_tool="add_payment").
+        """
         self._current_chat_id = chat_id
         memory.add_to_history(
             "user",
@@ -167,12 +176,23 @@ class DocumentAgent(_AgentV1):
         force_text_only = False   # если был terminal/button tool — следующий ход без tools
 
         for iteration in range(MAX_ITERATIONS):
+            # Определяем tool_choice для этой итерации:
+            # - force_text_only (после terminal или кнопок) → блокируем вызовы
+            # - force_tool на первой итерации → обязываем вызвать конкретный инструмент
+            # - иначе → LLM решает сама
+            if force_text_only:
+                tc = {"type": "none"}
+            elif force_tool and iteration == 0:
+                tc = {"type": "tool", "name": force_tool}
+            else:
+                tc = None
+
             response = await self._call_llm(
                 messages,
                 system_prompt,
                 tools,
                 iteration,
-                tool_choice=({"type": "none"} if force_text_only else None),
+                tool_choice=tc,
             )
             if response is None:
                 # Сетевая ошибка. Если уже что-то накопили — отдаём это,
