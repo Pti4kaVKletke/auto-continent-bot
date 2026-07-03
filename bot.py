@@ -373,9 +373,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             per_page = 5
 
             await query.edit_message_text("🔄 Загружаю активные сделки...")
-            deals = await agent.sheets.find_deal("активна")
-            # Фильтруем строго по статусу
-            deals = [d for d in deals if d.get("Статус", "").strip().lower() == "активна"]
+            # Пустой запрос вернёт все сделки, потом отфильтруем по статусу.
+            # Раньше передавали "активна" как поиск по подстроке — статус
+            # «ждём доплату» так не поймать, поэтому берём все и фильтруем.
+            deals = await agent.sheets.find_deal("")
+            deals = [
+                d for d in deals
+                if d.get("Статус", "").strip().lower() in ("активна", "ждём доплату")
+            ]
 
             if not deals:
                 await query.edit_message_text(
