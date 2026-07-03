@@ -46,11 +46,15 @@ def _parse_payments(text: str) -> list:
 
 
 def _format_payments(payments: list) -> str:
-    """Форматирует список платежей обратно в строку для хранения."""
+    """Форматирует список платежей обратно в строку для хранения.
+    Дробные суммы — с ',' (для русской локали Google Sheets)."""
     parts = []
     for p in payments:
         amount = p["amount"]
-        amount_str = f"{amount:.0f}" if amount == int(amount) else f"{amount:.2f}"
+        if amount == int(amount):
+            amount_str = f"{int(amount)}"
+        else:
+            amount_str = f"{amount:.2f}".replace(".", ",")
         parts.append(f"{amount_str} ({p['date']})")
     return "; ".join(parts)
 
@@ -88,8 +92,11 @@ def _calc_total_amount(deal: dict) -> float:
 
 
 def _num_for_sheet(x: float) -> str:
-    """Форматирует число для записи в Sheets: целое без .0, дробное с 2 знаками."""
-    return f"{x:.0f}" if x == int(x) else f"{x:.2f}"
+    """Форматирует число для записи в Google Sheets с русской локалью:
+    целое без .0, дробное с ',' в качестве десятичного разделителя."""
+    if x == int(x):
+        return f"{int(x)}"
+    return f"{x:.2f}".replace(".", ",")
 
 
 class DocumentAgent:
@@ -181,7 +188,7 @@ tpo_year        — год выдачи ТПО
 
 ФИНАНСЫ — ВАЖНО: это ДВЕ РАЗНЫЕ СУММЫ:
 car_price        — цена автомобиля в ДКП цифрами (например: 4200000). Валюта — рубли.
-car_price_words  — цена ДКП прописью (Четыре миллиона двести тысяч рублей)
+car_price_words  — цена ДКП прописью БЕЗ названия валюты (например "Четыре миллиона двести тысяч")
 currency         — валюта ДКП (рублей)
 cash_amount      — сумма наличных в Поручении цифрами (например: 54900). Это ДРУГАЯ сумма — в долларах!
 cash_amount_words — сумма наличных прописью БЕЗ валюты (Пятьдесят четыре тысячи девятьсот)
@@ -338,8 +345,25 @@ seller_name, seller_birth_date, seller_address, seller_id_number, seller_id_issu
   Позиции: 2=0, 3=5, 4=1, 5=2, 6=1, 7=9, 8=9, 9=8
   ДД=05, ММ=12, ГГГГ=1998 → seller_birth_date = "05.12.1998"
 
+- Пример 4: ИНН 20611200500576
+  Позиции: 2=0, 3=6, 4=1, 5=1, 6=2, 7=0, 8=0, 9=5
+  ДД=06, ММ=11, ГГГГ=2005 → seller_birth_date = "06.11.2005"
+
+- ⚠️ КРИТИЧНО ПРО ГОД: ГГГГ — это ПРОСТО 4 цифры на позициях 6,7,8,9, взятые в том
+  же порядке. НЕ МОДИФИЦИРУЙ их никак:
+  * НЕ добавляй "19" или "20" в начало (позиция 6 — это уже первая цифра года целиком)
+  * НЕ применяй логику "если год > текущего, то это 19XX"
+  * НЕ меняй порядок цифр
+  * Если цифры на позициях 6-9 = "2005" → год = 2005. Не 1920, не 2905. Ровно 2005.
+
 - ОБЯЗАТЕЛЬНАЯ ПРОВЕРКА: перед заполнением seller_birth_date напиши себе мысленно
   каждую цифру ИНН с её позицией (1,2,3...) и убедись что взял правильные позиции.
+
+- SANITY-CHECK ВОЗРАСТА: после вычисления даты рождения посчитай примерный возраст
+  (2026 − ГГГГ). Если возраст получается меньше 15 или больше 90 лет — с большой
+  вероятностью ты ошибся при чтении ИНН или при разборе цифр. В этом случае
+  ОБЯЗАТЕЛЬНО покажи пользователю ИНН и вычисленную дату с предупреждением, и
+  попроси перепроверить/ввести ИНН вручную. НЕ сохраняй такую дату без подтверждения.
 
 - ВАЖНО ПРО ТОЧНОСТЬ ИНН: OCR часто путает цифры в ИНН (например 3→1, 0→8, 6→5).
   Поэтому ВСЕГДА показывай пользователю ИНН который ты прочитал из документа и
@@ -375,7 +399,9 @@ seller_name, seller_birth_date, seller_address, seller_id_number, seller_id_issu
    - car_price   = цена в ДКП в РУБЛЯХ (например 4200000). Идёт только в ДКП.
    - cash_amount = сумма наличных которую агент передаёт продавцу в ДОЛЛАРАХ (например 54900). Идёт только в Поручение.
    - НИКОГДА не ставь car_price в поле cash_amount. Это всегда разные числа.
+   - car_price_words — цена ДКП прописью БЕЗ названия валюты (например "Два миллиона восемьсот пятьдесят восемь тысяч четыреста девяносто девять" — БЕЗ слова "рублей").
    - cash_amount_words — сумма прописью БЕЗ названия валюты. Только число словами: "Пятьдесят четыре тысячи девятьсот". Валюта указывается отдельно в поле cash_currency.
+   - ⚠️ ВАЖНО: обе суммы прописью (car_price_words и cash_amount_words) ты генерируешь САМА по числу — НЕ СПРАШИВАЙ их у пользователя. Валюту тоже НЕ ПИШИ в *_words.
 
 2. Если пользователь не назвал цвет автомобиля — обязательно спроси.
 3. Если пользователь не назвал сумму наличных (cash_amount) отдельно — спроси.
@@ -1460,7 +1486,8 @@ VIN: ...
             # Одна сделка — показываем нужный раздел
             if len(results) == 1:
                 r = results[0]
-                header = [f"📄 Сделка {_val(r, 'Номер договора')} от {_val(r, 'Дата договора')} [{_val(r, 'Статус')}]\n"]
+                num = _val(r, "Номер договора")
+                header = [f"📄 Сделка {num} от {_val(r, 'Дата договора')} [{_val(r, 'Статус')}]\n"]
 
                 section_map = {
                     "buyer":    _section_buyer,
@@ -1485,7 +1512,19 @@ VIN: ...
                         + [f"📁 Drive: {_val(r, 'Папка Drive')}",
                            f"💬 Комментарий: {_val(r, 'Комментарий')}"]
                     )
-                return {"message": "\n".join(lines)}
+
+                # Кнопки быстрого перехода. Для секции payments — путь в подменю
+                # оплат; для остальных — в общее меню сделки.
+                if section == "payments":
+                    buttons = [
+                        {"text": "➕ Добавить оплату", "callback_data": f"dealaction:{num}:pay_add"},
+                        {"text": "◀️ К сделке",         "callback_data": f"dealaction:{num}:menu"},
+                    ]
+                else:
+                    buttons = [
+                        {"text": "📋 Открыть меню сделки", "callback_data": f"dealaction:{num}:menu"},
+                    ]
+                return {"message": "\n".join(lines), "buttons": buttons}
 
             # Несколько сделок — краткий список
             lines = [f"🔍 Найдено сделок: {len(results)}\n"]
@@ -1650,7 +1689,13 @@ VIN: ...
                 f"📥 Получено: {_fmt_money(received)} {currency}",
                 f"⏳ Остаток: {_fmt_money(remainder)} {currency}",
             ]
-            return {"message": "\n".join(lines)}
+            return {
+                "message": "\n".join(lines),
+                "buttons": [
+                    {"text": "💳 К оплатам",  "callback_data": f"dealaction:{contract_number}:payments"},
+                    {"text": "◀️ К сделке",    "callback_data": f"dealaction:{contract_number}:menu"},
+                ],
+            }
 
         elif tool_name == "remove_payment":
             contract_number = (tool_input.get("contract_number") or "").strip()
@@ -1712,7 +1757,13 @@ VIN: ...
                 f"📥 Получено: {_fmt_money(received)} {currency}",
                 f"⏳ Остаток: {_fmt_money(remainder)} {currency}",
             ]
-            return {"message": "\n".join(lines)}
+            return {
+                "message": "\n".join(lines),
+                "buttons": [
+                    {"text": "💳 К оплатам",  "callback_data": f"dealaction:{contract_number}:payments"},
+                    {"text": "◀️ К сделке",    "callback_data": f"dealaction:{contract_number}:menu"},
+                ],
+            }
 
         return {"message": "Выполнено"}
 

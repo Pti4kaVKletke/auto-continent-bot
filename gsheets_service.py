@@ -202,11 +202,11 @@ class GoogleSheetsService:
                 elif col == "Дата договора":
                     row.append(contract_date)
                 elif col == "Сумма Договора":
-                    row.append(f"{total_sum:.2f}" if total_sum > 0 else "")
+                    row.append(f"{total_sum:.2f}".replace(".", ",") if total_sum > 0 else "")
                 elif col == "Статус":
                     row.append("активна")
                 elif col == "Комиссия %":
-                    row.append(str(commission_pct))
+                    row.append(str(commission_pct).replace(".", ","))
                 elif col == "Папка Drive":
                     row.append(drive_folder_link)
                 elif col == "Комментарий":
@@ -313,7 +313,7 @@ class GoogleSheetsService:
                     price_val = float(str(current_row[price_idx]).replace(" ", "").replace(",", "."))
                     comm_pct  = float(str(current_row[comm_idx] or "1").replace(",", "."))
                     total_sum = round(price_val * (1 + comm_pct / 100), 2)
-                    current_row[sum_idx] = f"{total_sum:.2f}" if total_sum > 0 else ""
+                    current_row[sum_idx] = f"{total_sum:.2f}".replace(".", ",") if total_sum > 0 else ""
                 except Exception as e:
                     logger.warning(f"Не удалось пересчитать сумму договора: {e}")
 
