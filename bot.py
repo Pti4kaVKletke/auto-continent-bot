@@ -2,6 +2,7 @@ import os
 import logging
 import asyncio
 import random
+import re
 import time
 from pathlib import Path
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -25,6 +26,40 @@ logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=lo
 logger = logging.getLogger(__name__)
 
 agent = DocumentAgent()
+
+
+# ─── ДЕТЕКТОР КОМАНД ─────────────────────────────────────────────────────────
+# Защита от галлюцинации Haiku в v2 на свободных текстовых командах.
+# Если пользователь пишет "добавь оплату N к сделке NNN" — LLM иногда просто
+# сочиняет ответ вместо реального вызова add_payment. Здесь мы явно детектим
+# намерение и через force_tool обязываем LLM вызвать конкретный инструмент.
+
+_DEAL_NUM_RE = re.compile(r"\b\d{9}\b")
+_PAY_ADD_RE  = re.compile(
+    r"(?:добав\S*|запиш\S*|внес\S*|провед\S*)\s+.*?(?:оплат|плат|поступлен)"
+    r"|(?:пришл\S*|поступил\S*)\s+.*?\d",
+    re.IGNORECASE,
+)
+_PAY_DEL_RE  = re.compile(
+    r"(?:удал\S*|убер\S*|отмен\S*)\s+.*?(?:оплат|плат|поступлен)",
+    re.IGNORECASE,
+)
+
+
+def _detect_forced_tool(text: str) -> str:
+    """Возвращает имя инструмента для форсирования или None.
+
+    Работает только когда в тексте есть номер сделки (9 цифр) — иначе LLM
+    сама решит нужен ли инструмент. Разделяем добавление и удаление платежа
+    по глаголу.
+    """
+    if not _DEAL_NUM_RE.search(text):
+        return None
+    if _PAY_DEL_RE.search(text):
+        return "remove_payment"
+    if _PAY_ADD_RE.search(text):
+        return "add_payment"
+    return None
 
 # ─── КОНТРОЛЬ ДОСТУПА ────────────────────────────────────────────────────────
 
@@ -1064,13 +1099,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message_to_agent = user_text
     if current_deal and len(user_text) < 200:
         # Если в тексте уже есть номер сделки (6+ цифр) — оставляем как есть
-        import re
         if not re.search(r"\d{6,}", user_text):
             message_to_agent = f"{user_text} (контекст: сделка {current_deal})"
 
+    # Детекция команд платежей → форсим tool_choice, чтобы LLM не галлюцинировала
+    forced = _detect_forced_tool(message_to_agent)
+    if forced:
+        logger.info(f"[detector] Обнаружена команда → force_tool={forced}")
+
     result = await typing_while(
         update.effective_chat.id, context,
-        agent.process_message(message_to_agent, chat_id=chat_id)
+        agent.process_message(message_to_agent, chat_id=chat_id, force_tool=forced)
     )
     await send_result(update.message, result, context=context, chat_id=str(update.effective_chat.id))
 
