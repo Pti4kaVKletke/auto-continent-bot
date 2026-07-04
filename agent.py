@@ -1666,74 +1666,15 @@ VIN: ...
             }
 
         elif tool_name == "add_payment":
-            contract_number = (tool_input.get("contract_number") or "").strip()
-            amount_in = tool_input.get("amount")
-            date = (tool_input.get("date") or "").strip()
-
-            if not contract_number:
-                return {"error": "⚠️ Не указан номер сделки"}
-            if not re.match(r"^\d{2}\.\d{2}\.\d{4}$", date):
-                return {"error": f"⚠️ Неверный формат даты: «{date}». Ожидается ДД.ММ.ГГГГ"}
-            try:
-                amount = float(amount_in)
-                if amount <= 0:
-                    raise ValueError
-            except (TypeError, ValueError):
-                return {"error": f"⚠️ Неверная сумма: «{amount_in}». Должно быть положительное число"}
-
-            deal = await self.sheets.get_deal(contract_number)
-            if not deal:
-                return {"error": f"⚠️ Сделка *{contract_number}* не найдена в журнале"}
-
-            payments = _parse_payments(deal.get("Платежи", ""))
-            payments.append({"amount": amount, "date": date})
-
-            total = _calc_total_amount(deal)
-            received = sum(p["amount"] for p in payments)
-            remainder = total - received
-
-            updates = {
-                "Платежи": _format_payments(payments),
-                "Получено": _num_for_sheet(received),
-                "Остаток": _num_for_sheet(remainder),
-            }
-
-            # Автоматическая смена статуса в зависимости от баланса:
-            #   остаток ≤ 0                   → «завершена»
-            #   остаток > 0 и есть платежи   → «ждём доплату»
-            # Не трогаем «отменена» и «черновик» — их не переопределяем автоматом.
-            current_status = (deal.get("Статус") or "").strip().lower()
-            status_msg = None
-            if current_status in ("отменена", "черновик"):
-                pass  # автомат не трогает эти статусы
-            elif remainder <= 0.01 and current_status != "завершена":
-                updates["Статус"] = "завершена"
-                status_msg = "🎉 Сделка полностью оплачена — статус сменён на «завершена»"
-            elif remainder > 0.01 and payments and current_status != "ждём доплату":
-                updates["Статус"] = "ждём доплату"
-                status_msg = "⏳ Статус изменён на «ждём доплату»"
-
-            ok = await self.sheets.update_deal(contract_number, updates)
-            if not ok:
-                return {"error": f"⚠️ Не удалось обновить сделку {contract_number}"}
-
-            currency = (deal.get("currency") or "руб").strip()
-            lines = [f"✅ Платёж №{len(payments)} записан: {_fmt_money(amount)} {currency} от {date}"]
-            if status_msg:
-                lines.append(status_msg)
-            lines += [
-                "",
-                f"💰 Сумма договора: {_fmt_money(total)} {currency}",
-                f"📥 Получено: {_fmt_money(received)} {currency}",
-                f"⏳ Остаток: {_fmt_money(remainder)} {currency}",
-            ]
-            return {
-                "message": "\n".join(lines),
-                "buttons": [
-                    {"text": "💳 К оплатам",  "callback_data": f"dealaction:{contract_number}:payments"},
-                    {"text": "◀️ К сделке",    "callback_data": f"dealaction:{contract_number}:menu"},
-                ],
-            }
+            # Логика вынесена в публичный метод add_payment_impl —
+            # bot.py тоже может его вызвать напрямую (с force=True после
+            # подтверждения кнопкой "Всё равно добавить" при переоплате).
+            return await self.add_payment_impl(
+                contract_number=(tool_input.get("contract_number") or "").strip(),
+                amount_in=tool_input.get("amount"),
+                date=(tool_input.get("date") or "").strip(),
+                force=False,
+            )
 
         elif tool_name == "remove_payment":
             contract_number = (tool_input.get("contract_number") or "").strip()
@@ -1854,6 +1795,127 @@ VIN: ...
         prompt = user_text or "Извлеки все данные из этого документа: реквизиты, данные об автомобиле, суммы."
         content.append({"type": "text", "text": prompt})
         return content
+
+    async def add_payment_impl(
+        self,
+        contract_number: str,
+        amount_in,
+        date: str,
+        force: bool = False,
+    ) -> dict:
+        """Добавляет платёж по сделке.
+
+        Единая точка входа для добавления платежа. Вызывается:
+          • из _execute_tool при tool_name == "add_payment" (LLM) — force=False
+          • из bot.py при подтверждении переоплаты кнопкой — force=True
+
+        При force=False и превышении остатка (сумма платежа > остатка) —
+        возвращает предупреждение с кнопкой «Всё равно добавить». При force=True
+        добавляет платёж независимо от суммы.
+        """
+        contract_number = (contract_number or "").strip()
+        date = (date or "").strip()
+
+        if not contract_number:
+            return {"error": "⚠️ Не указан номер сделки"}
+        if not re.match(r"^\d{2}\.\d{2}\.\d{4}$", date):
+            return {"error": f"⚠️ Неверный формат даты: «{date}». Ожидается ДД.ММ.ГГГГ"}
+        try:
+            amount = float(amount_in)
+            if amount <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            return {"error": f"⚠️ Неверная сумма: «{amount_in}». Должно быть положительное число"}
+
+        deal = await self.sheets.get_deal(contract_number)
+        if not deal:
+            return {"error": f"⚠️ Сделка *{contract_number}* не найдена в журнале"}
+
+        currency = (deal.get("currency") or "руб").strip()
+        payments_before = _parse_payments(deal.get("Платежи", ""))
+        total = _calc_total_amount(deal)
+        received_before = sum(p["amount"] for p in payments_before)
+        remainder_before = total - received_before
+
+        # ── Защита от переоплаты ──────────────────────────────────────────
+        # Если платёж превышает остаток и не форс — блокируем и просим
+        # подтверждение через кнопку. Толерантность 0.01 — на случай флоатов.
+        if not force and amount > remainder_before + 0.01:
+            over_by = amount - remainder_before
+            lines = [
+                f"⚠️ *ПЕРЕОПЛАТА по сделке {contract_number}*",
+                "",
+                f"Платёж: *{_fmt_money(amount)}* {currency} от {date}",
+                f"Остаток к оплате: *{_fmt_money(remainder_before)}* {currency}",
+                f"Превышение: *{_fmt_money(over_by)}* {currency}",
+                "",
+                f"💰 Сумма договора: {_fmt_money(total)} {currency}",
+                f"📥 Уже получено: {_fmt_money(received_before)} {currency}",
+                "",
+                "Всё равно добавить?",
+            ]
+            return {
+                "message": "\n".join(lines),
+                "buttons": [
+                    {"text": "✅ Всё равно добавить", "callback_data": "payforce:confirm"},
+                    {"text": "◀️ Отмена",             "callback_data": f"dealaction:{contract_number}:payments"},
+                ],
+                # Специальное поле — bot.py его читает в send_result и сохраняет
+                # в user_data для последующего клика "Всё равно добавить".
+                "overpay_pending": {
+                    "contract_number": contract_number,
+                    "amount": amount,
+                    "date": date,
+                },
+            }
+
+        # ── Штатное добавление ────────────────────────────────────────────
+        payments = payments_before + [{"amount": amount, "date": date}]
+        received = sum(p["amount"] for p in payments)
+        remainder = total - received
+
+        updates = {
+            "Платежи": _format_payments(payments),
+            "Получено": _num_for_sheet(received),
+            "Остаток": _num_for_sheet(remainder),
+        }
+
+        # Автосмена статуса. Отменённые и черновики автомат не трогает.
+        current_status = (deal.get("Статус") or "").strip().lower()
+        status_msg = None
+        if current_status in ("отменена", "черновик"):
+            pass
+        elif remainder <= 0.01 and current_status != "завершена":
+            updates["Статус"] = "завершена"
+            status_msg = "🎉 Сделка полностью оплачена — статус сменён на «завершена»"
+        elif remainder > 0.01 and payments and current_status != "ждём доплату":
+            updates["Статус"] = "ждём доплату"
+            status_msg = "⏳ Статус изменён на «ждём доплату»"
+
+        ok = await self.sheets.update_deal(contract_number, updates)
+        if not ok:
+            return {"error": f"⚠️ Не удалось обновить сделку {contract_number}"}
+
+        header = f"✅ Платёж №{len(payments)} записан: {_fmt_money(amount)} {currency} от {date}"
+        if force and amount > remainder_before + 0.01:
+            header = f"⚠️ Платёж №{len(payments)} записан (с переоплатой): {_fmt_money(amount)} {currency} от {date}"
+
+        lines = [header]
+        if status_msg:
+            lines.append(status_msg)
+        lines += [
+            "",
+            f"💰 Сумма договора: {_fmt_money(total)} {currency}",
+            f"📥 Получено: {_fmt_money(received)} {currency}",
+            f"⏳ Остаток: {_fmt_money(remainder)} {currency}",
+        ]
+        return {
+            "message": "\n".join(lines),
+            "buttons": [
+                {"text": "💳 К оплатам", "callback_data": f"dealaction:{contract_number}:payments"},
+                {"text": "◀️ К сделке",   "callback_data": f"dealaction:{contract_number}:menu"},
+            ],
+        }
 
     async def process_file(self, filepath: str, filename: str, caption: str = "", chat_id: str = "") -> dict:
         return await self.process_message(

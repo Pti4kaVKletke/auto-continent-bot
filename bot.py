@@ -215,6 +215,12 @@ async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def send_result(message, result: dict, context=None, chat_id=None):
     """Отправляет файлы и текст результата."""
+    # Пробрасываем данные ожидающего действия в user_data:
+    # add_payment_impl при переоплате возвращает overpay_pending — bot.py
+    # сохранит его для callback "payforce:confirm" (кнопка «Всё равно добавить»).
+    if context is not None and result.get("overpay_pending"):
+        context.user_data["overpay_pending"] = result["overpay_pending"]
+
     if result.get("files"):
         for f_info in result["files"]:
             try:
@@ -878,7 +884,30 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     force_tool="remove_payment",   # защита от галлюцинации
                 ),
             )
-            await send_result(query.message, result)
+            await send_result(query.message, result, context=context)
+
+    # ── Подтверждение переоплаты («Всё равно добавить» после блокировки) ─────
+    elif data == "payforce:confirm":
+        pending = context.user_data.pop("overpay_pending", None)
+        if not pending:
+            await query.answer("Данные ожидания утеряны, попробуйте добавить оплату заново", show_alert=True)
+            return
+
+        contract_number = pending["contract_number"]
+        await query.edit_message_text(
+            f"⏳ Добавляю платёж с переоплатой в сделку {contract_number}..."
+        )
+        # Вызываем метод напрямую с force=True — обход блокировки переоплаты.
+        result = await typing_while(
+            update.effective_chat.id, context,
+            agent.add_payment_impl(
+                contract_number=contract_number,
+                amount_in=pending["amount"],
+                date=pending["date"],
+                force=True,
+            ),
+        )
+        await send_result(query.message, result, context=context)
 
     # ── Смена реквизитов в существующей сделке ───────────────────────────────
     elif data.startswith("editbank:"):
