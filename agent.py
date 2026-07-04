@@ -78,17 +78,24 @@ def _calc_total_amount(deal: dict) -> float:
     fallback: car_price + car_price * commission/100 (для старых сделок или
     ручных правок, где сумма могла быть стёрта).
     """
-    def _num(v):
-        try:
-            return float(str(v).replace(",", ".").replace(" ", ""))
-        except (TypeError, ValueError):
-            return 0.0
     stored = _num(deal.get("Сумма Договора", 0))
     if stored > 0:
         return stored
     price = _num(deal.get("car_price", 0))
     commission = _num(deal.get("Комиссия %", 0))
     return price + price * commission / 100.0
+
+
+def _num(v) -> float:
+    """Парсит число из значения (в т.ч. с запятой как десятичным разделителем).
+
+    Возвращает 0.0 если распарсить не удалось. Умеет читать русский формат
+    хранения в Sheets: '1,0' → 1.0, '3 000 631,20' → 3000631.2.
+    """
+    try:
+        return float(str(v).replace(",", ".").replace(" ", ""))
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _num_for_sheet(x: float) -> str:
@@ -1205,7 +1212,8 @@ VIN: ...
                 ]
                 data           = {k: deal.get(k, "") for k in REQUIRED_KEYS}
                 contract_date  = deal.get("Дата договора", datetime.now().strftime("%d.%m.%Y"))
-                commission_pct = float(deal.get("Комиссия %", 1.0) or 1.0)
+                # _num умеет читать значения с запятой (русская локаль Sheets: "1,0" → 1.0)
+                commission_pct = _num(deal.get("Комиссия %", "1")) or 1.0
 
             deal_folder_id = await self.drive.get_or_create_deal_folder(contract_number)
             skip_pdf = os.environ.get("SKIP_PDF", "0") == "1"
@@ -1363,7 +1371,7 @@ VIN: ...
                     missing.append(f"  — {label} ({key})")
 
             contract_date = deal.get("Дата договора", "")
-            commission_pct = float(deal.get("Комиссия %", 1.0) or 1.0)
+            commission_pct = _num(deal.get("Комиссия %", "1")) or 1.0
 
             if missing:
                 lines = [
