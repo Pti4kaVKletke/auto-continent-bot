@@ -437,16 +437,31 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
 
         elif action == "stats":
-            await query.edit_message_text("📊 Считаю статистику...")
-            result = await typing_while(
-                update.effective_chat.id, context,
-                agent.process_message("покажи статистику сделок за этот месяц", chat_id=str(update.effective_chat.id))
-            )
-            await query.message.reply_text(
-                result.get("text") or "Нет данных.",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("◀️ Меню", callback_data="menu:back")
-                ]])
+            # Подменю выбора периода. Сам расчёт — в обработчике "stats:<period>".
+            kb = [
+                [
+                    InlineKeyboardButton("📅 Сегодня", callback_data="stats:today"),
+                    InlineKeyboardButton("📅 Вчера",   callback_data="stats:yesterday"),
+                ],
+                [
+                    InlineKeyboardButton("📅 Неделя",  callback_data="stats:week"),
+                    InlineKeyboardButton("📅 Месяц",   callback_data="stats:month"),
+                ],
+                [
+                    InlineKeyboardButton("📅 Квартал", callback_data="stats:quarter"),
+                    InlineKeyboardButton("📅 Год",     callback_data="stats:year"),
+                ],
+                [
+                    InlineKeyboardButton("📊 Всё время", callback_data="stats:all"),
+                ],
+                [
+                    InlineKeyboardButton("◀️ Меню", callback_data="menu:back"),
+                ],
+            ]
+            await query.edit_message_text(
+                "📊 *Статистика*\n\nВыбери период:",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(kb),
             )
 
         elif action == "bank_profiles":
@@ -497,6 +512,41 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="MarkdownV2",
                 reply_markup=main_menu_keyboard(),
             )
+        return
+
+    # ── Статистика по периоду ────────────────────────────────────────────────
+    if data.startswith("stats:"):
+        period = data.split(":", 1)[1]
+        period_label = {
+            "today":     "сегодня",
+            "yesterday": "вчера",
+            "week":      "неделю",
+            "month":     "месяц",
+            "quarter":   "квартал",
+            "year":      "год",
+            "all":       "всё время",
+        }.get(period, period)
+        await query.edit_message_text(f"📊 Считаю статистику за {period_label}...")
+
+        # Вызываем инструмент напрямую через _execute_tool — избегаем LLM для
+        # детерминированной операции (нет расхода токенов, нет риска галлюцинации,
+        # мгновенный ответ).
+        try:
+            result = await agent._execute_tool("get_statistics", {"period": period})
+        except Exception as e:
+            logger.error(f"Ошибка вычисления статистики: {e}", exc_info=True)
+            result = {"error": f"⚠️ Ошибка: {e}"}
+
+        text = result.get("message") or result.get("error") or "Нет данных."
+        kb = [
+            [InlineKeyboardButton("◀️ К периодам", callback_data="menu:stats")],
+            [InlineKeyboardButton("◀️ Меню",        callback_data="menu:back")],
+        ]
+        await query.edit_message_text(
+            text,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb),
+        )
         return
 
     # ── Выбор даты ────────────────────────────────────────────────────────────

@@ -106,6 +106,234 @@ def _num_for_sheet(x: float) -> str:
     return f"{x:.2f}".replace(".", ",")
 
 
+# ══ СТАТИСТИКА ПО ЖУРНАЛУ СДЕЛОК ═════════════════════════════════════════
+
+def _parse_date_ddmmyyyy(s: str):
+    """Парсит ДД.ММ.ГГГГ → datetime.date или None."""
+    if not s:
+        return None
+    try:
+        return datetime.strptime(str(s).strip(), "%d.%m.%Y").date()
+    except (ValueError, TypeError):
+        return None
+
+
+def _resolve_period(period: str, date_from: str = "", date_to: str = ""):
+    """По названию периода возвращает (date_from, date_to, label) — обе даты
+    в формате datetime.date включительно. Для 'all' возвращает (None, None, ...).
+    Для 'custom' парсит date_from / date_to (ДД.ММ.ГГГГ).
+    """
+    from datetime import date, timedelta
+    today = date.today()
+    p = (period or "month").lower().strip()
+
+    if p == "today":
+        return today, today, "сегодня"
+    if p == "yesterday":
+        y = today - timedelta(days=1)
+        return y, y, "вчера"
+    if p == "week":
+        start = today - timedelta(days=today.weekday())
+        return start, today, "текущая неделя"
+    if p == "month":
+        start = today.replace(day=1)
+        _MONTHS_RU = ["январь","февраль","март","апрель","май","июнь",
+                      "июль","август","сентябрь","октябрь","ноябрь","декабрь"]
+        return start, today, f"{_MONTHS_RU[start.month - 1]} {start.year}"
+    if p == "quarter":
+        q_start_month = ((today.month - 1) // 3) * 3 + 1
+        start = today.replace(month=q_start_month, day=1)
+        return start, today, f"квартал {(q_start_month - 1) // 3 + 1} / {today.year}"
+    if p == "year":
+        start = today.replace(month=1, day=1)
+        return start, today, f"{today.year} год"
+    if p == "custom":
+        df = _parse_date_ddmmyyyy(date_from)
+        dt = _parse_date_ddmmyyyy(date_to) or today
+        label = f"{df.strftime('%d.%m.%Y') if df else '…'} — {dt.strftime('%d.%m.%Y')}"
+        return df, dt, label
+    # all / любое неизвестное
+    return None, None, "всё время"
+
+
+def _in_period(d, df, dt) -> bool:
+    """True если дата d попадает в [df; dt] включительно.
+    df/dt=None означает «без ограничения» с соответствующей стороны."""
+    if d is None:
+        return False
+    if df and d < df:
+        return False
+    if dt and d > dt:
+        return False
+    return True
+
+
+def _calc_stats(deals: list, period: str = "month",
+                date_from: str = "", date_to: str = "") -> dict:
+    """Считает сводку по журналу сделок за период.
+
+    Группирует ДВУМЯ способами:
+      • по «Дате договора» — «сделки за период»
+      • по датам платежей   — «деньги за период»
+    Отменённые сделки исключаются из финансов, но показываются в счётчике статусов.
+
+    Возвращает dict со всеми числами и человекочитаемыми полями.
+    """
+    df, dt, label = _resolve_period(period, date_from, date_to)
+
+    # Счётчики по всей выборке (без учёта периода) — для контекста
+    status_counter = {}
+    for d in deals:
+        st = (d.get("Статус") or "—").strip().lower() or "—"
+        status_counter[st] = status_counter.get(st, 0) + 1
+
+    # ── Группировка А: сделки, у которых Дата договора попала в период ─
+    by_contract = [
+        d for d in deals
+        if _in_period(_parse_date_ddmmyyyy(d.get("Дата договора")), df, dt)
+    ]
+    active_contract = [
+        d for d in by_contract
+        if (d.get("Статус") or "").strip().lower() != "отменена"
+    ]
+    contract_status_counter = {}
+    for d in by_contract:
+        st = (d.get("Статус") or "—").strip().lower() or "—"
+        contract_status_counter[st] = contract_status_counter.get(st, 0) + 1
+
+    contract_sum   = sum(_calc_total_amount(d) for d in active_contract)
+    price_sum      = sum(_num(d.get("car_price", 0)) for d in active_contract)
+    commission_sum = contract_sum - price_sum  # комиссия агента = разница
+
+    # Получено и остаток по СДЕЛКАМ ПЕРИОДА (не по платежам периода)
+    received_by_contract = 0.0
+    for d in active_contract:
+        received_by_contract += sum(p["amount"] for p in _parse_payments(d.get("Платежи", "")))
+    remainder_by_contract = contract_sum - received_by_contract
+
+    avg_ticket = contract_sum / len(active_contract) if active_contract else 0.0
+
+    # ── Группировка Б: платежи, попавшие в период ──────────────────────
+    payments_in_period = []       # [(deal, payment_dict), ...]
+    for d in deals:
+        if (d.get("Статус") or "").strip().lower() == "отменена":
+            continue
+        for p in _parse_payments(d.get("Платежи", "")):
+            pd = _parse_date_ddmmyyyy(p.get("date"))
+            if _in_period(pd, df, dt):
+                payments_in_period.append((d, p))
+
+    payments_sum   = sum(p["amount"] for _, p in payments_in_period)
+    payments_count = len(payments_in_period)
+    unique_deals_paid = len({d.get("Номер договора") for d, _ in payments_in_period})
+
+    # Определяем «главную» валюту периода — берём самую частую среди активных
+    curr_counter = {}
+    for d in active_contract:
+        c = (d.get("currency") or "руб").strip() or "руб"
+        curr_counter[c] = curr_counter.get(c, 0) + 1
+    for d, _ in payments_in_period:
+        c = (d.get("currency") or "руб").strip() or "руб"
+        curr_counter[c] = curr_counter.get(c, 0) + 1
+    main_currency = max(curr_counter, key=curr_counter.get) if curr_counter else "руб"
+
+    return {
+        "period_label":   label,
+        "date_from":      df.strftime("%d.%m.%Y") if df else None,
+        "date_to":        dt.strftime("%d.%m.%Y") if dt else None,
+        "currency":       main_currency,
+        # По дате договора
+        "contract_count":         len(by_contract),
+        "contract_active_count":  len(active_contract),
+        "contract_status":        contract_status_counter,
+        "contract_sum":           contract_sum,
+        "price_sum":              price_sum,
+        "commission_sum":         commission_sum,
+        "received_by_contract":   received_by_contract,
+        "remainder_by_contract":  remainder_by_contract,
+        "avg_ticket":             avg_ticket,
+        # По дате платежа
+        "payments_sum":           payments_sum,
+        "payments_count":         payments_count,
+        "unique_deals_paid":      unique_deals_paid,
+        # Общий срез журнала
+        "total_deals_all_time":   len(deals),
+        "status_counter_all":     status_counter,
+    }
+
+
+def _format_stats(stats: dict) -> str:
+    """Форматирует результат _calc_stats в компактный markdown-отчёт."""
+    c = stats["currency"]
+
+    def m(x):
+        return f"{_fmt_money(x)} {c}"
+
+    lines = [
+        f"📊 *Статистика · {stats['period_label']}*",
+    ]
+    if stats["date_from"] and stats["date_to"]:
+        lines.append(f"_{stats['date_from']} — {stats['date_to']}_")
+    lines.append("")
+
+    # ── СДЕЛКИ ЗА ПЕРИОД (по дате договора) ──────────────────────────
+    lines += [
+        "📄 *Сделки за период* (по дате договора)",
+        f"  Всего заключено: *{stats['contract_count']}*",
+    ]
+    if stats["contract_status"]:
+        status_order = ["черновик", "активна", "ждём доплату", "завершена", "отменена"]
+        parts = []
+        for st in status_order:
+            n = stats["contract_status"].get(st, 0)
+            if n:
+                parts.append(f"{st}: {n}")
+        # Остальные статусы (если вдруг появятся новые)
+        for st, n in stats["contract_status"].items():
+            if st not in status_order and n:
+                parts.append(f"{st}: {n}")
+        if parts:
+            lines.append("  " + " · ".join(parts))
+
+    lines += [
+        "",
+        f"  💰 Сумма договоров: *{m(stats['contract_sum'])}*",
+        f"  🚗 Стоимость авто:  {m(stats['price_sum'])}",
+        f"  💼 Комиссия агента: *{m(stats['commission_sum'])}*",
+        f"  📥 Получено:        {m(stats['received_by_contract'])}",
+        f"  ⏳ Остаток:          {m(stats['remainder_by_contract'])}",
+    ]
+    if stats["contract_active_count"]:
+        lines.append(f"  📊 Средний чек:      {m(stats['avg_ticket'])}")
+    lines.append("_Отменённые исключены из финансов._")
+
+    # ── ПЛАТЕЖИ ЗА ПЕРИОД (по дате поступления) ──────────────────────
+    lines += [
+        "",
+        "💳 *Платежи за период* (по дате поступления)",
+        f"  Поступлений: *{stats['payments_count']}* на *{m(stats['payments_sum'])}*",
+    ]
+    if stats["unique_deals_paid"]:
+        lines.append(f"  Затрагивают сделок: {stats['unique_deals_paid']}")
+
+    # ── Контекст: срез всего журнала ─────────────────────────────────
+    lines += [
+        "",
+        f"📚 _Всего в журнале: {stats['total_deals_all_time']} сделок_",
+    ]
+    if stats["status_counter_all"]:
+        status_order = ["черновик", "активна", "ждём доплату", "завершена", "отменена"]
+        all_parts = []
+        for st in status_order:
+            n = stats["status_counter_all"].get(st, 0)
+            if n:
+                all_parts.append(f"{st}: {n}")
+        if all_parts:
+            lines.append("_" + " · ".join(all_parts) + "_")
+
+    return "\n".join(lines)
+
+
 class DocumentAgent:
 
     def __init__(self):
@@ -130,6 +358,7 @@ class DocumentAgent:
 - update_deal      — обновить данные сделки в журнале и при необходимости перегенерировать документы
 - cancel_deal      — отменить сделку (пометить как отменённую, не удалять)
 - complete_deal    — завершить сделку (деньги получены, авто передано)
+- get_statistics   — сводная статистика по журналу за период (сегодня/неделя/месяц/квартал/год/всё)
 - save_company     — сохранить реквизиты компании/клиента в постоянную память
 - save_instruction — сохранить инструкцию для себя
 
@@ -138,6 +367,7 @@ class DocumentAgent:
 Когда пользователь скидывает документ существующей сделки для занесения в журнал — используй import_deal.
 Когда пользователь пишет "проверь сделку", "создай документы для сделки из таблицы", "сделай договор по строке" — используй check_deal.
 Когда пользователь нажал кнопку выбора документов (пришло сообщение "Создай документы для сделки X, тип: Y") — используй generate_docs с contract_number=X и doc_type=Y.
+Когда пользователь спрашивает про статистику, отчёты, объёмы, итоги, средний чек, сколько сделок/денег/комиссии за период — ВСЕГДА вызывай get_statistics. НЕ считай агрегированные цифры в уме и не отвечай "у меня нет инструмента".
 
 === ПРОВЕРКА И СОЗДАНИЕ ДОКУМЕНТОВ ИЗ ТАБЛИЦЫ ===
 
@@ -954,6 +1184,43 @@ VIN: ...
                     "required": ["contract_number", "index"],
                 },
             },
+            {
+                "name": "get_statistics",
+                "description": (
+                    "Показать сводную статистику по журналу сделок за период. "
+                    "Возвращает: количество сделок с разбивкой по статусам, сумму договоров, "
+                    "стоимость авто, комиссию агента, получено и остаток к получению, средний чек, "
+                    "объём платежей за период и общий срез журнала. "
+                    "Отменённые сделки исключаются из финансовых сумм, но учитываются в счётчиках. "
+                    "Используй когда пользователь спрашивает: «сколько сделок за месяц», "
+                    "«сколько денег получили», «какая комиссия за квартал», «статистика за июль», "
+                    "«итоги года», «отчёт за неделю», «сколько активных сделок» и т.п. "
+                    "Не считай статистику в уме — всегда вызывай этот инструмент."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "period": {
+                            "type": "string",
+                            "description": (
+                                "Период: today (сегодня), yesterday (вчера), week (текущая неделя), "
+                                "month (текущий месяц), quarter (текущий квартал), year (текущий год), "
+                                "all (всё время), custom (указать date_from и date_to). "
+                                "По умолчанию month."
+                            ),
+                        },
+                        "date_from": {
+                            "type": "string",
+                            "description": "Начало периода в формате ДД.ММ.ГГГГ (только для period=custom)",
+                        },
+                        "date_to": {
+                            "type": "string",
+                            "description": "Конец периода в формате ДД.ММ.ГГГГ (только для period=custom)",
+                        },
+                    },
+                    "required": [],
+                },
+            },
         ]
 
     async def _handle_response(self, response) -> dict:
@@ -1755,6 +2022,24 @@ VIN: ...
                     {"text": "◀️ К сделке",    "callback_data": f"dealaction:{contract_number}:menu"},
                 ],
             }
+
+        elif tool_name == "get_statistics":
+            period    = (tool_input.get("period") or "month").strip()
+            date_from = (tool_input.get("date_from") or "").strip()
+            date_to   = (tool_input.get("date_to") or "").strip()
+
+            deals = await self.sheets.get_all_deals()
+            if not deals:
+                return {"message": "📊 Журнал сделок пуст — статистику считать не по чему."}
+
+            try:
+                stats = _calc_stats(deals, period=period, date_from=date_from, date_to=date_to)
+                text = _format_stats(stats)
+            except Exception as e:
+                logger.error(f"Ошибка расчёта статистики: {e}", exc_info=True)
+                return {"error": f"⚠️ Ошибка при расчёте статистики: {e}"}
+
+            return {"message": text}
 
         return {"message": "Выполнено"}
 

@@ -347,3 +347,12 @@ class GoogleSheetsService:
             if r.get("Номер договора") == contract_number:
                 return r
         return None
+
+    async def get_all_deals(self) -> list[dict]:
+        """Возвращает все сделки из журнала. Явная обёртка над find_deal("").
+
+        Используется агрегирующими инструментами (статистика, отчёты).
+        Отдельный метод — чтобы вызовы «прочитать всё» читались в коде
+        как намерение, а не как пустой поиск.
+        """
+        return await self.find_deal("")
