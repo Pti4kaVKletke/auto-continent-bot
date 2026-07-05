@@ -461,6 +461,94 @@ class DocumentBuilder:
 
         return str(path)
 
+    # ─── АКТ ВЫПОЛНЕННЫХ УСЛУГ ────────────────────────────────────────────
+
+    async def build_act(self, data: dict, contract_number: str, contract_date: str,
+                        act_date: str, commission_pct: float = 1.0) -> str:
+        """
+        Формирует акт об оказании услуг по агентскому договору.
+
+        contract_date — дата АГ договора/счёта/ДКП (ДД.ММ.ГГГГ). По решению
+        пользователя во все три места («от … г.») подставляется одна и та же
+        дата — дата основного договора. Плейсхолдеры в шаблоне разведены
+        (_ДОГОВОРА / _СЧЕТА / _ДКП) — если когда-нибудь потребуется различать,
+        менять только эту функцию, шаблон уже готов.
+
+        act_date — дата самого акта (дата закрывающего платежа).
+        """
+        template = self.templates_dir / "act_template.docx"
+        if not template.exists():
+            raise FileNotFoundError(
+                f"Шаблон акта не найден: {template}. "
+                "Положите act_template.docx в папку templates/."
+            )
+
+        # Суммы для акта
+        price_str = str(data.get("car_price", "0")).replace(" ", "").replace(",", ".")
+        try:
+            price_val = float(price_str)
+        except (TypeError, ValueError):
+            price_val = 0.0
+
+        commission_val = round(price_val * commission_pct / 100, 2)
+        total_val      = round(price_val + commission_val, 2)
+
+        def _fmt(v):
+            if v == int(v):
+                return f"{int(v):,}".replace(",", " ")
+            return f"{v:,.2f}".replace(",", " ").replace(".", ",")
+
+        # Разбор дат «ДД.ММ.ГГГГ» → (день, месяц-словом, год)
+        def _parts(date_str):
+            date_str = (date_str or "").strip()
+            if len(date_str) < 10:
+                return "", "", ""
+            return date_str[0:2], self._month_name(date_str[3:5]), date_str[6:10]
+
+        c_day, c_month, c_year = _parts(contract_date)
+        a_day, a_month, a_year = _parts(act_date)
+
+        extra = {
+            # Номера — по решению одинаковые (номер сделки)
+            "{{НОМЕР_АКТА}}":     contract_number,
+            "{{НОМЕР_ДОГОВОРА}}": contract_number,
+            "{{НОМЕР_СЧЕТА}}":    contract_number,
+            "{{НОМЕР_ДКП}}":      contract_number,
+
+            # Дата акта (дата закрывающего платежа)
+            "{{ДЕНЬ_АКТА}}":  a_day,
+            "{{МЕСЯЦ_АКТА}}": a_month,
+            "{{ГОД_АКТА}}":   a_year,
+
+            # Даты остальных документов — все равны дате договора
+            "{{ДЕНЬ_ДОГОВОРА}}":  c_day,
+            "{{МЕСЯЦ_ДОГОВОРА}}": c_month,
+            "{{ГОД_ДОГОВОРА}}":   c_year,
+            "{{ДЕНЬ_СЧЕТА}}":     c_day,
+            "{{МЕСЯЦ_СЧЕТА}}":    c_month,
+            "{{ГОД_СЧЕТА}}":      c_year,
+            "{{ДЕНЬ_ДКП}}":       c_day,
+            "{{МЕСЯЦ_ДКП}}":      c_month,
+            "{{ГОД_ДКП}}":        c_year,
+
+            # Суммы для раздела 2
+            "{{СУММА_ИТОГО_ЦИФРАМИ}}":  _fmt(total_val),
+            "{{СУММА_ИТОГО_ПРОПИСЬЮ}}": amount_to_words_rub(total_val),
+            "{{КОМИССИЯ_ЦИФРАМИ}}":     _fmt(commission_val),
+            "{{КОМИССИЯ_ПРОПИСЬЮ}}":    amount_to_words_rub(commission_val),
+        }
+        # {{ЦЕНА_*}}, {{СУММА_НАЛИЧНЫМИ*}}, {{КУРС_ДОЛЛАРА}}, {{ВАЛЮТА_НАЛИЧНЫМИ}},
+        # {{ПОКУПАТЕЛЬ_*}}, {{ПАСПОРТ_*}}, {{ПРОДАВЕЦ_*}}, {{VIN}}, {{МАРКА_МОДЕЛЬ}},
+        # {{ГОД_ВЫП}} — уже покрыты базовым набором в _fill_template.
+
+        return await self._fill_template(
+            template, data, contract_number, contract_date,
+            f"Акт_{contract_number}", commission_pct,
+            extra_replacements=extra,
+        )
+
+    # ─── ВОССТАНОВЛЕНИЕ КАРТИНОК ИЗ ШАБЛОНА xlsx ─────────────────────────
+
     def _restore_images_from_template(self, output_path: Path, template_path: Path):
         """
         Запасной путь: копирует печать/подпись (xl/media/*, xl/drawings/*) и связи
@@ -685,7 +773,8 @@ class DocumentBuilder:
         return " ".join(result)
 
     async def _fill_template(self, template_path, data, number, date, output_name,
-                              commission_pct: float = 1.0) -> str:
+                              commission_pct: float = 1.0,
+                              extra_replacements: dict | None = None) -> str:
         from lxml import etree
         from copy import deepcopy
 
@@ -783,6 +872,11 @@ class DocumentBuilder:
             "{{СЧЕТ_ВАЛЮТА}}":       data.get("account_currency", ""),
             "{{СЧЕТ_НОМЕР}}":        data.get("account_number", ""),
         }
+
+        # Пробрасываемые снаружи плейсхолдеры (для актов и подобных документов
+        # с расширенным набором). Перекрывают базовые при совпадении ключей.
+        if extra_replacements:
+            replacements.update(extra_replacements)
 
         W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 

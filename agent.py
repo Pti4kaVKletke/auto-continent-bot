@@ -936,6 +936,8 @@ VIN: ...
 - Чтобы посмотреть текущие платежи и баланс — вызывай find_deal с section="payments".
 - Чтобы удалить ошибочный платёж — вызывай remove_payment(contract_number, index). Если пользователь не помнит номер платежа — сначала покажи список через find_deal с section="payments", потом уточни какой удалять.
 - НЕ обновляй Платежи/Получено/Остаток через update_deal напрямую — это может сломать баланс. Используй ТОЛЬКО add_payment и remove_payment.
+- Когда пользователь просит «сформируй акт», «сделай акт», «акт выполненных услуг по сделке NNN» — вызывай build_act(contract_number). Дата акта берётся автоматически (последний платёж). Если сделка не оплачена — инструмент сам вернёт ошибку с остатком.
+- После полной оплаты (когда add_payment сообщает «🎉 Сделка полностью оплачена») пользователь ВИДИТ кнопку «📄 Сформировать акт» и сам её нажмёт. Не предлагай построить акт своими сообщениями и не вызывай build_act автоматически.
 
 ⚠️ ⚠️ ⚠️ КРИТИЧНО ПРО ВЫЗОВ ИНСТРУМЕНТОВ ⚠️ ⚠️ ⚠️
 - ЗАПРЕЩЕНО писать текст, ИМИТИРУЮЩИЙ результат работы инструмента, без реального вызова этого инструмента.
@@ -1113,6 +1115,22 @@ VIN: ...
                         "doc_type":        {"type": "string", "description": "Тип документов: all / ag / dkp / invoice"},
                     },
                     "required": ["contract_number", "doc_type"],
+                },
+            },
+            {
+                "name": "build_act",
+                "description": (
+                    "Сформировать акт об оказании услуг по агентскому договору. "
+                    "Дата акта берётся автоматически — это дата последнего платежа по сделке. "
+                    "Формируется только для полностью оплаченных сделок; иначе вернётся ошибка. "
+                    "Используй когда пользователь просит «сделай акт», «сформируй акт», «акт выполненных услуг»."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "contract_number": {"type": "string", "description": "Номер договора"},
+                    },
+                    "required": ["contract_number"],
                 },
             },
             {
@@ -2178,6 +2196,13 @@ VIN: ...
                 "buttons": buttons,
             }
 
+        elif tool_name == "build_act":
+            # Логика вынесена в публичный метод build_act_impl —
+            # bot.py тоже может его вызвать напрямую (кнопка «📄 Сформировать акт»).
+            return await self.build_act_impl(
+                contract_number=(tool_input.get("contract_number") or "").strip(),
+            )
+
         elif tool_name == "add_payment":
             # Логика вынесена в публичный метод add_payment_impl —
             # bot.py тоже может его вызвать напрямую (с force=True после
@@ -2479,11 +2504,116 @@ VIN: ...
             f"📥 Получено: {_fmt_money(received)} {currency}",
             f"⏳ Остаток: {_fmt_money(remainder)} {currency}",
         ]
+
+        # Кнопки — при полном закрытии сделки предлагаем сразу сформировать акт.
+        # Отменённые/черновики не трогаем.
+        buttons = []
+        if remainder <= 0.01 and current_status not in ("отменена", "черновик"):
+            buttons.append({
+                "text":          "📄 Сформировать акт",
+                "callback_data": f"dealaction:{contract_number}:build_act",
+            })
+        buttons += [
+            {"text": "💳 К оплатам", "callback_data": f"dealaction:{contract_number}:payments"},
+            {"text": "◀️ К сделке",   "callback_data": f"dealaction:{contract_number}:menu"},
+        ]
         return {
             "message": "\n".join(lines),
+            "buttons": buttons,
+        }
+
+    async def build_act_impl(self, contract_number: str) -> dict:
+        """Формирует акт выполненных услуг по сделке.
+
+        Дата акта = дата хронологически последнего платежа. Если сделка не
+        оплачена полностью — отказ.
+
+        Единая точка входа. Вызывается:
+          • из bot.py (кнопка «📄 Сформировать акт» в меню сделки и после
+            закрытия сделки платежом)
+          • как tool из LLM (при запросе «сделай акт»)
+        """
+        from datetime import datetime as _dt
+
+        contract_number = (contract_number or "").strip()
+        if not contract_number:
+            return {"error": "⚠️ Не указан номер сделки"}
+
+        deal = await self.sheets.get_deal(contract_number)
+        if not deal:
+            return {"error": f"⚠️ Сделка *{contract_number}* не найдена"}
+
+        payments = _parse_payments(deal.get("Платежи", ""))
+        if not payments:
+            return {"error": (
+                f"⚠️ По сделке *{contract_number}* нет зарегистрированных платежей. "
+                "Акт формируется только после полной оплаты."
+            )}
+
+        total     = _calc_total_amount(deal)
+        received  = sum(p["amount"] for p in payments)
+        remainder = total - received
+        if remainder > 0.01:
+            currency = (deal.get("currency") or "руб").strip()
+            return {"error": (
+                f"⚠️ Сделка *{contract_number}* оплачена не полностью.\n"
+                f"Остаток: {_fmt_money(remainder)} {currency}. "
+                "Акт формируется только после полной оплаты."
+            )}
+
+        # Дата акта — хронологически последний платёж
+        try:
+            act_date = max(
+                payments,
+                key=lambda p: _dt.strptime(p["date"], "%d.%m.%Y"),
+            )["date"]
+        except Exception:
+            act_date = payments[-1]["date"]
+
+        contract_date  = deal.get("Дата договора", "")
+        commission_pct = _num(deal.get("Комиссия %", "1")) or 1.0
+
+        # Данные для шаблона — все поля deal подходят напрямую (ключи совпадают
+        # с ожидаемыми в _fill_template)
+        data = {k: (v if v is not None else "") for k, v in deal.items()}
+
+        try:
+            deal_folder_id = await self.drive.get_or_create_deal_folder(contract_number)
+            docx_path = await self.builder.build_act(
+                data, contract_number, contract_date, act_date, commission_pct,
+            )
+            docx_name = f"Акт_{contract_number}.docx"
+            docx_link = await self.drive.upload_file(docx_path, docx_name, deal_folder_id)
+
+            extra_files, extra_names, extra_links = [], [], []
+            first_link = docx_link
+            skip_pdf = os.environ.get("SKIP_PDF", "0") == "1"
+            if not skip_pdf:
+                pdf_path = await self.builder.convert_to_pdf(docx_path)
+                if pdf_path:
+                    pdf_name = f"Акт_{contract_number}.pdf"
+                    pdf_link = await self.drive.upload_file(pdf_path, pdf_name, deal_folder_id)
+                    extra_files.append(pdf_path)
+                    extra_names.append(pdf_name)
+                    extra_links.append(pdf_link)
+                    if not first_link:
+                        first_link = pdf_link
+        except FileNotFoundError as e:
+            return {"error": f"⚠️ {e}"}
+        except Exception as e:
+            logger.error(f"Ошибка формирования акта для {contract_number}: {e}", exc_info=True)
+            return {"error": f"⚠️ Не удалось сформировать акт: {e}"}
+
+        return {
+            "file":        docx_path,
+            "filename":    docx_name,
+            "drive_link":  docx_link,
+            "extra_files": extra_files,
+            "extra_names": extra_names,
+            "extra_links": extra_links,
+            "message":     f"📄 Акт по сделке *{contract_number}* от {act_date} сформирован",
             "buttons": [
-                {"text": "💳 К оплатам", "callback_data": f"dealaction:{contract_number}:payments"},
-                {"text": "◀️ К сделке",   "callback_data": f"dealaction:{contract_number}:menu"},
+                {"text": "◀️ К сделке", "callback_data": f"dealaction:{contract_number}:menu"},
             ],
         }
 

@@ -951,6 +951,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("📎 Загрузить скан",    callback_data=f"dealaction:{num}:scan"),
                  InlineKeyboardButton("🗂 Сканы",             callback_data=f"dealaction:{num}:scans")],
                 [InlineKeyboardButton("💳 Оплаты",            callback_data=f"dealaction:{num}:payments")],
+                [InlineKeyboardButton("📄 Акт выполненных услуг", callback_data=f"dealaction:{num}:build_act")],
                 [InlineKeyboardButton("✅ Завершить сделку",  callback_data=f"dealaction:{num}:complete")],
                 [InlineKeyboardButton("❌ Отменить сделку",   callback_data=f"dealaction:{num}:cancel")],
             ]
@@ -1088,6 +1089,44 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 agent.process_message(f"проверь сделку {num}", chat_id=str(update.effective_chat.id))
             )
             await send_result(query.message, result)
+
+        elif action == "build_act":
+            # Формирование акта выполненных услуг. Дата акта берётся автоматически
+            # из даты последнего платежа. Если сделка не оплачена — build_act_impl
+            # вернёт понятную ошибку с остатком.
+            await query.edit_message_text(f"⏳ Формирую акт по сделке {num}...")
+            result = await typing_while(
+                update.effective_chat.id, context,
+                agent.build_act_impl(num),
+            )
+            if result.get("error"):
+                await query.message.reply_text(
+                    result["error"],
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("◀️ К сделке", callback_data=f"dealaction:{num}:menu")
+                    ]]),
+                )
+            else:
+                # Адаптируем формат build_act_impl (file/extra_*) в формат send_result (files-list)
+                files = []
+                if result.get("file"):
+                    files.append({
+                        "file":       result["file"],
+                        "filename":   result["filename"],
+                        "drive_link": result.get("drive_link", ""),
+                    })
+                for f_path, f_name, f_link in zip(
+                    result.get("extra_files", []),
+                    result.get("extra_names", []),
+                    result.get("extra_links", [""] * len(result.get("extra_files", []))),
+                ):
+                    files.append({"file": f_path, "filename": f_name, "drive_link": f_link})
+                await send_result(query.message, {
+                    "files":   files,
+                    "text":    result.get("message", ""),
+                    "buttons": result.get("buttons"),
+                }, context=context)
 
         elif action == "complete":
             keyboard = InlineKeyboardMarkup([
