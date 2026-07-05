@@ -334,6 +334,153 @@ def _format_stats(stats: dict) -> str:
     return "\n".join(lines)
 
 
+# ══ КОПИРОВАНИЕ СДЕЛОК (шаблоны) ═════════════════════════════════════════
+
+# Что копируем при разных режимах — списки ключей полей из COLUMNS Sheets.
+_COPY_FIELDS_BUYER = [
+    "buyer_name", "passport_series", "passport_number", "buyer_birth_date",
+    "buyer_address", "buyer_initials",
+    "passport_issued_by", "passport_issued_date", "passport_code",
+]
+_COPY_FIELDS_SELLER = [
+    "seller_name", "seller_id_number", "seller_birth_date", "seller_address",
+    "seller_initials", "seller_id_issued_by", "seller_id_issued_date",
+]
+_COPY_FIELDS_BANK = [
+    "account_currency", "account_number",
+    "bank_corr_line1", "bank_corr_line2", "bank_corr_line3",
+    "bank_ben_line1", "bank_ben_line2", "bank_kpp",
+]
+_COPY_FIELDS_COMMISSION = ["Комиссия %"]
+
+# Никогда не копируется — фиксируется в новой сделке независимо
+_COPY_NEVER = {
+    "Номер договора", "Дата договора", "Статус", "Папка Drive",
+    "Комментарий", "Платежи", "Получено", "Остаток", "Сумма Договора",
+    # Автомобиль всегда новый: VIN, TПO, цена и всё что вокруг
+    "car_model", "car_vin", "car_year", "car_color",
+    "tpo_number", "car_body_number", "tpo_day", "tpo_month", "tpo_year",
+    "car_price", "cash_amount", "exchange_rate", "car_price_words",
+    "currency", "cash_amount_words", "cash_currency",
+}
+
+_COPY_MODES = {"buyer_only", "seller_only", "all_except_car_sum"}
+
+
+def _prepare_copy_data(source: dict, mode: str, overrides: dict | None = None) -> dict:
+    """Готовит dict с данными для новой сделки на основе исходной.
+
+    Возвращает {скопированные_поля} + {overrides}, без служебных полей.
+    Пустые значения из исходной сделки не копируются — чтобы не тащить дыры.
+    """
+    result: dict = {}
+
+    if mode == "buyer_only":
+        keys = _COPY_FIELDS_BUYER + _COPY_FIELDS_BANK + _COPY_FIELDS_COMMISSION
+    elif mode == "seller_only":
+        keys = _COPY_FIELDS_SELLER + _COPY_FIELDS_BANK + _COPY_FIELDS_COMMISSION
+    else:  # all_except_car_sum
+        keys = (
+            _COPY_FIELDS_BUYER + _COPY_FIELDS_SELLER
+            + _COPY_FIELDS_BANK + _COPY_FIELDS_COMMISSION
+        )
+
+    for k in keys:
+        if k in _COPY_NEVER:
+            continue
+        val = source.get(k)
+        if val is None or (isinstance(val, str) and not val.strip()):
+            continue
+        result[k] = val
+
+    # overrides перекрывают скопированное — если пользователь сразу указал
+    # VIN/модель/цену/что-то ещё, оно попадает в черновик
+    if overrides:
+        for k, v in overrides.items():
+            if k in _COPY_NEVER and k not in (
+                "car_model", "car_vin", "car_price", "car_year", "car_color",
+                "cash_amount", "currency",
+            ):
+                # Даже overrides не могут задать Номер, Дату, Статус и т.п.
+                continue
+            if v is None or (isinstance(v, str) and not v.strip()):
+                continue
+            result[k] = v
+
+    return result
+
+
+def _format_copy_preview(source_num: str, mode: str, prepared: dict,
+                        overrides: dict | None = None) -> str:
+    """Форматирует предпросмотр черновика перед подтверждением."""
+    mode_label = {
+        "buyer_only":         "покупатель + реквизиты",
+        "seller_only":        "продавец + реквизиты",
+        "all_except_car_sum": "все данные, кроме авто и суммы",
+    }.get(mode, mode)
+
+    lines = [
+        f"📋 *Черновик на основе сделки {source_num}*",
+        f"_Режим: {mode_label}_",
+        "",
+        "*Скопировано:*",
+    ]
+
+    # Покупатель
+    if prepared.get("buyer_name"):
+        lines.append(f"👤 Покупатель: {prepared['buyer_name']}")
+        if prepared.get("passport_series") or prepared.get("passport_number"):
+            lines.append(
+                f"   Паспорт: {prepared.get('passport_series', '')} "
+                f"№{prepared.get('passport_number', '')}"
+            )
+
+    # Продавец
+    if prepared.get("seller_name"):
+        lines.append(f"🏭 Продавец: {prepared['seller_name']}")
+        if prepared.get("seller_id_number"):
+            lines.append(f"   ИНН/ID: {prepared['seller_id_number']}")
+
+    # Банк
+    if prepared.get("account_number"):
+        bank = prepared.get("bank_corr_line1", "").strip() or "—"
+        lines.append(f"🏦 Реквизиты: {bank}, счёт {prepared['account_number']}")
+
+    # Комиссия
+    if prepared.get("Комиссия %"):
+        lines.append(f"💼 Комиссия: {prepared['Комиссия %']}%")
+
+    # Если что-то из overrides перекрыло — покажу отдельным блоком
+    car_overrides = {k: v for k, v in (overrides or {}).items()
+                     if k in ("car_model", "car_vin", "car_price", "car_year",
+                              "car_color", "cash_amount", "currency") and v}
+    if car_overrides:
+        lines += ["", "*Из твоего запроса:*"]
+        if car_overrides.get("car_model"):
+            lines.append(f"🚗 Модель: {car_overrides['car_model']}")
+        if car_overrides.get("car_vin"):
+            lines.append(f"   VIN: {car_overrides['car_vin']}")
+        if car_overrides.get("car_year"):
+            lines.append(f"   Год: {car_overrides['car_year']}")
+        if car_overrides.get("car_price"):
+            curr = car_overrides.get("currency", "руб")
+            lines.append(f"💰 Цена: {car_overrides['car_price']} {curr}")
+
+    # Что осталось запросить
+    need = []
+    if not car_overrides.get("car_model"):  need.append("модель авто")
+    if not car_overrides.get("car_vin"):    need.append("VIN")
+    if not car_overrides.get("car_price"):  need.append("цену")
+    if need:
+        lines += ["", "*Осталось указать:* " + ", ".join(need)]
+
+    lines += [
+        "",
+        "_Номер договора и дата будут созданы автоматически._",
+    ]
+    return "\n".join(lines)
+
+
 class DocumentAgent:
 
     def __init__(self):
@@ -358,6 +505,7 @@ class DocumentAgent:
 - update_deal      — обновить данные сделки в журнале и при необходимости перегенерировать документы
 - cancel_deal      — отменить сделку (пометить как отменённую, не удалять)
 - complete_deal    — завершить сделку (деньги получены, авто передано)
+- copy_deal        — подготовить черновик новой сделки на основе существующей
 - get_statistics   — сводная статистика по журналу за период (сегодня/неделя/месяц/квартал/год/всё)
 - save_company     — сохранить реквизиты компании/клиента в постоянную память
 - save_instruction — сохранить инструкцию для себя
@@ -368,6 +516,8 @@ class DocumentAgent:
 Когда пользователь пишет "проверь сделку", "создай документы для сделки из таблицы", "сделай договор по строке" — используй check_deal.
 Когда пользователь нажал кнопку выбора документов (пришло сообщение "Создай документы для сделки X, тип: Y") — используй generate_docs с contract_number=X и doc_type=Y.
 Когда пользователь спрашивает про статистику, отчёты, объёмы, итоги, средний чек, сколько сделок/денег/комиссии за период — ВСЕГДА вызывай get_statistics. НЕ считай агрегированные цифры в уме и не отвечай "у меня нет инструмента".
+Когда пользователь просит создать сделку на основе существующей ("как в NNN", "используй данные покупателя/продавца из NNN", "скопируй NNN", "новая сделка как NNN") — ВСЕГДА вызывай copy_deal. Не пытайся сам вытаскивать данные через find_deal и потом создавать через create_contract — это делает copy_deal одним шагом с предпросмотром и подтверждением. Если пользователь в том же сообщении назвал новое авто/цену — передай их в overrides. После того как пользователь подтвердил копирование ("подтверждено", "давай", "ок") и назвал недостающие поля (обычно VIN, модель, цена) — вызывай create_contract, объединив данные из предпросмотра copy_deal (они есть в истории диалога) с новыми полями от пользователя.
+Когда пользователь просит создать новую сделку "как в NNN", "используй данные покупателя/продавца/реквизиты из NNN", "тот же покупатель что и в NNN", "скопируй данные из сделки NNN" — сначала вызови find_deal(query="NNN") и возьми оттуда нужные поля. Дальше см. секцию КОПИРОВАНИЕ ДАННЫХ ИЗ СУЩЕСТВУЮЩЕЙ СДЕЛКИ.
 
 === ПРОВЕРКА И СОЗДАНИЕ ДОКУМЕНТОВ ИЗ ТАБЛИЦЫ ===
 
@@ -385,6 +535,52 @@ class DocumentAgent:
 3. Покажи извлечённые данные пользователю в сводке и спроси подтверждение
 4. После подтверждения вызови import_deal — НЕ create_contract
 5. Ссылку на папку Drive попроси у пользователя или оставь пустой
+
+=== КОПИРОВАНИЕ ДАННЫХ ИЗ СУЩЕСТВУЮЩЕЙ СДЕЛКИ ===
+
+Пользователь может просить создать новую сделку на основе данных существующей. Примеры фраз-триггеров:
+• "создай новую сделку, используй данные продавца из 150626001"
+• "новая сделка, покупатель как в 040726002"
+• "тот же покупатель и продавец что и в 220626003, но авто другое"
+• "как в сделке 010726001, комиссия 3%"
+• "продавец из 150626001, покупатель из 040726002, авто новое"
+
+АЛГОРИТМ:
+1. Определи номера сделок-источников (9-значные, формат ДДММГГ+NNN).
+2. Для каждой сделки-источника вызови find_deal(query="номер") — получишь все поля.
+3. Собери данные для новой сделки, комбинируя поля из источников по указаниям пользователя.
+4. Если пользователь НЕ уточнил что копировать — переспроси: "Скопировать всё, кроме автомобиля и суммы? Или только определённые поля?"
+5. Покажи сводку "что переносится, что запрошу" и жди подтверждения.
+6. После подтверждения запроси недостающие данные (обязательно новый автомобиль и сумму).
+7. Вызови create_contract с собранными данными как для обычной новой сделки.
+
+⛔ НИКОГДА НЕ ПЕРЕНОСИ из сделки-источника:
+• Номер договора — генерируется автоматически через get_next_contract_number
+• Дата договора — всегда новая, спроси или используй сегодняшнюю
+• Статус — новая сделка всегда с "черновик"/"активна", НЕ "завершена"
+• Папка Drive — создаётся новая при create_contract
+• car_model, car_vin, car_year, car_color — автомобиль ВСЕГДА новый
+• car_body_number, tpo_number, tpo_day, tpo_month, tpo_year — данные под конкретный авто
+• car_price, cash_amount, car_price_words, cash_amount_words — сумма ВСЕГДА новая
+• exchange_rate — обычно новый, но можно уточнить у пользователя
+• Платежи, Получено, Остаток — в новой сделке всегда пустые
+• Комментарий — не переносится
+
+✅ МОЖНО переносить (если пользователь запросил):
+• buyer_name, buyer_initials, buyer_address, buyer_birth_date
+• passport_series, passport_number, passport_issued_by, passport_issued_date, passport_code
+• seller_name, seller_initials, seller_address, seller_birth_date, seller_id_number
+• seller_id_issued_by, seller_id_issued_date
+• account_number, account_currency
+• bank_corr_line1, bank_corr_line2, bank_corr_line3
+• bank_ben_line1, bank_ben_line2, bank_kpp
+• Комиссия % (если пользователь не указал новую)
+• currency, cash_currency
+
+При комбинировании из НЕСКОЛЬКИХ сделок (например продавец из одной, покупатель из другой) — бери каждый блок целиком, не смешивай поля покупателя из разных сделок.
+
+Если пользователь пишет "как в NNN но комиссия 3%" — скопируй ВСЕ переносимые поля, а комиссию поставь новую.
+Если пишет "продавец из NNN" — скопируй ТОЛЬКО поля продавца и его реквизиты (seller_*, account_*, bank_*), покупателя и авто спроси.
 
 __СТАТУСЫ_PLACEHOLDER__
 
@@ -1221,6 +1417,56 @@ VIN: ...
                     "required": [],
                 },
             },
+            {
+                "name": "copy_deal",
+                "description": (
+                    "Подготовить черновик новой сделки на основе существующей. "
+                    "НЕ создаёт сделку сразу — возвращает предпросмотр с кнопкой подтверждения. "
+                    "После подтверждения пользователь укажет недостающие данные (обычно авто и цена), "
+                    "и ты вызовешь create_contract с полным набором. "
+                    "\n\n"
+                    "Используй когда пользователь пишет: «создай новую как в NNN», "
+                    "«используй данные покупателя из NNN», «реквизиты продавца как в NNN», "
+                    "«новая сделка на основе NNN», «скопируй NNN» и подобные. "
+                    "\n\n"
+                    "Правила выбора mode:\n"
+                    "• «данные покупателя из NNN» / «тот же покупатель» → buyer_only\n"
+                    "• «реквизиты продавца из NNN» / «тот же продавец» → seller_only\n"
+                    "• «как в NNN» / «на основе NNN» без уточнений → all_except_car_sum\n"
+                    "\n"
+                    "Если в том же сообщении пользователь уже указал VIN/модель/цену/год авто — "
+                    "передай их в overrides как {car_vin, car_model, car_price, car_year, currency}. "
+                    "Никогда не копируется: номер договора, дата, статус, папка Drive, платежи, "
+                    "суммы, всё что связано с авто (car_*, tpo_*) — они всегда новые."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "source_contract_number": {
+                            "type": "string",
+                            "description": "Номер сделки-источника, например 150626001",
+                        },
+                        "mode": {
+                            "type": "string",
+                            "enum": ["buyer_only", "seller_only", "all_except_car_sum"],
+                            "description": (
+                                "buyer_only — покупатель + реквизиты + комиссия; "
+                                "seller_only — продавец + реквизиты + комиссия; "
+                                "all_except_car_sum — покупатель + продавец + реквизиты + комиссия."
+                            ),
+                        },
+                        "overrides": {
+                            "type": "object",
+                            "description": (
+                                "Поля, которые пользователь сразу назвал в запросе. "
+                                "Обычно данные нового авто: car_model, car_vin, car_year, "
+                                "car_color, car_price, currency. Передавай только явно названные."
+                            ),
+                        },
+                    },
+                    "required": ["source_contract_number", "mode"],
+                },
+            },
         ]
 
     async def _handle_response(self, response) -> dict:
@@ -2040,6 +2286,45 @@ VIN: ...
                 return {"error": f"⚠️ Ошибка при расчёте статистики: {e}"}
 
             return {"message": text}
+
+        elif tool_name == "copy_deal":
+            source_num = (tool_input.get("source_contract_number") or "").strip()
+            mode       = (tool_input.get("mode") or "").strip()
+            overrides  = tool_input.get("overrides") or {}
+
+            if not source_num:
+                return {"error": "⚠️ Не указан номер сделки-источника"}
+            if mode not in _COPY_MODES:
+                return {"error": (
+                    f"⚠️ Неизвестный режим: {mode}. "
+                    f"Допустимые: {', '.join(sorted(_COPY_MODES))}"
+                )}
+
+            source = await self.sheets.get_deal(source_num)
+            if not source:
+                return {"error": f"⚠️ Сделка {source_num} не найдена в журнале"}
+
+            try:
+                prepared = _prepare_copy_data(source, mode, overrides)
+                preview  = _format_copy_preview(source_num, mode, prepared, overrides)
+            except Exception as e:
+                logger.error(f"Ошибка подготовки копии сделки: {e}", exc_info=True)
+                return {"error": f"⚠️ Ошибка при подготовке копии: {e}"}
+
+            # Данные для user_data — bot.py их сохранит и использует после
+            # подтверждения. Ключи buttons и copy_pending подхватываются в bot.py.
+            return {
+                "message": preview,
+                "buttons": [
+                    {"text": "✅ Подтвердить",  "callback_data": "copy:ok"},
+                    {"text": "❌ Отменить",     "callback_data": "copy:cancel"},
+                ],
+                "copy_pending": {
+                    "source":   source_num,
+                    "mode":     mode,
+                    "prepared": prepared,
+                },
+            }
 
         return {"message": "Выполнено"}
 

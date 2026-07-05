@@ -331,6 +331,11 @@ async def send_result(message, result: dict, context=None, chat_id=None):
     if context is not None and result.get("overpay_pending"):
         context.user_data["overpay_pending"] = result["overpay_pending"]
 
+    # copy_deal возвращает copy_pending — bot.py сохранит для callback "copy:ok",
+    # где пользователь подтвердит начало сбора недостающих полей.
+    if context is not None and result.get("copy_pending"):
+        context.user_data["copy_pending"] = result["copy_pending"]
+
     if result.get("files"):
         for f_info in result["files"]:
             try:
@@ -731,8 +736,60 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         return
 
-    # ── Статистика по периоду ────────────────────────────────────────────────
-    if data.startswith("stats:"):
+    # ── Подтверждение / отмена копирования сделки ────────────────────────────
+    if data.startswith("copy:"):
+        sub = data.split(":", 1)[1]
+        pending = context.user_data.get("copy_pending")
+
+        if sub == "cancel":
+            context.user_data.pop("copy_pending", None)
+            await query.edit_message_text(
+                "❌ Копирование отменено.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("◀️ Меню", callback_data="menu:back"),
+                ]]),
+            )
+            return
+
+        if sub == "ok":
+            if not pending:
+                await query.edit_message_text(
+                    "⚠️ Данные черновика утеряны (перезапуск бота?). "
+                    "Попроси заново: «создай новую как в NNN».",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("◀️ Меню", callback_data="menu:back"),
+                    ]]),
+                )
+                return
+
+            # Убираем кнопки под предпросмотром, чтобы нельзя было переподтвердить
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+
+            # Подсказываем, чего именно не хватает. Список полей — от _prepare_copy_data.
+            prepared = pending.get("prepared") or {}
+            missing = []
+            if not prepared.get("car_model"): missing.append("модель авто")
+            if not prepared.get("car_vin"):   missing.append("VIN")
+            if not prepared.get("car_price"): missing.append("цену")
+
+            if missing:
+                text = (
+                    "✅ Данные скопированы. Осталось указать: "
+                    + ", ".join(missing) + ".\n\n"
+                    "Напиши в свободной форме — можно всё сразу одним сообщением, "
+                    "например: `Chery Tiggo 8, VIN LVVDB21B..., цена 3 200 000`."
+                )
+            else:
+                text = (
+                    "✅ Данные скопированы. Скажи что ещё уточнить — "
+                    "или напиши «создавай», если всё готово."
+                )
+            await query.message.reply_text(text, parse_mode="Markdown")
+            return
+        return
         period = data.split(":", 1)[1]
 
         # Свой период — просим ввести диапазон дат
