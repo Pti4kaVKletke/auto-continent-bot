@@ -28,6 +28,39 @@ logger = logging.getLogger(__name__)
 agent = DocumentAgent()
 
 
+# ─── AWAITING-ФЛАГИ ──────────────────────────────────────────────────────────
+# Единый список всех состояний "жду от пользователя ввода". Клик по любой
+# кнопке или команда /menu, /start означают переход в новое состояние, а не
+# продолжение прошлого ожидания → сбрасываем всё разом. Обработчик, который
+# сам ставит awaiting-флаг, установит его ПОСЛЕ этого сброса — порядок верный.
+AWAITING_FLAGS = (
+    "awaiting_search",
+    "awaiting_stats_dates",
+    "awaiting_deal_date",
+    "awaiting_scan_for_deal",
+    "awaiting_scan_folder_id",
+    "awaiting_scan_for_existing",
+    "awaiting_edit_deal",
+    "awaiting_payment_for_deal",
+)
+
+# Дополнительные "хвосты" — временные данные, привязанные к awaiting-состояниям
+# как парные значения. Сбрасываем вместе с флагами.
+# ⚠️  last_scan_* сюда НЕ входят: они читаются в самом handle_callback (ветка
+# scan_route), сброс в начале колбэка их бы обнулил.
+AWAITING_TAILS = (
+    "pending_existing_filepath",
+    "pending_existing_filename",
+)
+
+
+def _clear_awaiting_flags(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Сбрасывает все awaiting_* флаги и связанные с ними временные данные.
+    Не трогает current_deal / new_deal_started (это не флаги ожидания ввода)."""
+    for key in AWAITING_FLAGS + AWAITING_TAILS:
+        context.user_data.pop(key, None)
+
+
 # ─── ДЕТЕКТОР КОМАНД ─────────────────────────────────────────────────────────
 # Защита от галлюцинации Haiku в v2 на свободных текстовых командах.
 # Если пользователь пишет "добавь оплату N к сделке NNN" — LLM иногда просто
@@ -136,6 +169,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_access(update):
         await update.message.reply_text("⛔ Доступ запрещён.")
         return
+    _clear_awaiting_flags(context)
     await update.message.reply_text(
         get_menu_text(),
         parse_mode="MarkdownV2",
@@ -144,6 +178,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _clear_awaiting_flags(context)
     await update.message.reply_text(
         get_menu_text(),
         parse_mode="MarkdownV2",
@@ -340,6 +375,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("⛔ Доступ запрещён.")
         return
 
+    # Любой клик по кнопке = переход в новое состояние. Сбрасываем все
+    # висящие awaiting_* флаги. Если текущий обработчик сам ставит новый
+    # awaiting-флаг (например, stats:custom или dealaction:X:edit) — он
+    # установится ниже по коду, уже после сброса.
+    _clear_awaiting_flags(context)
+
     data = query.data or ""
 
     # ── Главное меню ──────────────────────────────────────────────────────────
@@ -455,6 +496,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     InlineKeyboardButton("📊 Всё время", callback_data="stats:all"),
                 ],
                 [
+                    InlineKeyboardButton("📅 Свой период", callback_data="stats:custom"),
+                ],
+                [
                     InlineKeyboardButton("◀️ Меню", callback_data="menu:back"),
                 ],
             ]
@@ -517,6 +561,23 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Статистика по периоду ────────────────────────────────────────────────
     if data.startswith("stats:"):
         period = data.split(":", 1)[1]
+
+        # Свой период — просим ввести диапазон дат
+        if period == "custom":
+            context.user_data["awaiting_stats_dates"] = True
+            await query.edit_message_text(
+                "📅 *Свой период*\n\n"
+                "Введи диапазон дат в одном из форматов:\n"
+                "• `01.06.2026 - 30.06.2026`\n"
+                "• `01.06.2026 30.06.2026`\n"
+                "• `01.06.2026` (одна дата — от неё до сегодня)",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("◀️ Отмена", callback_data="menu:stats"),
+                ]]),
+            )
+            return
+
         period_label = {
             "today":     "сегодня",
             "yesterday": "вчера",
@@ -1130,6 +1191,78 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"Ошибка загрузки скана: {e}", exc_info=True)
             await update.message.reply_text(f"⚠️ Ошибка загрузки: {e}")
+        return
+
+    if context.user_data.get("awaiting_stats_dates"):
+        context.user_data["awaiting_stats_dates"] = False
+        raw = user_text.strip()
+
+        # Достаём все даты в формате ДД.ММ.ГГГГ из строки
+        import re as _re
+        matches = _re.findall(r"\d{1,2}\.\d{1,2}\.\d{4}", raw)
+
+        if not matches:
+            await update.message.reply_text(
+                "⚠️ Не нашёл ни одной даты. Ожидаю формат ДД.ММ.ГГГГ, например "
+                "`01.06.2026 - 30.06.2026`",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("◀️ К периодам", callback_data="menu:stats"),
+                ]]),
+            )
+            return
+
+        date_from = matches[0]
+        date_to   = matches[1] if len(matches) >= 2 else ""  # пусто → до сегодня (см. _resolve_period)
+
+        # Валидация: дата_от не должна быть позже даты_до
+        from datetime import datetime as _dt
+        try:
+            df = _dt.strptime(date_from, "%d.%m.%Y").date()
+            dt_end = _dt.strptime(date_to, "%d.%m.%Y").date() if date_to else None
+            if dt_end and df > dt_end:
+                await update.message.reply_text(
+                    f"⚠️ Начало периода `{date_from}` позже конца `{date_to}`. "
+                    "Проверь порядок дат.",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("◀️ К периодам", callback_data="menu:stats"),
+                    ]]),
+                )
+                return
+        except ValueError as e:
+            await update.message.reply_text(
+                f"⚠️ Не удалось разобрать дату: {e}",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("◀️ К периодам", callback_data="menu:stats"),
+                ]]),
+            )
+            return
+
+        loading = await update.message.reply_text(
+            f"📊 Считаю статистику за {date_from} — {date_to or 'сегодня'}..."
+        )
+        try:
+            result = await agent._execute_tool("get_statistics", {
+                "period":    "custom",
+                "date_from": date_from,
+                "date_to":   date_to,
+            })
+        except Exception as e:
+            logger.error(f"Ошибка вычисления статистики (custom): {e}", exc_info=True)
+            result = {"error": f"⚠️ Ошибка: {e}"}
+
+        text = result.get("message") or result.get("error") or "Нет данных."
+        kb = [
+            [InlineKeyboardButton("◀️ К периодам", callback_data="menu:stats")],
+            [InlineKeyboardButton("◀️ Меню",        callback_data="menu:back")],
+        ]
+        try:
+            await loading.edit_text(text, parse_mode="Markdown",
+                                    reply_markup=InlineKeyboardMarkup(kb))
+        except Exception:
+            await update.message.reply_text(text, parse_mode="Markdown",
+                                            reply_markup=InlineKeyboardMarkup(kb))
         return
 
     if context.user_data.get("awaiting_deal_date"):
