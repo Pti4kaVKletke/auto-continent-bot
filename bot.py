@@ -21,11 +21,13 @@ else:
 from agent import _parse_payments, _calc_total_amount, _fmt_money
 
 import memory
+from backup_service import BackupService
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-agent = DocumentAgent()
+agent  = DocumentAgent()
+backup = BackupService()
 
 
 # ─── AWAITING-ФЛАГИ ──────────────────────────────────────────────────────────
@@ -98,12 +100,17 @@ def _detect_forced_tool(text: str) -> str:
 
 ALLOWED_CHAT_ID = int(os.environ.get("ALLOWED_CHAT_ID", "268470621"))
 
-async def check_access(update: Update) -> bool:
-    allowed = set(
+def _get_allowed_chat_ids() -> list[int]:
+    """Список всех разрешённых chat_id — используется для рассылки
+    административных уведомлений (алерты бэкапа и т.п.)."""
+    return [
         int(x.strip())
         for x in os.environ.get("ALLOWED_CHAT_IDS", str(ALLOWED_CHAT_ID)).split(",")
         if x.strip().lstrip("-").isdigit()
-    )
+    ]
+
+async def check_access(update: Update) -> bool:
+    allowed = set(_get_allowed_chat_ids())
     return update.effective_chat.id in allowed
 
 
@@ -161,6 +168,9 @@ def main_menu_keyboard():
         [
             InlineKeyboardButton("🏦 Реквизиты",       callback_data="menu:bank_profiles"),
             InlineKeyboardButton("🧠 Память",          callback_data="menu:memory"),
+        ],
+        [
+            InlineKeyboardButton("💾 Бэкапы",          callback_data="menu:backup"),
         ],
     ])
 
@@ -229,6 +239,71 @@ async def del_instruction(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ Инструкция #{instruction_id} удалена")
     except (IndexError, ValueError):
         await update.message.reply_text("Укажите номер инструкции: /del_instruction 1")
+
+
+async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /backup — быстрый доступ к подменю бэкапов."""
+    if not await check_access(update):
+        await update.message.reply_text("⛔ Доступ запрещён.")
+        return
+    _clear_awaiting_flags(context)
+
+    latest = await asyncio.to_thread(backup.list_backups, 1)
+    if latest:
+        last = latest[0]
+        summary = (
+            f"🕓 Последний бэкап: *{last['created']}*\n"
+            f"💾 Размер: {last['size_kb']} KB"
+        )
+    else:
+        summary = "🕓 Бэкапов ещё нет."
+
+    text = (
+        "💾 *Бэкапы журнала*\n\n"
+        f"{summary}\n\n"
+        "_Автоматический бэкап делается каждый день в 03:00_"
+    )
+    kb = [
+        [InlineKeyboardButton("💾 Создать сейчас",     callback_data="backup:create")],
+        [InlineKeyboardButton("📋 Последние бэкапы",   callback_data="backup:list")],
+        [InlineKeyboardButton("📂 Открыть папку",      callback_data="backup:folder")],
+        [InlineKeyboardButton("🗑 Очистить старые",    callback_data="backup:cleanup")],
+        [InlineKeyboardButton("◀️ Меню",                callback_data="menu:back")],
+    ]
+    await update.message.reply_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(kb),
+    )
+
+
+async def daily_backup_job(context: ContextTypes.DEFAULT_TYPE):
+    """Ежедневный автобэкап + ротация. Успех — тихо в логи, ошибка — алерт в чат."""
+    logger.info("Запуск ежедневного бэкапа")
+    result = await asyncio.to_thread(backup.create_backup)
+
+    if result.get("success"):
+        cleanup = await asyncio.to_thread(backup.cleanup_old_backups)
+        # При успехе — молчим. Логов хватит. Не спамим Александру каждое утро.
+        logger.info(
+            f"Автобэкап OK: {result['file_name']} ({result['size_kb']} KB), "
+            f"удалено старых: {cleanup.get('deleted', 0)}"
+        )
+        return
+
+    # Ошибка — уведомляем всех разрешённых
+    err = result.get("error", "неизвестно")
+    logger.error(f"Автобэкап FAILED: {err}")
+    msg = (
+        "⚠️ *Ошибка ежедневного бэкапа*\n\n"
+        f"`{err}`\n\n"
+        "Проверь OAuth и доступ к Google Drive."
+    )
+    for chat_id in _get_allowed_chat_ids():
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
+        except Exception as e:
+            logger.warning(f"Не удалось уведомить {chat_id} об ошибке бэкапа: {e}")
 
 
 async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -549,6 +624,36 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ]])
             )
 
+        elif action == "backup":
+            # Подменю бэкапов — быстрая сводка и действия.
+            latest = await asyncio.to_thread(backup.list_backups, 1)
+            if latest:
+                last = latest[0]
+                summary = (
+                    f"🕓 Последний бэкап: *{last['created']}*\n"
+                    f"💾 Размер: {last['size_kb']} KB"
+                )
+            else:
+                summary = "🕓 Бэкапов ещё нет."
+
+            text = (
+                "💾 *Бэкапы журнала*\n\n"
+                f"{summary}\n\n"
+                "_Автоматический бэкап делается каждый день в 03:00_"
+            )
+            kb = [
+                [InlineKeyboardButton("💾 Создать сейчас",     callback_data="backup:create")],
+                [InlineKeyboardButton("📋 Последние бэкапы",   callback_data="backup:list")],
+                [InlineKeyboardButton("📂 Открыть папку",      callback_data="backup:folder")],
+                [InlineKeyboardButton("🗑 Очистить старые",    callback_data="backup:cleanup")],
+                [InlineKeyboardButton("◀️ Меню",                callback_data="menu:back")],
+            ]
+            await query.edit_message_text(
+                text,
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(kb),
+            )
+
         elif action == "back":
             context.user_data.pop("current_deal", None)
             await query.edit_message_text(
@@ -556,6 +661,74 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="MarkdownV2",
                 reply_markup=main_menu_keyboard(),
             )
+        return
+
+    # ── Управление бэкапами ──────────────────────────────────────────────────
+    if data.startswith("backup:"):
+        sub = data.split(":", 1)[1]
+
+        back_kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("◀️ К бэкапам", callback_data="menu:backup")],
+            [InlineKeyboardButton("◀️ Меню",       callback_data="menu:back")],
+        ])
+
+        if sub == "create":
+            await query.edit_message_text("💾 Создаю бэкап...")
+            result = await asyncio.to_thread(backup.create_backup)
+            if result.get("success"):
+                text = (
+                    "✅ *Бэкап создан*\n\n"
+                    f"📄 `{result['file_name']}`\n"
+                    f"💾 {result['size_kb']} KB\n"
+                )
+                if result.get("web_link"):
+                    text += f"🔗 [Открыть в Drive]({result['web_link']})"
+            else:
+                text = f"❌ *Ошибка бэкапа*\n\n`{result.get('error', 'неизвестно')}`"
+            await query.edit_message_text(text, parse_mode="Markdown",
+                                          disable_web_page_preview=True,
+                                          reply_markup=back_kb)
+
+        elif sub == "list":
+            files = await asyncio.to_thread(backup.list_backups, 10)
+            if not files:
+                text = "📋 *Бэкапов пока нет.*"
+            else:
+                lines = [f"📋 *Последние {len(files)} бэкапов:*\n"]
+                for f in files:
+                    link = f["web_link"]
+                    if link:
+                        lines.append(f"• [{f['created']}]({link}) · {f['size_kb']} KB")
+                    else:
+                        lines.append(f"• {f['created']} · {f['size_kb']} KB")
+                text = "\n".join(lines)
+            await query.edit_message_text(text, parse_mode="Markdown",
+                                          disable_web_page_preview=True,
+                                          reply_markup=back_kb)
+
+        elif sub == "folder":
+            link = await asyncio.to_thread(backup.get_folder_link)
+            if link:
+                text = f"📂 *Папка бэкапов в Drive:*\n\n{link}"
+            else:
+                text = "⚠️ Не удалось получить ссылку на папку."
+            await query.edit_message_text(text, parse_mode="Markdown",
+                                          disable_web_page_preview=True,
+                                          reply_markup=back_kb)
+
+        elif sub == "cleanup":
+            await query.edit_message_text("🗑 Ищу старые бэкапы...")
+            result = await asyncio.to_thread(backup.cleanup_old_backups)
+            if result.get("success"):
+                deleted = result.get("deleted", 0)
+                if deleted:
+                    text = f"✅ Удалено старых бэкапов: *{deleted}* (старше {result['kept_days']} дн.)"
+                else:
+                    text = f"✅ Нечего удалять — старше {result['kept_days']} дн. бэкапов нет."
+            else:
+                text = f"❌ Ошибка очистки: `{result.get('error', 'неизвестно')}`"
+            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=back_kb)
+
         return
 
     # ── Статистика по периоду ────────────────────────────────────────────────
@@ -1355,10 +1528,39 @@ def main():
     app.add_handler(CommandHandler("memory",          show_memory))
     app.add_handler(CommandHandler("clear",           clear_history))
     app.add_handler(CommandHandler("del_instruction", del_instruction))
+    app.add_handler(CommandHandler("backup",          cmd_backup))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, handle_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_error_handler(error_handler)
+
+    # ── Ежедневный автобэкап в 03:00 по Бишкеку ──────────────────────────
+    if app.job_queue is None:
+        logger.warning(
+            "JobQueue недоступен (не установлен python-telegram-bot[job-queue]) — "
+            "автобэкап отключён. Ручной бэкап через /backup работает."
+        )
+    else:
+        try:
+            from datetime import time as _dt_time
+            try:
+                from zoneinfo import ZoneInfo
+                bishkek_tz = ZoneInfo("Asia/Bishkek")
+            except Exception:
+                # Фолбэк: контейнер без tzdata → фиксированный UTC+6
+                from datetime import timezone as _tz, timedelta as _td
+                bishkek_tz = _tz(_td(hours=6))
+
+            hour   = int(os.environ.get("BACKUP_HOUR",   "3"))
+            minute = int(os.environ.get("BACKUP_MINUTE", "0"))
+            app.job_queue.run_daily(
+                daily_backup_job,
+                time=_dt_time(hour=hour, minute=minute, tzinfo=bishkek_tz),
+                name="daily_backup",
+            )
+            logger.info(f"Автобэкап запланирован на {hour:02d}:{minute:02d} Asia/Bishkek")
+        except Exception as e:
+            logger.error(f"Не удалось запланировать автобэкап: {e}", exc_info=True)
 
     logger.info("Бот запущен")
     app.run_polling()
