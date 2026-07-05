@@ -951,7 +951,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("📎 Загрузить скан",    callback_data=f"dealaction:{num}:scan"),
                  InlineKeyboardButton("🗂 Сканы",             callback_data=f"dealaction:{num}:scans")],
                 [InlineKeyboardButton("💳 Оплаты",            callback_data=f"dealaction:{num}:payments")],
-                [InlineKeyboardButton("📄 Акт выполненных услуг", callback_data=f"dealaction:{num}:build_act")],
                 [InlineKeyboardButton("✅ Завершить сделку",  callback_data=f"dealaction:{num}:complete")],
                 [InlineKeyboardButton("❌ Отменить сделку",   callback_data=f"dealaction:{num}:cancel")],
             ]

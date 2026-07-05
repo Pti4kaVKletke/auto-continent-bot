@@ -1948,6 +1948,7 @@ VIN: ...
                 {"text": "📋 АГ договор",                      "callback_data": f"docmenu:{contract_number}:ag"},
                 {"text": "🚗 ДКП ТС",                         "callback_data": f"docmenu:{contract_number}:dkp"},
                 {"text": "💰 Счёт на оплату",                  "callback_data": f"docmenu:{contract_number}:invoice"},
+                {"text": "📄 Акт выполненных услуг",           "callback_data": f"dealaction:{contract_number}:build_act"},
             ]
             return {"message": text, "buttons": buttons}
 
