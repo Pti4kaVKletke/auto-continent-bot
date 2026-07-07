@@ -790,6 +790,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text(text, parse_mode="Markdown")
             return
         return
+
+    # ── Статистика: выбор периода ────────────────────────────────────────────
+    if data.startswith("stats:"):
         period = data.split(":", 1)[1]
 
         # Свой период — просим ввести диапазон дат
