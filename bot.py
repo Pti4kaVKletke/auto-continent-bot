@@ -579,6 +579,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     InlineKeyboardButton("📅 Свой период", callback_data="stats:custom"),
                 ],
                 [
+                    InlineKeyboardButton("⏳ Ждём доплату", callback_data="stats:pending"),
+                ],
+                [
                     InlineKeyboardButton("◀️ Меню", callback_data="menu:back"),
                 ],
             ]
@@ -794,6 +797,103 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Статистика: выбор периода ────────────────────────────────────────────
     if data.startswith("stats:"):
         period = data.split(":", 1)[1]
+
+        # Список сделок, ждущих доплату — самостоятельный отчёт, не завязан на период
+        if period == "pending":
+            await query.edit_message_text("⏳ Собираю список сделок, ждущих доплату...")
+            try:
+                deals = await agent.sheets.get_all_deals()
+            except Exception as e:
+                logger.error(f"Ошибка получения сделок для 'ждём доплату': {e}", exc_info=True)
+                await query.edit_message_text(
+                    f"⚠️ Ошибка: {e}",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("◀️ К периодам", callback_data="menu:stats"),
+                    ]]),
+                )
+                return
+
+            pending = [
+                d for d in deals
+                if (d.get("Статус") or "").strip().lower() == "ждём доплату"
+            ]
+
+            back_kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("◀️ К периодам", callback_data="menu:stats")],
+                [InlineKeyboardButton("◀️ Меню",       callback_data="menu:back")],
+            ])
+
+            if not pending:
+                await query.edit_message_text(
+                    "✅ Сделок, ждущих доплату, нет.",
+                    reply_markup=back_kb,
+                )
+                return
+
+            # Сортируем по дате договора (свежие сверху)
+            def _sort_key(d):
+                dt = d.get("Дата договора") or ""
+                # DD.MM.YYYY → YYYYMMDD для лексикографической сортировки
+                try:
+                    dd, mm, yy = dt.split(".")
+                    return f"{yy}{mm}{dd}"
+                except Exception:
+                    return ""
+            pending.sort(key=_sort_key, reverse=True)
+
+            lines = [f"⏳ *Сделок ждёт доплату: {len(pending)}*\n"]
+            total_remainder_by_currency: dict[str, float] = {}
+
+            for d in pending:
+                num  = d.get("Номер договора", "—")
+                fio  = d.get("buyer_initials") or d.get("buyer_name") or "—"
+                car  = d.get("car_model") or "—"
+                vin  = d.get("car_vin") or ""
+                curr = (d.get("currency") or "руб").strip() or "руб"
+
+                total    = _calc_total_amount(d)
+                received = sum(p["amount"] for p in _parse_payments(d.get("Платежи", "")))
+                remainder = total - received
+
+                total_remainder_by_currency[curr] = total_remainder_by_currency.get(curr, 0.0) + remainder
+
+                vin_tail = f" · `...{vin[-6:]}`" if vin else ""
+                lines.append(
+                    f"📄 `{num}` · *{fio}*\n"
+                    f"   🚗 {car}{vin_tail}\n"
+                    f"   💰 Сумма:    {_fmt_money(total)} {curr}\n"
+                    f"   📥 Оплачено: {_fmt_money(received)} {curr}\n"
+                    f"   ⏳ Остаток:  *{_fmt_money(remainder)} {curr}*\n"
+                )
+
+            # Итоговый остаток по валютам
+            lines.append("─" * 20)
+            remainder_str = ", ".join(
+                f"*{_fmt_money(v)} {c}*"
+                for c, v in sorted(total_remainder_by_currency.items())
+            )
+            lines.append(f"💼 *Всего к получению:* {remainder_str}")
+
+            text_out = "\n".join(lines)
+
+            # Telegram лимит на сообщение ~4096 симв. Если превысили — режем.
+            if len(text_out) > 3900:
+                text_out = text_out[:3800] + "\n\n_(список обрезан — слишком много сделок)_"
+
+            try:
+                await query.edit_message_text(
+                    text_out,
+                    parse_mode="Markdown",
+                    reply_markup=back_kb,
+                )
+            except Exception as e:
+                logger.warning(f"Не удалось отредактировать сообщение с pending, шлём новым: {e}")
+                await query.message.reply_text(
+                    text_out,
+                    parse_mode="Markdown",
+                    reply_markup=back_kb,
+                )
+            return
 
         # Свой период — просим ввести диапазон дат
         if period == "custom":
