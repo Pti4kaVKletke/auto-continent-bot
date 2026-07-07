@@ -295,6 +295,7 @@ class DocumentAgent(_AgentV1):
         result["files"] = self._dedup_files(result["files"])
 
         memory.add_to_history("assistant", result.get("text", ""))
+        result = self._maybe_inject_bank_choice(result)
         return result
 
     # ── Вспомогательные методы ───────────────────────────────────────────

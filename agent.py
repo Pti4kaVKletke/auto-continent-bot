@@ -1095,6 +1095,47 @@ VIN: ...
                 "success": False,
             }
         memory.add_to_history("assistant", result.get("text", ""))
+        result = self._maybe_inject_bank_choice(result)
+        return result
+
+    def _maybe_inject_bank_choice(self, result: dict) -> dict:
+        """Страховка: если LLM ответила текстом про выбор банковских реквизитов
+        (перечислила профили или спросила «какой профиль использовать»), но не
+        вызвала request_bank_choice — прикрепляем кнопки постфактум.
+
+        Промпт и tool description просят делать это через инструмент, но модель
+        временами игнорирует и выдаёт список текстом. Детерминированный
+        перехват здесь надёжнее любой промпт-инженерии.
+        """
+        if not result or result.get("buttons"):
+            return result
+        text = (result.get("text") or result.get("message") or "").lower()
+        if not text:
+            return result
+
+        # Триггеры: явный запрос выбора профиля или показ сохранённого списка
+        triggers = (
+            "какие реквизиты",
+            "какой профиль",
+            "какой из профилей",
+            "сохранённые профили",
+            "сохраненные профили",
+            "доступные сохран",
+            "укажите новые реквизиты",
+            "или новые реквизиты",
+            "или укажите",
+        )
+        if not any(t in text for t in triggers):
+            return result
+
+        profiles = memory.list_bank_profiles()
+        if not profiles:
+            return result
+
+        buttons = [{"text": name, "callback_data": f"bankprofile:{name}"} for name in profiles]
+        buttons.append({"text": "🆕 Новые реквизиты", "callback_data": "bankprofile:__new__"})
+        result["buttons"] = buttons
+        logger.info("Auto-injected bank_choice buttons (LLM ответила текстом вместо request_bank_choice)")
         return result
 
     def _get_tools(self) -> list:
