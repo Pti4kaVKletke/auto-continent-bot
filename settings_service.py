@@ -1,21 +1,4 @@
-"""
-settings_service.py — управление настройками бота через Railway env-переменные.
-
-Идея: в Telegram-меню Александры есть раздел «⚙️ Настройки», где кнопками
-переключаются рабочие параметры (модель Claude, версия агента, флаги
-SKIP_PDF/SKIP_DRIVE и т.п.). Каждое изменение отправляется в Railway
-GraphQL API через serviceVariablesUpsert — Railway автоматически передеплоит
-сервис, и бот перезапустится уже с новыми значениями.
-
-Данные-первичны: список настроек SETTINGS описывает всё, что доступно в меню.
-Чтобы добавить новую настройку — просто дописать словарь в SETTINGS.
-
-Требуемые Railway env-переменные (уже есть в проекте):
-  RAILWAY_API_TOKEN       — токен Railway API
-  RAILWAY_SERVICE_ID      — ID сервиса
-  RAILWAY_ENVIRONMENT_ID  — ID окружения (production)
-"""
-
+"""settings_service.py — управление настройками бота через Railway env-переменные."""
 import json
 import logging
 import os
@@ -23,15 +6,7 @@ import urllib.request
 
 logger = logging.getLogger(__name__)
 
-# ─── РЕЕСТР НАСТРОЕК ─────────────────────────────────────────────────────────
-# Каждая настройка: {
-#   "key":     имя env-переменной
-#   "label":   что показать в меню
-#   "default": значение когда env-переменная не задана
-#   "options": [{"label": показать, "value": реальное значение}, ...]
-# }
-
-SETTINGS: list[dict] = [
+SETTINGS: list = [
     {
         "key":     "CLAUDE_MODEL",
         "label":   "🤖 Модель Claude",
@@ -83,17 +58,11 @@ SETTINGS: list[dict] = [
 ]
 
 
-# ─── ЧТЕНИЕ ТЕКУЩИХ ЗНАЧЕНИЙ ─────────────────────────────────────────────────
-
-def get_current_value(setting: dict) -> str:
-    """Текущее значение env-переменной с фолбэком на default."""
+def get_current_value(setting):
     return os.environ.get(setting["key"], setting["default"])
 
 
-def get_current_label(setting: dict) -> str:
-    """Человекочитаемая метка текущей опции.
-    Если env-переменная имеет значение, которого нет в options — вернём
-    само значение (чтобы пользователь увидел, что там кастомное)."""
+def get_current_label(setting):
     current = get_current_value(setting)
     for opt in setting["options"]:
         if opt["value"] == current:
@@ -101,30 +70,22 @@ def get_current_label(setting: dict) -> str:
     return f"(кастом) {current}"
 
 
-def get_setting_by_index(i: int) -> dict | None:
+def get_setting_by_index(i):
     if 0 <= i < len(SETTINGS):
         return SETTINGS[i]
     return None
 
 
-def get_option_by_index(setting: dict, j: int) -> dict | None:
+def get_option_by_index(setting, j):
     opts = setting.get("options", [])
     if 0 <= j < len(opts):
         return opts[j]
     return None
 
 
-# ─── ЗАПИСЬ В RAILWAY ────────────────────────────────────────────────────────
-
-def set_railway_variable(name: str, value: str) -> tuple[bool, str]:
+def set_railway_variable(name, value):
     """Обновляет env-переменную через Railway GraphQL API.
-    Возвращает (ok, error_message). При ok=True error_message пустая.
-
-    После успешного вызова Railway автоматически передеплоит сервис —
-    бот перезапустится и подхватит новое значение. Локально также
-    обновляем os.environ, чтобы последующие чтения в этом процессе
-    (до рестарта) видели новое значение.
-    """
+    Возвращает (ok: bool, error_message: str)."""
     railway_token       = os.environ.get("RAILWAY_API_TOKEN", "")
     railway_service_id  = os.environ.get("RAILWAY_SERVICE_ID", "")
     railway_env_id      = os.environ.get("RAILWAY_ENVIRONMENT_ID", "")
@@ -168,18 +129,12 @@ def set_railway_variable(name: str, value: str) -> tuple[bool, str]:
         logger.warning(f"settings: Railway API вернул ошибки: {errs}")
         return False, f"Railway API: {errs}"
 
-    # Успех — обновляем локальный os.environ, чтобы в этом процессе
-    # (до рестарта Railway) чтения возвращали свежее значение.
     os.environ[name] = value
     logger.info(f"settings: переменная {name}={value} сохранена в Railway")
     return True, ""
 
 
-# ─── ЛОГИРОВАНИЕ ТЕКУЩИХ ЗНАЧЕНИЙ ПРИ СТАРТЕ ─────────────────────────────────
-
-def log_current_settings() -> None:
-    """Вывести в логи все текущие значения — удобно после рестарта видеть
-    что реально подхватилось из Railway env."""
+def log_current_settings():
     lines = ["Текущие настройки бота:"]
     for s in SETTINGS:
         lines.append(f"  {s['key']} = {get_current_value(s)}")
