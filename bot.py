@@ -21,6 +21,7 @@ else:
 from agent import _parse_payments, _calc_total_amount, _fmt_money
 
 import memory
+import settings_service
 from backup_service import BackupService
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -171,8 +172,44 @@ def main_menu_keyboard():
         ],
         [
             InlineKeyboardButton("💾 Бэкапы",          callback_data="menu:backup"),
+            InlineKeyboardButton("⚙️ Настройки",       callback_data="menu:settings"),
         ],
     ])
+
+
+def settings_menu_keyboard():
+    """Корневое подменю настроек: по кнопке на каждую настройку из реестра
+    settings_service.SETTINGS. В подписи кнопки — текущее значение."""
+    kb = []
+    for i, s in enumerate(settings_service.SETTINGS):
+        current = settings_service.get_current_label(s)
+        # Обрезаем чтобы влезло в кнопку (Telegram лимит на текст кнопки ~64 симв)
+        label = f"{s['label']}: {current}"
+        if len(label) > 60:
+            label = label[:57] + "…"
+        kb.append([InlineKeyboardButton(label, callback_data=f"settings:{i}")])
+    kb.append([InlineKeyboardButton("◀️ Меню", callback_data="menu:back")])
+    return InlineKeyboardMarkup(kb)
+
+
+def setting_options_keyboard(setting_index: int):
+    """Подменю выбора значения для конкретной настройки."""
+    setting = settings_service.get_setting_by_index(setting_index)
+    if not setting:
+        return InlineKeyboardMarkup([[
+            InlineKeyboardButton("◀️ К настройкам", callback_data="menu:settings")
+        ]])
+    current = settings_service.get_current_value(setting)
+    kb = []
+    for j, opt in enumerate(setting["options"]):
+        marker = "✅ " if opt["value"] == current else "○ "
+        kb.append([InlineKeyboardButton(
+            marker + opt["label"],
+            callback_data=f"settings:{setting_index}:{j}",
+        )])
+    kb.append([InlineKeyboardButton("◀️ К настройкам", callback_data="menu:settings")])
+    kb.append([InlineKeyboardButton("◀️ Меню",         callback_data="menu:back")])
+    return InlineKeyboardMarkup(kb)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -662,6 +699,23 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=InlineKeyboardMarkup(kb),
             )
 
+        elif action == "settings":
+            # Корневое меню настроек — список параметров с текущими значениями.
+            lines = ["⚙️ *Настройки*\n"]
+            for s in settings_service.SETTINGS:
+                lines.append(f"*{s['label']}*")
+                lines.append(f"  {settings_service.get_current_label(s)}")
+                lines.append("")
+            lines.append(
+                "_Изменения применяются после автоматического рестарта_\n"
+                "_Railway (~30 сек)._"
+            )
+            await query.edit_message_text(
+                "\n".join(lines),
+                parse_mode="Markdown",
+                reply_markup=settings_menu_keyboard(),
+            )
+
         elif action == "back":
             context.user_data.pop("current_deal", None)
             await query.edit_message_text(
@@ -737,6 +791,102 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text = f"❌ Ошибка очистки: `{result.get('error', 'неизвестно')}`"
             await query.edit_message_text(text, parse_mode="Markdown", reply_markup=back_kb)
 
+        return
+
+    # ── Настройки (⚙️) ───────────────────────────────────────────────────────
+    # Форматы:
+    #   settings:<i>          — показать варианты для настройки i
+    #   settings:<i>:<j>      — применить вариант j для настройки i
+    if data.startswith("settings:"):
+        parts = data.split(":")
+        # parts[0] == "settings"
+        try:
+            setting_index = int(parts[1])
+        except (IndexError, ValueError):
+            await query.edit_message_text(
+                "⚠️ Некорректный параметр настройки.",
+                reply_markup=settings_menu_keyboard(),
+            )
+            return
+
+        setting = settings_service.get_setting_by_index(setting_index)
+        if not setting:
+            await query.edit_message_text(
+                "⚠️ Настройка не найдена.",
+                reply_markup=settings_menu_keyboard(),
+            )
+            return
+
+        # Клик по конкретному варианту — применяем через Railway API
+        if len(parts) >= 3:
+            try:
+                option_index = int(parts[2])
+            except ValueError:
+                await query.edit_message_text(
+                    "⚠️ Некорректный вариант.",
+                    reply_markup=setting_options_keyboard(setting_index),
+                )
+                return
+
+            option = settings_service.get_option_by_index(setting, option_index)
+            if not option:
+                await query.edit_message_text(
+                    "⚠️ Вариант не найден.",
+                    reply_markup=setting_options_keyboard(setting_index),
+                )
+                return
+
+            # Если значение и так уже установлено — просто перерисуем меню
+            if settings_service.get_current_value(setting) == option["value"]:
+                await query.edit_message_text(
+                    f"ℹ️ *{setting['label']}* уже установлена в:\n"
+                    f"  {option['label']}",
+                    parse_mode="Markdown",
+                    reply_markup=setting_options_keyboard(setting_index),
+                )
+                return
+
+            await query.edit_message_text(
+                f"⏳ Обновляю *{setting['label']}*…",
+                parse_mode="Markdown",
+            )
+            ok, err = await asyncio.to_thread(
+                settings_service.set_railway_variable,
+                setting["key"], option["value"],
+            )
+            if ok:
+                text = (
+                    f"✅ *{setting['label']}* обновлена:\n"
+                    f"  {option['label']}\n\n"
+                    "_Railway автоматически передеплоит сервис (~30 сек)._\n"
+                    "_После рестарта бот подхватит новое значение._"
+                )
+            else:
+                text = (
+                    f"❌ Не удалось обновить *{setting['label']}*.\n\n"
+                    f"`{err}`\n\n"
+                    "Проверь `RAILWAY_API_TOKEN`, `RAILWAY_SERVICE_ID` и "
+                    "`RAILWAY_ENVIRONMENT_ID` в переменных сервиса."
+                )
+            await query.edit_message_text(
+                text,
+                parse_mode="Markdown",
+                reply_markup=setting_options_keyboard(setting_index),
+            )
+            return
+
+        # Клик по самой настройке — показать варианты
+        current_label = settings_service.get_current_label(setting)
+        text = (
+            f"*{setting['label']}*\n\n"
+            f"Текущее значение: _{current_label}_\n\n"
+            f"Env-переменная: `{setting['key']}`"
+        )
+        await query.edit_message_text(
+            text,
+            parse_mode="Markdown",
+            reply_markup=setting_options_keyboard(setting_index),
+        )
         return
 
     # ── Подтверждение / отмена копирования сделки ────────────────────────────
@@ -1718,6 +1868,7 @@ async def error_handler(update, context):
 def main():
     memory.init_db()
     memory.cleanup_old_pending_scans()
+    settings_service.log_current_settings()
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     app = ApplicationBuilder().token(token).build()
 
