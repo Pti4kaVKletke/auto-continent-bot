@@ -91,9 +91,13 @@ def _num(v) -> float:
 
     Возвращает 0.0 если распарсить не удалось. Умеет читать русский формат
     хранения в Sheets: '1,0' → 1.0, '3 000 631,20' → 3000631.2.
+
+    Убирает ВСЕ виды пробельных символов (обычный пробел, NBSP \xa0, узкий
+    NBSP  , тонкий пробел   и т.п.) — Google Sheets в русской
+    локали часто отдаёт числа с неразрывными пробелами.
     """
     try:
-        return float(str(v).replace(",", ".").replace(" ", ""))
+        return float(re.sub(r"\s+", "", str(v).replace(",", ".")))
     except (TypeError, ValueError):
         return 0.0
 
@@ -2532,7 +2536,10 @@ VIN: ...
 
         if not contract_number:
             return {"error": "⚠️ Не указан номер сделки"}
-        if not re.match(r"^\d{2}\.\d{2}\.\d{4}$", date):
+        # Валидируем не только маску, но и реальность даты (32.13.2026 не пройдёт).
+        try:
+            datetime.strptime(date, "%d.%m.%Y")
+        except (TypeError, ValueError):
             return {"error": f"⚠️ Неверный формат даты: «{date}». Ожидается ДД.ММ.ГГГГ"}
         try:
             amount = float(amount_in)
@@ -2732,6 +2739,7 @@ VIN: ...
             "extra_links": extra_links,
             "message":     f"📄 Акт по сделке *{contract_number}* от {act_date} сформирован",
             "buttons": [
+        
                 {"text": "◀️ К сделке", "callback_data": f"dealaction:{contract_number}:menu"},
             ],
         }

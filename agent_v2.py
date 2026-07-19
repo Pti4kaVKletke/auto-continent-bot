@@ -168,6 +168,13 @@ class DocumentAgent(_AgentV1):
         else:
             current_content = user_text
 
+        # Если предыдущий тёрн упал между add_to_history("user") и
+        # add_to_history("assistant"), последним в sanitized остался "user".
+        # Добавление ещё одного user-сообщения даст 400 «expected alternating roles».
+        # Вставляем placeholder-ассистента, чтобы восстановить чередование.
+        if messages and messages[-1]["role"] == "user":
+            messages.append({"role": "assistant", "content": "…"})
+
         messages.append({"role": "user", "content": current_content})
 
         # ── Agentic loop ──────────────────────────────────────────────────
@@ -403,7 +410,7 @@ class DocumentAgent(_AgentV1):
                             [""] * len(tool_result.get("extra_files", []))),
         ):
             if Path(f_path).exists():
-                result["files"].append({
+                            result["files"].append({
                     "file":       f_path,
                     "filename":   f_name,
                     "drive_link": f_link,

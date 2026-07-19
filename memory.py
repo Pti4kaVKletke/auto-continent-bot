@@ -5,6 +5,10 @@ from pathlib import Path
 
 DB_PATH = os.environ.get("DB_PATH", "/data/agent.db")
 
+# Сколько дней хранить историю диалога и незавершённые сканы.
+# История может содержать паспортные данные / ИНН, поэтому не бесконечно.
+HISTORY_RETENTION_DAYS = int(os.environ.get("HISTORY_RETENTION_DAYS", "7"))
+
 
 def get_conn():
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
@@ -184,8 +188,11 @@ def add_to_history(role: str, content: str):
             SELECT id FROM history ORDER BY id DESC LIMIT 50
         )
     """)
-    # Удаляем записи старше 7 дней (могут содержать паспортные данные, ИНН и т.п.)
-    conn.execute("DELETE FROM history WHERE created_at < datetime('now', '-3 days')")
+    # Удаляем записи старше HISTORY_RETENTION_DAYS (могут содержать паспортные данные, ИНН и т.п.)
+    conn.execute(
+        "DELETE FROM history WHERE created_at < datetime('now', ?)",
+        (f"-{HISTORY_RETENTION_DAYS} days",),
+    )
     conn.commit()
     conn.close()
 
