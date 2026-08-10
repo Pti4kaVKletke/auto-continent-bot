@@ -1340,14 +1340,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             await send_result(query.message, result)
 
-        elif action == "build_act":
-            # Формирование акта выполненных услуг. Дата акта берётся автоматически
-            # из даты последнего платежа. Если сделка не оплачена — build_act_impl
-            # вернёт понятную ошибку с остатком.
-            await query.edit_message_text(f"⏳ Формирую акт по сделке {num}...")
+        elif action in ("build_act", "build_receipt"):
+            # Формирование акта выполненных услуг / расписки продавца о получении
+            # наличных (Приложение № 1 к акту). Дата берётся автоматически из даты
+            # последнего платежа. Если сделка не оплачена — *_impl вернёт понятную
+            # ошибку с остатком.
+            is_act = action == "build_act"
+            label  = "акт" if is_act else "расписку"
+            await query.edit_message_text(f"⏳ Формирую {label} по сделке {num}...")
             result = await typing_while(
                 update.effective_chat.id, context,
-                agent.build_act_impl(num),
+                agent.build_act_impl(num) if is_act else agent.build_receipt_impl(num),
             )
             if result.get("error"):
                 await query.message.reply_text(
@@ -1358,7 +1361,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     ]]),
                 )
             else:
-                # Адаптируем формат build_act_impl (file/extra_*) в формат send_result (files-list)
+                # Адаптируем формат build_act_impl / build_receipt_impl
+                # (file/extra_*) в формат send_result (files-list)
                 files = []
                 if result.get("file"):
                     files.append({

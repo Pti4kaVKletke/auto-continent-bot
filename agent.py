@@ -943,6 +943,8 @@ VIN: ...
 - НЕ обновляй Платежи/Получено/Остаток через update_deal напрямую — это может сломать баланс. Используй ТОЛЬКО add_payment и remove_payment.
 - Когда пользователь просит «сформируй акт», «сделай акт», «акт выполненных услуг по сделке NNN» — вызывай build_act(contract_number). Дата акта берётся автоматически (последний платёж). Если сделка не оплачена — инструмент сам вернёт ошибку с остатком.
 - После полной оплаты (когда add_payment сообщает «🎉 Сделка полностью оплачена») пользователь ВИДИТ кнопку «📄 Сформировать акт» и сам её нажмёт. Не предлагай построить акт своими сообщениями и не вызывай build_act автоматически.
+- Когда пользователь просит «сделай расписку», «расписка о получении денег», «расписка продавца по сделке NNN» — вызывай build_receipt(contract_number). Расписка — это Приложение № 1 к акту: её подписывает ПРОДАВЕЦ, подтверждая получение наличных. Дата расписки совпадает с датой акта (последний платёж). Если сделка оплачена не полностью — инструмент сам вернёт ошибку с остатком.
+- Кнопку «🧾 Сформировать расписку» пользователь тоже видит сам (рядом с кнопкой акта). Не вызывай build_receipt автоматически и не предлагай её текстом.
 
 ⚠️ ⚠️ ⚠️ КРИТИЧНО ПРО ВЫЗОВ ИНСТРУМЕНТОВ ⚠️ ⚠️ ⚠️
 - ЗАПРЕЩЕНО писать текст, ИМИТИРУЮЩИЙ результат работы инструмента, без реального вызова этого инструмента.
@@ -1184,6 +1186,24 @@ VIN: ...
                     "Дата акта берётся автоматически — это дата последнего платежа по сделке. "
                     "Формируется только для полностью оплаченных сделок; иначе вернётся ошибка. "
                     "Используй когда пользователь просит «сделай акт», «сформируй акт», «акт выполненных услуг»."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "contract_number": {"type": "string", "description": "Номер договора"},
+                    },
+                    "required": ["contract_number"],
+                },
+            },
+            {
+                "name": "build_receipt",
+                "description": (
+                    "Сформировать расписку продавца о получении наличных денежных средств "
+                    "(Приложение № 1 к акту об оказании услуг). "
+                    "Дата расписки берётся автоматически — это дата последнего платежа по сделке. "
+                    "Формируется только для полностью оплаченных сделок; иначе вернётся ошибка. "
+                    "Используй когда пользователь просит «сделай расписку», «сформируй расписку», "
+                    "«расписка о получении денежных средств»."
                 ),
                 "input_schema": {
                     "type": "object",
@@ -2046,6 +2066,7 @@ VIN: ...
                 {"text": "🚗 ДКП ТС",                         "callback_data": f"docmenu:{contract_number}:dkp"},
                 {"text": "💰 Счёт на оплату",                  "callback_data": f"docmenu:{contract_number}:invoice"},
                 {"text": "📄 Акт выполненных услуг",           "callback_data": f"dealaction:{contract_number}:build_act"},
+                {"text": "🧾 Расписка о получении денег",       "callback_data": f"dealaction:{contract_number}:build_receipt"},
             ]
             return {"message": text, "buttons": buttons}
 
@@ -2323,6 +2344,13 @@ VIN: ...
             # Логика вынесена в публичный метод build_act_impl —
             # bot.py тоже может его вызвать напрямую (кнопка «📄 Сформировать акт»).
             return await self.build_act_impl(
+                contract_number=(tool_input.get("contract_number") or "").strip(),
+            )
+
+        elif tool_name == "build_receipt":
+            # Логика вынесена в публичный метод build_receipt_impl —
+            # bot.py тоже может его вызвать напрямую (кнопка «🧾 Сформировать расписку»).
+            return await self.build_receipt_impl(
                 contract_number=(tool_input.get("contract_number") or "").strip(),
             )
 
@@ -2639,6 +2667,10 @@ VIN: ...
                 "text":          "📄 Сформировать акт",
                 "callback_data": f"dealaction:{contract_number}:build_act",
             })
+            buttons.append({
+                "text":          "🧾 Сформировать расписку",
+                "callback_data": f"dealaction:{contract_number}:build_receipt",
+            })
         buttons += [
             {"text": "💳 К оплатам", "callback_data": f"dealaction:{contract_number}:payments"},
             {"text": "◀️ К сделке",   "callback_data": f"dealaction:{contract_number}:menu"},
@@ -2739,7 +2771,99 @@ VIN: ...
             "extra_links": extra_links,
             "message":     f"📄 Акт по сделке *{contract_number}* от {act_date} сформирован",
             "buttons": [
-        
+                {"text": "🧾 Сформировать расписку",
+                 "callback_data": f"dealaction:{contract_number}:build_receipt"},
+                {"text": "◀️ К сделке", "callback_data": f"dealaction:{contract_number}:menu"},
+            ],
+        }
+
+    async def build_receipt_impl(self, contract_number: str) -> dict:
+        """Формирует расписку продавца о получении наличных денежных средств.
+
+        Расписка — Приложение № 1 к акту об оказании услуг, поэтому условия
+        те же, что и у акта: сделка должна быть оплачена полностью, дата
+        расписки = дата хронологически последнего платежа.
+
+        Единая точка входа. Вызывается:
+          • из bot.py (кнопка «🧾 Сформировать расписку» — в меню документов,
+            после закрытия сделки платежом и после формирования акта)
+          • как tool из LLM (при запросе «сделай расписку»)
+        """
+        from datetime import datetime as _dt
+
+        contract_number = (contract_number or "").strip()
+        if not contract_number:
+            return {"error": "⚠️ Не указан номер сделки"}
+
+        deal = await self.sheets.get_deal(contract_number)
+        if not deal:
+            return {"error": f"⚠️ Сделка *{contract_number}* не найдена"}
+
+        payments = _parse_payments(deal.get("Платежи", ""))
+        if not payments:
+            return {"error": (
+                f"⚠️ По сделке *{contract_number}* нет зарегистрированных платежей. "
+                "Расписка формируется только после полной оплаты."
+            )}
+
+        total     = _calc_total_amount(deal)
+        received  = sum(p["amount"] for p in payments)
+        remainder = total - received
+        if remainder > 0.01:
+            currency = (deal.get("currency") or "руб").strip()
+            return {"error": (
+                f"⚠️ Сделка *{contract_number}* оплачена не полностью.\n"
+                f"Остаток: {_fmt_money(remainder)} {currency}. "
+                "Расписка формируется только после полной оплаты."
+            )}
+
+        # Дата расписки — хронологически последний платёж (как у акта)
+        try:
+            receipt_date = max(
+                payments,
+                key=lambda p: _dt.strptime(p["date"], "%d.%m.%Y"),
+            )["date"]
+        except Exception:
+            receipt_date = payments[-1]["date"]
+
+        contract_date  = deal.get("Дата договора", "")
+        commission_pct = _num(deal.get("Комиссия %", "1")) or 1.0
+
+        data = {k: (v if v is not None else "") for k, v in deal.items()}
+
+        try:
+            deal_folder_id = await self.drive.get_or_create_deal_folder(contract_number)
+            docx_path = await self.builder.build_receipt(
+                data, contract_number, contract_date, receipt_date, commission_pct,
+            )
+            docx_name = f"Расписка_{contract_number}.docx"
+            docx_link = await self.drive.upload_file(docx_path, docx_name, deal_folder_id)
+
+            extra_files, extra_names, extra_links = [], [], []
+            skip_pdf = os.environ.get("SKIP_PDF", "0") == "1"
+            if not skip_pdf:
+                pdf_path = await self.builder.convert_to_pdf(docx_path)
+                if pdf_path:
+                    pdf_name = f"Расписка_{contract_number}.pdf"
+                    pdf_link = await self.drive.upload_file(pdf_path, pdf_name, deal_folder_id)
+                    extra_files.append(pdf_path)
+                    extra_names.append(pdf_name)
+                    extra_links.append(pdf_link)
+        except FileNotFoundError as e:
+            return {"error": f"⚠️ {e}"}
+        except Exception as e:
+            logger.error(f"Ошибка формирования расписки для {contract_number}: {e}", exc_info=True)
+            return {"error": f"⚠️ Не удалось сформировать расписку: {e}"}
+
+        return {
+            "file":        docx_path,
+            "filename":    docx_name,
+            "drive_link":  docx_link,
+            "extra_files": extra_files,
+            "extra_names": extra_names,
+            "extra_links": extra_links,
+            "message":     f"🧾 Расписка по сделке *{contract_number}* от {receipt_date} сформирована",
+            "buttons": [
                 {"text": "◀️ К сделке", "callback_data": f"dealaction:{contract_number}:menu"},
             ],
         }

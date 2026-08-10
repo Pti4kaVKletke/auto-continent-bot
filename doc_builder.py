@@ -1,4 +1,5 @@
 import os
+import re
 import asyncio
 import logging
 import subprocess
@@ -544,6 +545,98 @@ class DocumentBuilder:
         return await self._fill_template(
             template, data, contract_number, contract_date,
             f"Акт_{contract_number}", commission_pct,
+            extra_replacements=extra,
+        )
+
+    # ─── РАСПИСКА О ПОЛУЧЕНИИ ДЕНЕЖНЫХ СРЕДСТВ ───────────────────────────
+
+    async def build_receipt(self, data: dict, contract_number: str, contract_date: str,
+                            receipt_date: str, commission_pct: float = 1.0) -> str:
+        """
+        Формирует расписку продавца о получении наличных денежных средств
+        (Приложение № 1 к акту об оказании услуг).
+
+        contract_date — дата АГ договора / ДКП (ДД.ММ.ГГГГ). Подставляется во все
+        места «от «..» ... г.», где упоминаются номера договоров — так же как в акте.
+
+        receipt_date — дата самой расписки. Совпадает с датой акта, то есть с датой
+        хронологически последнего платежа по сделке.
+        """
+        template = self.templates_dir / "raspiska_template.docx"
+        if not template.exists():
+            raise FileNotFoundError(
+                f"Шаблон расписки не найден: {template}. "
+                "Положите raspiska_template.docx в папку templates/."
+            )
+
+        n = self._normalize
+
+        # Разбор даты «ДД.ММ.ГГГГ» → (день, месяц-словом, год)
+        def _parts(date_str):
+            date_str = (date_str or "").strip()
+            if len(date_str) < 10:
+                return "", "", ""
+            return date_str[0:2], self._month_name(date_str[3:5]), date_str[6:10]
+
+        r_day, r_month, r_year = _parts(receipt_date)
+
+        # ── Блок получателя денег — продавец (гражданин КР) ───────────────
+        receiver = n(data.get("seller_full_details", "")).strip()
+        if not receiver:
+            bits = [n(data.get("seller_name", ""))]
+            if data.get("seller_birth_date"):
+                bits.append(f"{data['seller_birth_date']} года рождения")
+            id_num = data.get("seller_id_number", "") or data.get("seller_id", "")
+            if id_num:
+                id_str = f"ID-карта № {id_num}"
+                if data.get("seller_id_issued_by"):
+                    id_str += f", выдана {n(data['seller_id_issued_by'])}"
+                if data.get("seller_id_issued_date"):
+                    id_str += f" {data['seller_id_issued_date']}"
+                bits.append(id_str)
+            if data.get("seller_address"):
+                bits.append(f"зарегистрирован(а) по адресу: {n(data['seller_address'])}")
+            receiver = ", ".join(b for b in bits if b)
+
+        receiver_initials = (n(data.get("seller_initials", "")).strip()
+                             or n(data.get("seller_name", "")).strip())
+
+        # ── Сумма в рублях прописью ───────────────────────────────────────
+        # В журнале поле может быть пустым — считаем сами, чтобы в расписке
+        # никогда не оставалось незамещённого плейсхолдера.
+        price_words = (data.get("car_price_words", "") or "").strip()
+        if not price_words:
+            price_str = str(data.get("car_price", "0")).replace(" ", "").replace(",", ".")
+            try:
+                price_words = amount_to_words_rub(float(price_str))
+            except (TypeError, ValueError):
+                price_words = ""
+            # В шаблоне слово «рублей» стоит уже после скобок, поэтому отбрасываем
+            # хвост «рублей NN копеек» — иначе получится «... рублей 00 копеек) рублей РФ».
+            cut = re.search(r"\s+рубл(ь|я|ей)\b", price_words)
+            if cut:
+                price_words = price_words[:cut.start()]
+
+        extra = {
+            # Дата расписки = дата акта (дата закрывающего платежа)
+            "{{ДЕНЬ_АКТА}}":  r_day,
+            "{{МЕСЯЦ_АКТА}}": r_month,
+            "{{ГОД_АКТА}}":   r_year,
+
+            # Получатель наличных — продавец
+            "{{ПОЛУЧАТЕЛЬ_БЛОК}}":     receiver,
+            "{{ПОЛУЧАТЕЛЬ_ИНИЦИАЛЫ}}": receiver_initials,
+
+            # Рублёвый эквивалент прописью
+            "{{ЦЕНА_ПРОПИСЬЮ}}": price_words,
+        }
+        # {{НОМЕР}}, {{ДЕНЬ}}/{{МЕСЯЦ}}/{{ГОД}}, {{СУММА_НАЛИЧНЫМИ*}},
+        # {{ВАЛЮТА_НАЛИЧНЫМИ}}, {{КУРС_ДОЛЛАРА}}, {{ЦЕНА_ЦИФРАМИ}},
+        # {{МАРКА_МОДЕЛЬ}}, {{VIN}} — покрыты базовым набором в _fill_template.
+
+        return await self._fill_template(
+            template, data, contract_number, contract_date,
+            f"Расписка_{contract_number}", commission_pct,
             extra_replacements=extra,
         )
 
