@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 import memory
 from drive_service import GoogleDriveService
-from doc_builder import DocumentBuilder
+from doc_builder import DocumentBuilder, MissingDataError
 from gsheets_service import GoogleSheetsService
 
 
@@ -100,6 +100,22 @@ def _num(v) -> float:
         return float(re.sub(r"\s+", "", str(v).replace(",", ".")))
     except (TypeError, ValueError):
         return 0.0
+
+
+def _missing_data_text(contract_number: str, e: MissingDataError) -> str:
+    """
+    Сообщение пользователю о том, что документ не выдан из-за неполных данных.
+
+    Единый текст для всех точек сборки документов (пакет, отдельный документ,
+    акт, расписка, отчёт) — чтобы Александра всегда видела одинаковый формат.
+    """
+    lines = [f"🚫 Документ по сделке *{contract_number}* не сформирован — данные неполные.", ""]
+    if e.missing:
+        lines.append("Не заполнены: " + ", ".join(e.missing) + ".")
+    if e.leftover:
+        lines.append("Неизвестные плейсхолдеры в шаблоне: " + ", ".join(e.leftover) + ".")
+    lines += ["", "Дозаполните данные в журнале и повторите."]
+    return "\n".join(lines)
 
 
 def _num_for_sheet(x: float) -> str:
@@ -359,7 +375,7 @@ _COPY_FIELDS_COMMISSION = ["Комиссия %"]
 
 # Никогда не копируется — фиксируется в новой сделке независимо
 _COPY_NEVER = {
-    "Номер договора", "Дата договора", "Статус", "Папка Drive",
+    "Номер договора", "Дата договора", "Дата ДКП", "Статус", "Папка Drive",
     "Комментарий", "Платежи", "Получено", "Остаток", "Сумма Договора",
     # Автомобиль всегда новый: VIN, TПO, цена и всё что вокруг
     "car_model", "car_vin", "car_year", "car_color",
@@ -658,6 +674,11 @@ bank_ben_line2   — БИК и корр.счёт банка получателя
 
 НЕОБЯЗАТЕЛЬНЫЕ поля (оставь пустыми если нет):
 car_body_number
+dkp_date — дата подписания ДКП в формате ДД.ММ.ГГГГ. Приходит от бота вместе с датой
+           договора («Дата договора: ... . Дата ДКП: ...») — просто перенеси её сюда.
+           САМА дату ДКП не придумывай и отдельно не переспрашивай: кнопки её выбора
+           показывает бот. Если бот прислал только дату договора — оставь пустым,
+           тогда в журнал уйдёт дата договора.
 
 === ПРАВИЛА ИЗВЛЕЧЕНИЯ ДАННЫХ ИЗ ДОКУМЕНТОВ ===
 
@@ -885,6 +906,9 @@ VIN: ...
 После этого жди ответа пользователя. Только если он подтвердил (написал "да", "верно", "создавай", "всё верно" или аналог) — вызови инструмент request_date_choice чтобы показать кнопки выбора даты договора. НЕ спрашивай дату текстом — всегда через инструмент.
 Если пользователь нажал «Сегодня» — используй {today_str}. Если нажал «Другая дата» или написал дату вручную — используй её. Передавай дату в параметр contract_date при вызове create_contract.
 
+Даты ДКП отдельно НЕ спрашивай и request_date_choice второй раз НЕ вызывай: сразу после выбора даты договора бот сам покажет кнопки выбора даты ДКП и пришлёт тебе обе даты одним сообщением вида «Дата договора: 05.08.2026. Дата ДКП: 03.08.2026».
+Получив такое сообщение, вызывай create_contract: дату договора клади в параметр contract_date, дату ДКП — в data.dkp_date. Если даты совпадают — dkp_date всё равно передавай, пустым его не оставляй.
+
 === РАБОТА С ЖУРНАЛОМ СДЕЛОК ===
 
 После создания каждой сделки она автоматически записывается в Google Sheets журнал.
@@ -945,6 +969,8 @@ VIN: ...
 - После полной оплаты (когда add_payment сообщает «🎉 Сделка полностью оплачена») пользователь ВИДИТ кнопку «📄 Сформировать акт» и сам её нажмёт. Не предлагай построить акт своими сообщениями и не вызывай build_act автоматически.
 - Когда пользователь просит «сделай расписку», «расписка о получении денег», «расписка продавца по сделке NNN» — вызывай build_receipt(contract_number). Расписка — это Приложение № 1 к акту: её подписывает ПРОДАВЕЦ, подтверждая получение наличных. Дата расписки совпадает с датой акта (последний платёж). Если сделка оплачена не полностью — инструмент сам вернёт ошибку с остатком.
 - Кнопку «🧾 Сформировать расписку» пользователь тоже видит сам (рядом с кнопкой акта). Не вызывай build_receipt автоматически и не предлагай её текстом.
+- Когда пользователь просит «сделай отчёт агента», «сформируй отчёт по сделке NNN» — вызывай build_report(contract_number). Даты отчёта, поступления средств и расчёта берутся автоматически (последний платёж). Если сделка не оплачена — инструмент сам вернёт ошибку с остатком. Кнопку «📊 Отчёт агента» пользователь видит сам — не вызывай build_report автоматически.
+- Если инструмент вернул «🚫 Документ не сформирован — данные неполные», НЕ пытайся собрать документ повторно и не придумывай недостающие значения. Просто передай пользователю список незаполненных полей и предложи их дозаполнить.
 
 ⚠️ ⚠️ ⚠️ КРИТИЧНО ПРО ВЫЗОВ ИНСТРУМЕНТОВ ⚠️ ⚠️ ⚠️
 - ЗАПРЕЩЕНО писать текст, ИМИТИРУЮЩИЙ результат работы инструмента, без реального вызова этого инструмента.
@@ -1186,6 +1212,26 @@ VIN: ...
                     "Дата акта берётся автоматически — это дата последнего платежа по сделке. "
                     "Формируется только для полностью оплаченных сделок; иначе вернётся ошибка. "
                     "Используй когда пользователь просит «сделай акт», «сформируй акт», «акт выполненных услуг»."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "contract_number": {"type": "string", "description": "Номер договора"},
+                    },
+                    "required": ["contract_number"],
+                },
+            },
+            {
+                "name": "build_report",
+                "description": (
+                    "Сформировать отчёт агента по агентскому договору. "
+                    "Дата отчёта, дата поступления средств и дата расчёта берутся автоматически — "
+                    "это дата последнего платежа по сделке. "
+                    "Формируется только для полностью оплаченных сделок; иначе вернётся ошибка. "
+                    "Используй когда пользователь просит «сделай отчёт агента», «сформируй отчёт», "
+                    "«отчёт агента по сделке». "
+                    "НЕ путай с get_statistics — та отвечает на вопросы про объёмы и итоги за период, "
+                    "а build_report создаёт документ по одной конкретной сделке."
                 ),
                 "input_schema": {
                     "type": "object",
@@ -1452,7 +1498,9 @@ VIN: ...
                 "name": "request_date_choice",
                 "description": (
                     "Показать пользователю кнопки выбора даты договора: «Сегодня» и «Другая дата». "
-                    "Вызывай ВСЕГДА после подтверждения данных сделки, вместо того чтобы спрашивать дату текстом."
+                    "Вызывай ВСЕГДА после подтверждения данных сделки, вместо того чтобы спрашивать дату текстом. "
+                    "Дату ДКП этот инструмент не спрашивает — её кнопки бот показывает сам сразу после "
+                    "выбора даты договора. Повторно вызывать инструмент ради даты ДКП НЕ нужно."
                 ),
                 "input_schema": {
                     "type": "object",
@@ -1697,6 +1745,12 @@ VIN: ...
                 logger.warning(f"create_contract: поле 'data' отсутствует, извлекаю из tool_input напрямую. Ключи: {list(data.keys())}")
             tool_input["data"] = data
 
+            # Та же защита точечно для dkp_date: LLM нередко кладёт её рядом
+            # с contract_date, а не внутрь data — тогда дата ДКП молча терялась
+            # бы и в журнал ушла дата договора.
+            if tool_input.get("dkp_date") and not data.get("dkp_date"):
+                data["dkp_date"] = tool_input["dkp_date"]
+
             date           = tool_input.get("contract_date") or datetime.now().strftime("%d.%m.%Y")
             commission_pct = float(tool_input.get("commission_pct", 1.0))
             deal_folder_id = await self.drive.get_or_create_deal_folder(number)
@@ -1728,6 +1782,11 @@ VIN: ...
                 logger.info("Строю счёт...")
                 built["invoice"] = await self.builder.build_invoice(tool_input["data"], number, date, commission_pct)
 
+            except MissingDataError as e:
+                # Строгая проверка заполнения: документ не выдаём, чтобы
+                # неидентифицированная сторона не ушла в подписанный комплект.
+                logger.error(f"Сделка {number}: документы не выданы — {e}")
+                return {"message": _missing_data_text(number, e)}
             except Exception as e:
                 logger.error(f"Ошибка построения документов для сделки {number}: {e}", exc_info=True)
                 files_done = list(built.keys())
@@ -1790,6 +1849,10 @@ VIN: ...
                     updates["Комиссия %"] = str(commission_pct)
                     updates["Дата договора"] = date
                     updates["Папка Drive"] = drive_folder_link
+                    # dkp_date приходит как поле анкеты — в журнале это
+                    # колонка «Дата ДКП». Пусто → не трогаем то, что уже стоит.
+                    if str(tool_input["data"].get("dkp_date") or "").strip():
+                        updates["Дата ДКП"] = tool_input["data"]["dkp_date"]
                     await self.sheets.update_deal(number, updates)
                 else:
                     await self.sheets.save_deal(
@@ -1859,6 +1922,9 @@ VIN: ...
                     "bank_kpp",
                 ]
                 data           = {k: deal.get(k, "") for k in REQUIRED_KEYS}
+                # Дата ДКП не входит в REQUIRED_KEYS (это системная колонка,
+                # а не поле анкеты), но нужна шаблонам ДКП/акта/отчёта.
+                data["Дата ДКП"] = deal.get("Дата ДКП", "")
                 contract_date  = deal.get("Дата договора", datetime.now().strftime("%d.%m.%Y"))
                 # _num умеет читать значения с запятой (русская локаль Sheets: "1,0" → 1.0)
                 commission_pct = _num(deal.get("Комиссия %", "1")) or 1.0
@@ -1942,6 +2008,9 @@ VIN: ...
                     await _build_and_upload_dkp()
                 elif doc_type == "invoice":
                     await _build_and_upload_invoice()
+            except MissingDataError as e:
+                logger.error(f"Сделка {contract_number}: документы не выданы — {e}")
+                return {"message": _missing_data_text(contract_number, e)}
             except Exception as e:
                 logger.error(f"Ошибка генерации документов ({doc_type}) для {contract_number}: {e}", exc_info=True)
                 return {"message": f"⚠️ Ошибка создания документов: {e}"}
@@ -2067,6 +2136,7 @@ VIN: ...
                 {"text": "💰 Счёт на оплату",                  "callback_data": f"docmenu:{contract_number}:invoice"},
                 {"text": "📄 Акт выполненных услуг",           "callback_data": f"dealaction:{contract_number}:build_act"},
                 {"text": "🧾 Расписка о получении денег",       "callback_data": f"dealaction:{contract_number}:build_receipt"},
+                {"text": "📊 Отчёт агента",                    "callback_data": f"dealaction:{contract_number}:build_report"},
             ]
             return {"message": text, "buttons": buttons}
 
@@ -2344,6 +2414,13 @@ VIN: ...
             # Логика вынесена в публичный метод build_act_impl —
             # bot.py тоже может его вызвать напрямую (кнопка «📄 Сформировать акт»).
             return await self.build_act_impl(
+                contract_number=(tool_input.get("contract_number") or "").strip(),
+            )
+
+        elif tool_name == "build_report":
+            # Логика вынесена в публичный метод build_report_impl —
+            # bot.py тоже может его вызвать напрямую (кнопка «📊 Отчёт агента»).
+            return await self.build_report_impl(
                 contract_number=(tool_input.get("contract_number") or "").strip(),
             )
 
@@ -2671,6 +2748,10 @@ VIN: ...
                 "text":          "🧾 Сформировать расписку",
                 "callback_data": f"dealaction:{contract_number}:build_receipt",
             })
+            buttons.append({
+                "text":          "📊 Отчёт агента",
+                "callback_data": f"dealaction:{contract_number}:build_report",
+            })
         buttons += [
             {"text": "💳 К оплатам", "callback_data": f"dealaction:{contract_number}:payments"},
             {"text": "◀️ К сделке",   "callback_data": f"dealaction:{contract_number}:menu"},
@@ -2756,6 +2837,9 @@ VIN: ...
                     extra_links.append(pdf_link)
                     if not first_link:
                         first_link = pdf_link
+        except MissingDataError as e:
+            logger.error(f"Акт по {contract_number} не выдан — {e}")
+            return {"error": _missing_data_text(contract_number, e)}
         except FileNotFoundError as e:
             return {"error": f"⚠️ {e}"}
         except Exception as e:
@@ -2773,6 +2857,109 @@ VIN: ...
             "buttons": [
                 {"text": "🧾 Сформировать расписку",
                  "callback_data": f"dealaction:{contract_number}:build_receipt"},
+                {"text": "📊 Отчёт агента",
+                 "callback_data": f"dealaction:{contract_number}:build_report"},
+                {"text": "◀️ К сделке", "callback_data": f"dealaction:{contract_number}:menu"},
+            ],
+        }
+
+    async def build_report_impl(self, contract_number: str) -> dict:
+        """Формирует отчёт агента по сделке.
+
+        Условия те же, что у акта: сделка должна быть оплачена полностью.
+        Даты берутся из даты хронологически последнего платежа:
+          • дата отчёта          → {{ДЕНЬ/МЕСЯЦ/ГОД_ОТЧЕТА}}
+          • дата поступления     → {{ДАТА_ПОСТУПЛЕНИЯ}}
+          • дата расчёта         → {{ДАТА_РАСЧЕТА}}
+        Отчёт, акт и передача наличных оформляются одним днём — если это
+        когда-нибудь разойдётся, менять только эту функцию.
+
+        Единая точка входа. Вызывается:
+          • из bot.py (кнопка «📊 Отчёт агента»)
+          • как tool из LLM (при запросе «сделай отчёт агента»)
+        """
+        from datetime import datetime as _dt
+
+        contract_number = (contract_number or "").strip()
+        if not contract_number:
+            return {"error": "⚠️ Не указан номер сделки"}
+
+        deal = await self.sheets.get_deal(contract_number)
+        if not deal:
+            return {"error": f"⚠️ Сделка *{contract_number}* не найдена"}
+
+        payments = _parse_payments(deal.get("Платежи", ""))
+        if not payments:
+            return {"error": (
+                f"⚠️ По сделке *{contract_number}* нет зарегистрированных платежей. "
+                "Отчёт агента формируется только после полной оплаты."
+            )}
+
+        total     = _calc_total_amount(deal)
+        received  = sum(p["amount"] for p in payments)
+        remainder = total - received
+        if remainder > 0.01:
+            currency = (deal.get("currency") or "руб").strip()
+            return {"error": (
+                f"⚠️ Сделка *{contract_number}* оплачена не полностью.\n"
+                f"Остаток: {_fmt_money(remainder)} {currency}. "
+                "Отчёт агента формируется только после полной оплаты."
+            )}
+
+        try:
+            last_date = max(
+                payments,
+                key=lambda p: _dt.strptime(p["date"], "%d.%m.%Y"),
+            )["date"]
+        except Exception:
+            last_date = payments[-1]["date"]
+
+        report_date     = last_date
+        received_date   = last_date
+        settlement_date = last_date
+
+        contract_date  = deal.get("Дата договора", "")
+        commission_pct = _num(deal.get("Комиссия %", "1")) or 1.0
+
+        data = {k: (v if v is not None else "") for k, v in deal.items()}
+
+        try:
+            deal_folder_id = await self.drive.get_or_create_deal_folder(contract_number)
+            docx_path = await self.builder.build_report(
+                data, contract_number, contract_date,
+                report_date, received_date, settlement_date, commission_pct,
+            )
+            docx_name = f"Отчёт_агента_{contract_number}.docx"
+            docx_link = await self.drive.upload_file(docx_path, docx_name, deal_folder_id)
+
+            extra_files, extra_names, extra_links = [], [], []
+            skip_pdf = os.environ.get("SKIP_PDF", "0") == "1"
+            if not skip_pdf:
+                pdf_path = await self.builder.convert_to_pdf(docx_path)
+                if pdf_path:
+                    pdf_name = f"Отчёт_агента_{contract_number}.pdf"
+                    pdf_link = await self.drive.upload_file(pdf_path, pdf_name, deal_folder_id)
+                    extra_files.append(pdf_path)
+                    extra_names.append(pdf_name)
+                    extra_links.append(pdf_link)
+        except MissingDataError as e:
+            logger.error(f"Отчёт агента по {contract_number} не выдан — {e}")
+            return {"error": _missing_data_text(contract_number, e)}
+        except FileNotFoundError as e:
+            return {"error": f"⚠️ {e}"}
+        except Exception as e:
+            logger.error(f"Ошибка формирования отчёта агента для {contract_number}: {e}", exc_info=True)
+            return {"error": f"⚠️ Не удалось сформировать отчёт агента: {e}"}
+
+        return {
+            "file":        docx_path,
+            "filename":    docx_name,
+            "drive_link":  docx_link,
+            "extra_files": extra_files,
+            "extra_names": extra_names,
+            "extra_links": extra_links,
+            "message":     f"📊 Отчёт агента по сделке *{contract_number}* от {report_date} сформирован",
+            "buttons": [
                 {"text": "◀️ К сделке", "callback_data": f"dealaction:{contract_number}:menu"},
             ],
         }
@@ -2849,6 +3036,9 @@ VIN: ...
                     extra_files.append(pdf_path)
                     extra_names.append(pdf_name)
                     extra_links.append(pdf_link)
+        except MissingDataError as e:
+            logger.error(f"Расписка по {contract_number} не выдана — {e}")
+            return {"error": _missing_data_text(contract_number, e)}
         except FileNotFoundError as e:
             return {"error": f"⚠️ {e}"}
         except Exception as e:

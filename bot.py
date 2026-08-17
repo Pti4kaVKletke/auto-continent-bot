@@ -40,6 +40,7 @@ AWAITING_FLAGS = (
     "awaiting_search",
     "awaiting_stats_dates",
     "awaiting_deal_date",
+    "awaiting_dkp_date",
     "awaiting_scan_for_deal",
     "awaiting_scan_folder_id",
     "awaiting_scan_for_existing",
@@ -55,6 +56,12 @@ AWAITING_TAILS = (
     "pending_existing_filepath",
     "pending_existing_filename",
 )
+
+# ⚠️  pending_deal_date сюда НЕ входит: дата договора живёт между двумя
+# нажатиями кнопок (сначала дата договора, затем дата ДКП), а
+# _clear_awaiting_flags() вызывается в начале каждого handle_callback —
+# сброс убил бы её ровно в момент выбора даты ДКП. Та же логика, что у
+# copy_pending / overpay_pending.
 
 
 def _clear_awaiting_flags(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -483,6 +490,34 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─── ОБРАБОТКА CALLBACK-КНОПОК ───────────────────────────────────────────────
+
+async def ask_dkp_date(message, deal_date: str):
+    """
+    Второй шаг выбора дат при создании комплекта: дата ДКП.
+
+    ДКП нередко подписывают раньше агентского договора, поэтому дату спрашиваем
+    отдельно. Первой кнопкой — «та же, что договор»: это самый частый случай,
+    Александре хватит одного нажатия.
+
+    Вызывается ботом сразу после выбора даты договора (кнопкой или текстом),
+    а не инструментом LLM — чтобы шаг нельзя было пропустить.
+    """
+    from datetime import datetime
+
+    today_str = datetime.now().strftime("%d.%m.%Y")
+    kb = [[InlineKeyboardButton(f"✅ Та же, что договор ({deal_date})",
+                                callback_data="dkp_date:__same__")]]
+    if today_str != deal_date:
+        kb.append([InlineKeyboardButton(f"📅 Сегодня ({today_str})",
+                                        callback_data=f"dkp_date:{today_str}")])
+    kb.append([InlineKeyboardButton("✏️ Другая дата", callback_data="dkp_date:__custom__")])
+
+    await message.reply_text(
+        f"📅 Дата договора: *{deal_date}*\n\nТеперь дата ДКП:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(kb),
+    )
+
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1091,7 +1126,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ── Выбор даты ────────────────────────────────────────────────────────────
+    # ── Выбор даты договора ───────────────────────────────────────────────────
+    # Двухшаговый флоу: сначала дата агентского договора, затем дата ДКП.
+    # Второй шаг запускает сам бот (см. ask_dkp_date), а не LLM — так кнопки
+    # появляются всегда, независимо от того, вспомнит ли Haiku про ДКП.
     if data.startswith("deal_date:"):
         value = data.split(":", 1)[1]
         await query.edit_message_reply_markup(reply_markup=None)
@@ -1102,9 +1140,28 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Введите дату договора в формате ДД.ММ.ГГГГ (например: 18.06.2026):"
             )
         else:
+            context.user_data["pending_deal_date"] = value
+            await ask_dkp_date(query.message, value)
+
+    # ── Выбор даты ДКП ────────────────────────────────────────────────────────
+    elif data.startswith("dkp_date:"):
+        value = data.split(":", 1)[1]
+        await query.edit_message_reply_markup(reply_markup=None)
+
+        if value == "__custom__":
+            context.user_data["awaiting_dkp_date"] = True
+            await query.message.reply_text(
+                "Введите дату ДКП в формате ДД.ММ.ГГГГ (например: 18.06.2026):"
+            )
+        else:
+            deal_date = context.user_data.pop("pending_deal_date", "")
+            dkp_date  = deal_date if value == "__same__" else value
             result = await typing_while(
                 update.effective_chat.id, context,
-                agent.process_message(f"Дата договора: {value}", chat_id=str(update.effective_chat.id))
+                agent.process_message(
+                    f"Дата договора: {deal_date}. Дата ДКП: {dkp_date}",
+                    chat_id=str(update.effective_chat.id),
+                )
             )
             await send_result(query.message, result)
 
@@ -1202,6 +1259,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("📎 Загрузить скан",    callback_data=f"dealaction:{num}:scan"),
                  InlineKeyboardButton("🗂 Сканы",             callback_data=f"dealaction:{num}:scans")],
                 [InlineKeyboardButton("💳 Оплаты",            callback_data=f"dealaction:{num}:payments")],
+                [InlineKeyboardButton("📄 Акт",               callback_data=f"dealaction:{num}:build_act"),
+                 InlineKeyboardButton("🧾 Расписка",          callback_data=f"dealaction:{num}:build_receipt")],
+                [InlineKeyboardButton("📊 Отчёт агента",      callback_data=f"dealaction:{num}:build_report")],
                 [InlineKeyboardButton("✅ Завершить сделку",  callback_data=f"dealaction:{num}:complete")],
                 [InlineKeyboardButton("❌ Отменить сделку",   callback_data=f"dealaction:{num}:cancel")],
             ]
@@ -1340,17 +1400,25 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             await send_result(query.message, result)
 
-        elif action in ("build_act", "build_receipt"):
+        elif action in ("build_act", "build_receipt", "build_report"):
             # Формирование акта выполненных услуг / расписки продавца о получении
-            # наличных (Приложение № 1 к акту). Дата берётся автоматически из даты
-            # последнего платежа. Если сделка не оплачена — *_impl вернёт понятную
-            # ошибку с остатком.
-            is_act = action == "build_act"
-            label  = "акт" if is_act else "расписку"
-            await query.edit_message_text(f"⏳ Формирую {label} по сделке {num}...")
+            # наличных (Приложение № 1 к акту) / отчёта агента. Даты берутся
+            # автоматически из даты последнего платежа. Если сделка не оплачена
+            # или данные неполные — *_impl вернёт понятную ошибку.
+            labels = {
+                "build_act":     "акт",
+                "build_receipt": "расписку",
+                "build_report":  "отчёт агента",
+            }
+            impls = {
+                "build_act":     agent.build_act_impl,
+                "build_receipt": agent.build_receipt_impl,
+                "build_report":  agent.build_report_impl,
+            }
+            await query.edit_message_text(f"⏳ Формирую {labels[action]} по сделке {num}...")
             result = await typing_while(
                 update.effective_chat.id, context,
-                agent.build_act_impl(num) if is_act else agent.build_receipt_impl(num),
+                impls[action](num),
             )
             if result.get("error"):
                 await query.message.reply_text(
@@ -1361,8 +1429,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     ]]),
                 )
             else:
-                # Адаптируем формат build_act_impl / build_receipt_impl
-                # (file/extra_*) в формат send_result (files-list)
+                # Адаптируем формат build_act_impl / build_receipt_impl /
+                # build_report_impl (file/extra_*) в формат send_result (files-list)
                 files = []
                 if result.get("file"):
                     files.append({
@@ -1790,9 +1858,21 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if context.user_data.get("awaiting_deal_date"):
         context.user_data["awaiting_deal_date"] = False
+        deal_date = user_text.strip()
+        context.user_data["pending_deal_date"] = deal_date
+        # Дата введена руками — дальше тот же второй шаг, что и после кнопки
+        await ask_dkp_date(update.message, deal_date)
+        return
+
+    if context.user_data.get("awaiting_dkp_date"):
+        context.user_data["awaiting_dkp_date"] = False
+        deal_date = context.user_data.pop("pending_deal_date", "")
         result = await typing_while(
             update.effective_chat.id, context,
-            agent.process_message(f"Дата договора: {user_text.strip()}", chat_id=chat_id)
+            agent.process_message(
+                f"Дата договора: {deal_date}. Дата ДКП: {user_text.strip()}",
+                chat_id=chat_id,
+            )
         )
         await send_result(update.message, result, context=context, chat_id=str(update.effective_chat.id))
         return

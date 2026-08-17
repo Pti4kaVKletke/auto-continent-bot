@@ -70,6 +70,8 @@ DATA_START_ROW = 3
 COLUMNS = [
     "Номер договора",
     "Дата договора",
+    "Дата ДКП",      # ДКП может быть подписан раньше агентского договора.
+                     # Пусто → подставляется «Дата договора».
     "Сумма Договора",
     "Статус",
     "buyer_name",
@@ -201,6 +203,10 @@ class GoogleSheetsService:
                     row.append(contract_number)
                 elif col == "Дата договора":
                     row.append(contract_date)
+                elif col == "Дата ДКП":
+                    # Отдельная дата ДКП: он может быть подписан раньше
+                    # агентского договора. Если не указана — равна дате договора.
+                    row.append(str(data.get("dkp_date") or "").strip() or contract_date)
                 elif col == "Сумма Договора":
                     row.append(f"{total_sum:.2f}".replace(".", ",") if total_sum > 0 else "")
                 elif col == "Статус":

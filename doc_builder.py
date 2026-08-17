@@ -17,6 +17,88 @@ logger = logging.getLogger(__name__)
 logger.info(f"openpyxl version: {openpyxl.__version__}")
 
 
+# ─── Контроль заполнения документов ────────────────────────────────────────
+# Если в готовом документе остался незамещённый {{ПЛЕЙСХОЛДЕР}} или
+# плейсхолдер из шаблона получил пустое значение — документ не выдаётся.
+# Причина: договор с незаполненными паспортными данными стороны — это дыра
+# в комплаенсе, хуже любой неточной формулировки.
+# Отключается переменной окружения STRICT_PLACEHOLDERS=0 (тогда только warning).
+STRICT_PLACEHOLDERS = os.environ.get("STRICT_PLACEHOLDERS", "1") != "0"
+
+# Плейсхолдеры, которым разрешено быть пустыми (необязательные реквизиты).
+ALLOW_EMPTY_PLACEHOLDERS = {
+    "{{ЦВЕТ}}",
+    "{{НОМ_ТПО}}", "{{ДЕНЬ_ТПО}}", "{{МЕС_ТПО}}", "{{ГОД_ТПО}}",
+    "{{ПАСПОРТ_КОД}}",
+    "{{БАНК_ПОЛ_СТРОКА2}}", "{{БАНК_КОРР_СТРОКА3}}",
+    "{{КОММЕНТАРИЙ}}",
+}
+
+# Человекочитаемые названия — чтобы в сообщении Александре было понятно,
+# что именно доввести в журнал.
+PLACEHOLDER_LABELS = {
+    "{{ПОКУПАТЕЛЬ_ФИО}}":           "ФИО покупателя",
+    "{{ПОКУПАТЕЛЬ_ДАТА_РОЖДЕНИЯ}}": "дата рождения покупателя",
+    "{{ПОКУПАТЕЛЬ_АДРЕС}}":         "адрес покупателя",
+    "{{ПОКУПАТЕЛЬ_ИНИЦИАЛЫ}}":      "инициалы покупателя",
+    "{{ПАСПОРТ_СЕРИЯ}}":            "серия паспорта",
+    "{{ПАСПОРТ_НОМЕР}}":            "номер паспорта",
+    "{{ПАСПОРТ_ВЫДАН}}":            "кем выдан паспорт",
+    "{{ПАСПОРТ_ДАТА_ВЫДАЧИ}}":      "дата выдачи паспорта",
+    "{{ПРОДАВЕЦ_ФИО}}":             "ФИО продавца",
+    "{{ПРОДАВЕЦ_ДАТА_РОЖДЕНИЯ}}":   "дата рождения продавца",
+    "{{ПРОДАВЕЦ_АДРЕС}}":           "адрес продавца",
+    "{{ПРОДАВЕЦ_ИНИЦИАЛЫ}}":        "инициалы продавца",
+    "{{ПРОДАВЕЦ_ID_НОМЕР}}":        "номер ID-карты продавца",
+    "{{ПРОДАВЕЦ_ID_ВЫДАНА}}":       "кем выдана ID-карта продавца",
+    "{{ПРОДАВЕЦ_ID_ДАТА}}":         "дата выдачи ID-карты продавца",
+    "{{МАРКА_МОДЕЛЬ}}":             "марка и модель авто",
+    "{{VIN}}":                      "VIN",
+    "{{ГОД_ВЫП}}":                  "год выпуска",
+    "{{ЦЕНА_ЦИФРАМИ}}":             "цена цифрами",
+    "{{ЦЕНА_ПРОПИСЬЮ}}":            "цена прописью",
+    "{{СУММА_НАЛИЧНЫМИ}}":          "сумма наличными",
+    "{{СУММА_НАЛИЧНЫМИ_ПРОПИСЬЮ}}": "сумма наличными прописью",
+    "{{ВАЛЮТА_НАЛИЧНЫМИ}}":         "валюта наличных",
+    "{{КУРС_ДОЛЛАРА}}":             "курс доллара",
+    "{{ДАТА_ПОСТУПЛЕНИЯ}}":         "дата поступления средств",
+    "{{ДАТА_РАСЧЕТА}}":             "дата расчёта с получателем",
+    "{{СЧЕТ_НОМЕР}}":               "номер счёта",
+}
+
+
+class MissingDataError(Exception):
+    """
+    Документ собран, но часть плейсхолдеров осталась пустой или незамещённой.
+
+    Поднимается из `_fill_template` при STRICT_PLACEHOLDERS=1. Вызывающий код
+    (agent.py) ловит её и возвращает пользователю понятный список полей —
+    файл при этом НЕ выдаётся и НЕ заливается на Drive.
+    """
+
+    def __init__(self, doc_name: str, missing: list[str], leftover: list[str]):
+        self.doc_name = doc_name
+        self.missing  = missing
+        self.leftover = leftover
+        parts = []
+        if missing:
+            parts.append("не заполнены поля: " + ", ".join(missing))
+        if leftover:
+            parts.append("не распознаны плейсхолдеры: " + ", ".join(leftover))
+        super().__init__(f"{doc_name} — " + "; ".join(parts))
+
+
+def _fmt_num(v) -> str:
+    """Форматирует число для документа: 3997500 → «3 997 500», 1234.5 → «1 234,50»."""
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    if v == int(v):
+        return f"{int(v):,}".replace(",", " ")
+    return f"{v:,.2f}".replace(",", " ").replace(".", ",")
+
+
 # ─── Сумма прописью (рубли) ────────────────────────────────────────────────
 
 _UNITS = ["", "один", "два", "три", "четыре", "пять", "шесть", "семь", "восемь", "девять"]
@@ -484,67 +566,66 @@ class DocumentBuilder:
                 "Положите act_template.docx в папку templates/."
             )
 
-        # Суммы для акта
-        price_str = str(data.get("car_price", "0")).replace(" ", "").replace(",", ".")
-        try:
-            price_val = float(price_str)
-        except (TypeError, ValueError):
-            price_val = 0.0
+        a_day, a_month, a_year = self._date_parts(act_date)
 
-        commission_val = round(price_val * commission_pct / 100, 2)
-        total_val      = round(price_val + commission_val, 2)
-
-        def _fmt(v):
-            if v == int(v):
-                return f"{int(v):,}".replace(",", " ")
-            return f"{v:,.2f}".replace(",", " ").replace(".", ",")
-
-        # Разбор дат «ДД.ММ.ГГГГ» → (день, месяц-словом, год)
-        def _parts(date_str):
-            date_str = (date_str or "").strip()
-            if len(date_str) < 10:
-                return "", "", ""
-            return date_str[0:2], self._month_name(date_str[3:5]), date_str[6:10]
-
-        c_day, c_month, c_year = _parts(contract_date)
-        a_day, a_month, a_year = _parts(act_date)
-
+        # Перекрываем только дату акта — она единственная отличается от даты
+        # сделки. Номера всех документов (_АКТА/_ДОГОВОРА/_СЧЕТА/_ДКП), даты
+        # договора/счёта/ДКП, суммы, комиссия и итог — из базового набора
+        # _fill_template, там же они считаются для отчёта и счёта.
         extra = {
-            # Номера — по решению одинаковые (номер сделки)
-            "{{НОМЕР_АКТА}}":     contract_number,
-            "{{НОМЕР_ДОГОВОРА}}": contract_number,
-            "{{НОМЕР_СЧЕТА}}":    contract_number,
-            "{{НОМЕР_ДКП}}":      contract_number,
-
-            # Дата акта (дата закрывающего платежа)
             "{{ДЕНЬ_АКТА}}":  a_day,
             "{{МЕСЯЦ_АКТА}}": a_month,
             "{{ГОД_АКТА}}":   a_year,
-
-            # Даты остальных документов — все равны дате договора
-            "{{ДЕНЬ_ДОГОВОРА}}":  c_day,
-            "{{МЕСЯЦ_ДОГОВОРА}}": c_month,
-            "{{ГОД_ДОГОВОРА}}":   c_year,
-            "{{ДЕНЬ_СЧЕТА}}":     c_day,
-            "{{МЕСЯЦ_СЧЕТА}}":    c_month,
-            "{{ГОД_СЧЕТА}}":      c_year,
-            "{{ДЕНЬ_ДКП}}":       c_day,
-            "{{МЕСЯЦ_ДКП}}":      c_month,
-            "{{ГОД_ДКП}}":        c_year,
-
-            # Суммы для раздела 2
-            "{{СУММА_ИТОГО_ЦИФРАМИ}}":  _fmt(total_val),
-            "{{СУММА_ИТОГО_ПРОПИСЬЮ}}": amount_to_words_rub(total_val),
-            "{{КОМИССИЯ_ЦИФРАМИ}}":     _fmt(commission_val),
-            "{{КОМИССИЯ_ПРОПИСЬЮ}}":    amount_to_words_rub(commission_val),
         }
-        # {{ЦЕНА_*}}, {{СУММА_НАЛИЧНЫМИ*}}, {{КУРС_ДОЛЛАРА}}, {{ВАЛЮТА_НАЛИЧНЫМИ}},
-        # {{ПОКУПАТЕЛЬ_*}}, {{ПАСПОРТ_*}}, {{ПРОДАВЕЦ_*}}, {{VIN}}, {{МАРКА_МОДЕЛЬ}},
-        # {{ГОД_ВЫП}} — уже покрыты базовым набором в _fill_template.
 
         return await self._fill_template(
             template, data, contract_number, contract_date,
             f"Акт_{contract_number}", commission_pct,
+            extra_replacements=extra,
+        )
+
+    # ─── ОТЧЁТ АГЕНТА ─────────────────────────────────────────────────────
+
+    async def build_report(self, data: dict, contract_number: str, contract_date: str,
+                           report_date: str, received_date: str, settlement_date: str,
+                           commission_pct: float = 1.0) -> str:
+        """
+        Формирует отчёт агента по агентскому договору.
+
+        contract_date    — дата АГ договора / счёта / ДКП (ДД.ММ.ГГГГ).
+        report_date      — дата самого отчёта (по умолчанию = дата акта).
+        received_date    — дата зачисления средств от принципала ({{ДАТА_ПОСТУПЛЕНИЯ}}).
+        settlement_date  — дата передачи наличных получателю ({{ДАТА_РАСЧЕТА}}).
+
+        Все три даты по умолчанию берутся из даты закрывающего платежа
+        (см. build_report_impl в agent.py) — отчёт, акт и расчёт обычно
+        оформляются одним днём.
+        """
+        template = self.templates_dir / "otchet_agenta_template.docx"
+        if not template.exists():
+            raise FileNotFoundError(
+                f"Шаблон отчёта агента не найден: {template}. "
+                "Положите otchet_agenta_template.docx в папку templates/."
+            )
+
+        r_day, r_month, r_year = self._date_parts(report_date)
+
+        # Даты поступления и расчёта идут в шаблон одним полем ДД.ММ.ГГГГ.
+        # Кладём их и в data — базовый набор _fill_template читает их оттуда,
+        # чтобы значение было одно и то же, откуда бы отчёт ни собирали.
+        data = dict(data)
+        data["payment_received_date"] = received_date
+        data["settlement_date"]       = settlement_date
+
+        extra = {
+            "{{ДЕНЬ_ОТЧЕТА}}":  r_day,
+            "{{МЕСЯЦ_ОТЧЕТА}}": r_month,
+            "{{ГОД_ОТЧЕТА}}":   r_year,
+        }
+
+        return await self._fill_template(
+            template, data, contract_number, contract_date,
+            f"Отчёт_агента_{contract_number}", commission_pct,
             extra_replacements=extra,
         )
 
@@ -798,6 +879,47 @@ class DocumentBuilder:
         }
         return months.get(month_num, month_num)
 
+    def _date_parts(self, date_str: str) -> tuple[str, str, str]:
+        """«07.08.2026» → («07», «августа», «2026»). Пустая/битая дата → («», «», «»)."""
+        date_str = (date_str or "").strip()
+        if len(date_str) < 10:
+            return "", "", ""
+        return date_str[0:2], self._month_name(date_str[3:5]), date_str[6:10]
+
+    @staticmethod
+    def _scan_placeholders(doc) -> set:
+        """
+        Возвращает множество всех {{ПЛЕЙСХОЛДЕРОВ}}, встречающихся в документе:
+        в тексте, таблицах, колонтитулах.
+
+        Используется дважды: до подстановки — чтобы знать, какие поля документ
+        вообще требует, и после — чтобы поймать незамещённые.
+        """
+        W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        found = set()
+
+        def scan_para(para):
+            text = "".join(
+                t.text or ""
+                for r in para._element.findall(f"{{{W}}}r")
+                for t in r.findall(f"{{{W}}}t")
+            )
+            found.update(re.findall(r"\{\{[^{}]+\}\}", text))
+
+        for para in doc.paragraphs:
+            scan_para(para)
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    for para in cell.paragraphs:
+                        scan_para(para)
+        for section in doc.sections:
+            for para in section.header.paragraphs:
+                scan_para(para)
+            for para in section.footer.paragraphs:
+                scan_para(para)
+        return found
+
     @staticmethod
     def _normalize(value: str) -> str:
         """
@@ -895,12 +1017,25 @@ class DocumentBuilder:
         except Exception:
             cash_fmt = cash_amount_raw
 
+        # ── Комиссия и итог — считаются в одном месте для всех документов ──
+        # Комиссия = ЦЕНА_ЦИФРАМИ × КОМИССИЯ% / 100, база — сумма Поручения
+        # (car_price). Считаем здесь, а не в каждом build_*, чтобы акт, отчёт
+        # и счёт никогда не разошлись в арифметике.
+        commission_val = round(price_val * commission_pct / 100, 2)
+        total_val      = round(price_val + commission_val, 2)
+
         replacements = {
             "{{НОМЕР}}":   number,
             "{{ДЕНЬ}}":    day,
             "{{МЕСЯЦ}}":   self._month_name(month),
             "{{ГОД}}":     year,
             "{{КОМИССИЯ}}": str(commission_pct),
+
+            # Комиссия и итог
+            "{{КОМИССИЯ_ЦИФРАМИ}}":     _fmt_num(commission_val),
+            "{{КОМИССИЯ_ПРОПИСЬЮ}}":    amount_to_words_rub(commission_val),
+            "{{СУММА_ИТОГО_ЦИФРАМИ}}":  _fmt_num(total_val),
+            "{{СУММА_ИТОГО_ПРОПИСЬЮ}}": amount_to_words_rub(total_val),
 
             # Покупатель (гражданин РФ)
             "{{ПОКУПАТЕЛЬ_ФИО}}":           n(data.get("buyer_name", "")),
@@ -966,10 +1101,43 @@ class DocumentBuilder:
             "{{СЧЕТ_НОМЕР}}":        data.get("account_number", ""),
         }
 
+        # ── Номер и дата в разрезе каждого документа ──────────────────────
+        # Номер сделки один на весь комплект (присваивается один раз при
+        # открытии сделки) — поэтому во все *_НОМЕР идёт одно и то же значение.
+        # Даты по умолчанию равны дате сделки; конкретный build_* перекрывает
+        # нужные через extra_replacements (например дату акта или отчёта).
+        for scope in ("ДКП", "ДОГОВОРА", "СЧЕТА", "АКТА", "ОТЧЕТА"):
+            replacements[f"{{{{НОМЕР_{scope}}}}}"] = number
+            replacements[f"{{{{ДЕНЬ_{scope}}}}}"]  = day
+            replacements[f"{{{{МЕСЯЦ_{scope}}}}}"] = self._month_name(month)
+            replacements[f"{{{{ГОД_{scope}}}}}"]   = year
+
+        # Дата ДКП — единственная дата комплекта, которая может отличаться от
+        # даты сделки: ДКП нередко подписывают раньше агентского договора.
+        # Живёт в колонке журнала «Дата ДКП» (в data при создании сделки —
+        # ключ dkp_date). Пусто → остаётся дата договора, выставленная выше.
+        # Подставляется здесь, а не в build_dkp, потому что на неё ссылаются
+        # ещё акт и отчёт агента — иначе комплект разойдётся.
+        dkp_date = str(data.get("Дата ДКП") or data.get("dkp_date") or "").strip()
+        if len(dkp_date) >= 10:
+            k_day, k_month, k_year = self._date_parts(dkp_date)
+            replacements["{{ДЕНЬ_ДКП}}"]  = k_day
+            replacements["{{МЕСЯЦ_ДКП}}"] = k_month
+            replacements["{{ГОД_ДКП}}"]   = k_year
+
+        # Даты одним полем (ДД.ММ.ГГГГ) — используются в отчёте агента
+        replacements["{{ДАТА_ПОСТУПЛЕНИЯ}}"] = data.get("payment_received_date", "")
+        replacements["{{ДАТА_РАСЧЕТА}}"]     = data.get("settlement_date", "")
+
         # Пробрасываемые снаружи плейсхолдеры (для актов и подобных документов
         # с расширенным набором). Перекрывают базовые при совпадении ключей.
         if extra_replacements:
             replacements.update(extra_replacements)
+
+        # ── Какие плейсхолдеры реально есть в шаблоне ─────────────────────
+        # Нужно ДО подстановки: пустое значение после замены неотличимо от
+        # текста, который в шаблоне и должен быть пустым.
+        present = self._scan_placeholders(doc)
 
         W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 
@@ -1052,34 +1220,31 @@ class DocumentBuilder:
             for para in section.footer.paragraphs:
                 replace_in_para(para)
 
-        # ── Проверка на незамещённые плейсхолдеры ──────────────────────
-        import re
-        leftover = set()
+        # ── Контроль заполнения ────────────────────────────────────────
+        # 1) Незамещённые {{...}} — плейсхолдер есть в шаблоне, но его нет
+        #    в карте замен (опечатка в шаблоне или забыли добавить в код).
+        # 2) Пустые значения — плейсхолдер есть в шаблоне и он известен,
+        #    но данных по нему в журнале нет. Именно так в документ уходит
+        #    сторона без номера паспорта.
+        leftover = sorted(self._scan_placeholders(doc))
 
-        def scan_para(para):
-            text = "".join(t.text or "" for r in para._element.findall(f"{{{W}}}r")
-                            for t in r.findall(f"{{{W}}}t"))
-            for m in re.findall(r"\{\{[^{}]+\}\}", text):
-                leftover.add(m)
+        missing = sorted(
+            PLACEHOLDER_LABELS.get(ph, ph.strip("{}"))
+            for ph in present
+            if ph in replacements
+            and ph not in ALLOW_EMPTY_PLACEHOLDERS
+            and not str(replacements[ph] or "").strip()
+        )
 
-        for para in doc.paragraphs:
-            scan_para(para)
-        for table in doc.tables:
-            for row in table.rows:
-                for cell in row.cells:
-                    for para in cell.paragraphs:
-                        scan_para(para)
-        for section in doc.sections:
-            for para in section.header.paragraphs:
-                scan_para(para)
-            for para in section.footer.paragraphs:
-                scan_para(para)
-
-        if leftover:
-            logger.warning(
-                f"В документе {output_name}.docx остались незамещённые плейсхолдеры: "
-                f"{sorted(leftover)}"
+        if leftover or missing:
+            msg = (
+                f"{output_name}.docx: незамещённые плейсхолдеры={leftover}, "
+                f"пустые поля={missing}"
             )
+            if STRICT_PLACEHOLDERS:
+                logger.error(msg)
+                raise MissingDataError(output_name, missing, leftover)
+            logger.warning(msg + " (STRICT_PLACEHOLDERS=0 — документ выдан как есть)")
 
         # ── Удаляем w:proofErr (артефакты проверки правописания Word) ──
         # Эти теги между runs иногда вызывают переупорядочивание текста
