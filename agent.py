@@ -1906,6 +1906,13 @@ VIN: ...
                 data           = pending["data"]
                 contract_date  = pending["contract_date"]
                 commission_pct = pending["commission_pct"]
+                # Страховка на случай кэша, собранного до появления колонки
+                # «Дата ДКП» (например _pending_check пережил правку кода).
+                # Проверяем наличие ключа, а не его истинность: пустая дата ДКП —
+                # это законное «совпадает с датой договора», перечитывать не нужно.
+                if "Дата ДКП" not in data:
+                    deal = await self.sheets.get_deal(contract_number)
+                    data["Дата ДКП"] = (deal or {}).get("Дата ДКП", "")
             else:
                 deal = await self.sheets.get_deal(contract_number)
                 if not deal:
@@ -2112,6 +2119,11 @@ VIN: ...
                 "bank_ben_line1","bank_ben_line2","bank_kpp",
             ]
             data = {k: deal.get(k, "") for k in ALL_DATA_KEYS}
+            # Дата ДКП — системная колонка журнала, а не поле анкеты, поэтому
+            # её нет в ALL_DATA_KEYS. Но шаблонам ДКП/акта/отчёта она нужна, а
+            # generate_docs берёт data именно отсюда (из _pending_check), не
+            # перечитывая журнал. Без этой строки в ДКП уходит дата договора.
+            data["Дата ДКП"] = deal.get("Дата ДКП", "")
 
             text = "\n".join([
                 f"✅ Сделка {contract_number} от {contract_date} — все поля заполнены.\n",
