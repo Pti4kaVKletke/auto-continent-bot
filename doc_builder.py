@@ -67,6 +67,84 @@ PLACEHOLDER_LABELS = {
 }
 
 
+# Допуск сходимости «наличные × курс = цена в рублях».
+# Курс в поручении указывается округлённым (например 1,08), поэтому точного
+# равенства не бывает. 0,5 % — это порядка 5 000 ₽ на сделку в миллион:
+# достаточно широко для округления курса и достаточно узко, чтобы поймать
+# опечатку в разряде.
+AMOUNT_TOLERANCE = float(os.environ.get("AMOUNT_TOLERANCE", "0.005"))
+
+
+class AmountMismatchError(Exception):
+    """
+    Суммы сделки не сходятся: наличные × курс ≠ цена в рублях.
+
+    Поднимается из `_fill_template`. Комплект не формируется — цифры в
+    поручении, расписке, акте и отчёте обязаны совпадать до копейки, иначе
+    документы противоречат друг другу.
+    """
+
+    def __init__(self, doc_name: str, cash, rate, expected, actual):
+        self.doc_name = doc_name
+        self.cash     = cash
+        self.rate     = rate
+        self.expected = expected   # цена из ДКП
+        self.actual   = actual     # наличные × курс
+        super().__init__(
+            f"{doc_name}: {cash} × {rate} = {actual:,.2f}, "
+            f"а цена в договоре {expected:,.2f}"
+        )
+
+
+def _check_amounts(price_val: float, cash_raw, rate_raw, doc_name: str) -> None:
+    """Проверяет СУММА_НАЛИЧНЫМИ × КУРС_ДОЛЛАРА ≈ ЦЕНА_ЦИФРАМИ."""
+    if not STRICT_PLACEHOLDERS:
+        return
+    if not price_val:
+        return
+
+    def _f(v):
+        s = str(v or "").replace(" ", "").replace(" ", "").replace(",", ".")
+        try:
+            return float(s)
+        except (TypeError, ValueError):
+            return None
+
+    cash = _f(cash_raw)
+    rate = _f(rate_raw)
+    # Пустой курс или наличные — не ошибка арифметики, это отсутствие данных;
+    # им занимается контроль заполнения ниже (он видит, нужны ли они шаблону).
+    if not cash or not rate:
+        return
+
+    actual = cash * rate
+    if abs(actual - price_val) > price_val * AMOUNT_TOLERANCE:
+        raise AmountMismatchError(doc_name, cash_raw, rate_raw, price_val, actual)
+
+
+def dkp_number_from(data: dict, fallback: str = "") -> str:
+    """
+    Номер договора купли-продажи = последние 6 знаков VIN.
+
+    Пример: VIN LVGEU76A1TG062177 → 062177.
+
+    Проверка уникальности не нужна: первичный ключ сделки в системе — номер
+    агентского договора, номер ДКП на связки не влияет.
+
+    Колонка журнала «Номер ДКП» (ручной ввод) имеет приоритет — на случай,
+    если по бумажному оригиналу номер другой. Если ни колонки, ни VIN нет,
+    возвращается fallback (номер сделки) — чтобы документ не остался с
+    пустым номером.
+    """
+    manual = str(data.get("Номер ДКП") or data.get("dkp_number") or "").strip()
+    if manual:
+        return manual
+    vin = re.sub(r"[^A-Za-z0-9]", "", str(data.get("car_vin") or data.get("VIN") or ""))
+    if len(vin) >= 6:
+        return vin[-6:].upper()
+    return fallback
+
+
 class MissingDataError(Exception):
     """
     Документ собран, но часть плейсхолдеров осталась пустой или незамещённой.
@@ -276,6 +354,14 @@ class DocumentBuilder:
     # ─── ДКП ТС ───────────────────────────────────────────────────────────
 
     async def build_dkp(self, data: dict, number: str, date: str) -> str:
+        """
+        number — номер СДЕЛКИ (агентского договора). Сам номер ДКП внутри
+        документа считается по VIN (см. dkp_number_from), а имя файла берётся
+        по номеру сделки — чтобы файлы комплекта лежали рядом в папке Drive.
+
+        date — дата сделки; дата самого ДКП подставляется в _fill_template из
+        колонки журнала «Дата ДКП», если она заполнена.
+        """
         template = self.templates_dir / "dkp_template.docx"
         if template.exists():
             return await self._fill_template(template, data, number, date, f"ДКП_ТС_{number}")
@@ -287,7 +373,11 @@ class DocumentBuilder:
 
         t = doc.add_paragraph()
         t.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        r = t.add_run(f"ДОГОВОР КУПЛИ-ПРОДАЖИ ТРАНСПОРТНОГО СРЕДСТВА № {number}")
+        # Номер ДКП — по VIN, а не номер сделки (см. dkp_number_from)
+        r = t.add_run(
+            f"ДОГОВОР КУПЛИ-ПРОДАЖИ ТРАНСПОРТНОГО СРЕДСТВА № "
+            f"{dkp_number_from(data, number)}"
+        )
         r.bold = True; r.font.size = Pt(13)
 
         doc.add_paragraph(f"«{date[:2]}» {self._month_name(date[3:5])} {date[6:]} г. г. Бишкек")
@@ -1024,6 +1114,14 @@ class DocumentBuilder:
         commission_val = round(price_val * commission_pct / 100, 2)
         total_val      = round(price_val + commission_val, 2)
 
+        # ── Проверка арифметики сделки ─────────────────────────────────────
+        # Комиссия и итог считаются здесь же, поэтому сойтись обязаны всегда.
+        # Реально проверять нужно одно: наличные × курс ≈ цена в рублях —
+        # эти три числа вводятся руками и попадают в поручение, расписку,
+        # акт и отчёт. Расхождение = вопрос банка по 115-ФЗ.
+        _check_amounts(price_val, data.get("cash_amount"), data.get("exchange_rate"),
+                       output_name)
+
         replacements = {
             "{{НОМЕР}}":   number,
             "{{ДЕНЬ}}":    day,
@@ -1125,9 +1223,27 @@ class DocumentBuilder:
             replacements["{{МЕСЯЦ_ДКП}}"] = k_month
             replacements["{{ГОД_ДКП}}"]   = k_year
 
-        # Даты одним полем (ДД.ММ.ГГГГ) — используются в отчёте агента
-        replacements["{{ДАТА_ПОСТУПЛЕНИЯ}}"] = data.get("payment_received_date", "")
-        replacements["{{ДАТА_РАСЧЕТА}}"]     = data.get("settlement_date", "")
+        # Номер ДКП — не номер сделки, а последние 6 знаков VIN.
+        # Причина: номер сделки кодирует дату её открытия, а ДКП нередко
+        # подписан раньше агентского договора — номер вида «110826001» на
+        # договоре от 27 июля расшифровывается в неверную дату, и это видно
+        # по всему комплекту. Номер по VIN даты не содержит.
+        # Колонка журнала «Номер ДКП» перекрывает расчёт (ручной ввод).
+        replacements["{{НОМЕР_ДКП}}"] = dkp_number_from(data, number)
+
+        # Даты одним полем (ДД.ММ.ГГГГ) — используются в отчёте агента.
+        # Приоритет: явно переданное значение (build_report) → колонка
+        # журнала (ручной ввод) → пусто.
+        replacements["{{ДАТА_ПОСТУПЛЕНИЯ}}"] = (
+            data.get("payment_received_date")
+            or data.get("Дата поступления")
+            or ""
+        )
+        replacements["{{ДАТА_РАСЧЕТА}}"] = (
+            data.get("settlement_date")
+            or data.get("Дата расчёта")
+            or ""
+        )
 
         # Пробрасываемые снаружи плейсхолдеры (для актов и подобных документов
         # с расширенным набором). Перекрывают базовые при совпадении ключей.

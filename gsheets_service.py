@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import logging
 import asyncio
@@ -70,9 +71,20 @@ DATA_START_ROW = 3
 COLUMNS = [
     "Номер договора",
     "Дата договора",
+    # ── Колонки, добавленные 19.08.2026 ───────────────────────────────────
+    # Порядок здесь обязан совпадать с физическим порядком колонок в таблице:
+    # запись и обновление строки идут по индексу. Четыре новые колонки Илья
+    # вставил в блок «ОСНОВНОЕ» (C, D, F, G, H) — список приведён к тому же виду.
+    "Номер ДКП",     # последние 6 знаков VIN; пусто → считается из VIN
     "Дата ДКП",      # ДКП может быть подписан раньше агентского договора.
                      # Пусто → подставляется «Дата договора».
     "Сумма Договора",
+    "Сумма Комиссии",  # = car_price × «Комиссия %» / 100 → {{КОМИССИЯ_ЦИФРАМИ}}
+                       # проверка: car_price + Сумма Комиссии = Сумма Договора
+    "Дата поступления",  # дата зачисления средств от принципала → {{ДАТА_ПОСТУПЛЕНИЯ}}
+                         # пусто → берётся дата последнего платежа из «Платежи»
+    "Дата расчёта",      # дата передачи наличных продавцу → {{ДАТА_РАСЧЕТА}};
+                         # ею же датируются акт, расписка и отчёт агента
     "Статус",
     "buyer_name",
     "passport_series",
@@ -121,6 +133,21 @@ COLUMNS = [
     "Получено",      # сумма всех платежей
     "Остаток",       # Сумма Договора - Получено
 ]
+
+
+def _dkp_number(data: dict) -> str:
+    """
+    Номер ДКП = последние 6 знаков VIN.
+
+    Дублирует doc_builder.dkp_number_from намеренно: тянуть сюда весь
+    doc_builder (python-docx, openpyxl) ради шести символов незачем.
+    Логику менять сразу в обоих местах.
+    """
+    manual = str(data.get("Номер ДКП") or data.get("dkp_number") or "").strip()
+    if manual:
+        return manual
+    vin = re.sub(r"[^A-Za-z0-9]", "", str(data.get("car_vin") or ""))
+    return vin[-6:].upper() if len(vin) >= 6 else ""
 
 
 def _build_sheets_service():
@@ -196,7 +223,8 @@ class GoogleSheetsService:
                 price_val = float(str(data.get("car_price", "0")).replace(" ", "").replace(",", "."))
             except Exception:
                 price_val = 0.0
-            total_sum = round(price_val * (1 + commission_pct / 100), 2)
+            commission_sum = round(price_val * commission_pct / 100, 2)
+            total_sum = round(price_val + commission_sum, 2)
 
             for col in COLUMNS:
                 if col == "Номер договора":
@@ -213,6 +241,15 @@ class GoogleSheetsService:
                     row.append("активна")
                 elif col == "Комиссия %":
                     row.append(str(commission_pct).replace(".", ","))
+                elif col == "Сумма Комиссии":
+                    # Сумма агентского вознаграждения. Пишется в журнал, а не
+                    # считается каждым документом отдельно: цифра идёт в счёт,
+                    # поручение, акт и отчёт и обязана совпадать во всех.
+                    row.append(f"{commission_sum:.2f}".replace(".", ",")
+                               if commission_sum > 0 else "")
+                elif col == "Номер ДКП":
+                    # Последние 6 знаков VIN (см. dkp_number_from в doc_builder).
+                    row.append(_dkp_number(data))
                 elif col == "Папка Drive":
                     row.append(drive_folder_link)
                 elif col == "Комментарий":
@@ -243,7 +280,7 @@ class GoogleSheetsService:
             sheet = svc.spreadsheets()
             result = sheet.values().get(
                 spreadsheetId=SPREADSHEET_ID,
-                range=f"A{DATA_START_ROW}:AZ",
+                range=f"A{DATA_START_ROW}:{self._col_letter(len(COLUMNS) - 1)}",
             ).execute()
             rows = result.get("values", [])
             if not rows:
@@ -285,7 +322,7 @@ class GoogleSheetsService:
             sheet = svc.spreadsheets()
             result = sheet.values().get(
                 spreadsheetId=SPREADSHEET_ID,
-                range=f"A{DATA_START_ROW}:AZ",
+                range=f"A{DATA_START_ROW}:{self._col_letter(len(COLUMNS) - 1)}",
             ).execute()
             rows = result.get("values", [])
             if not rows:
@@ -310,18 +347,31 @@ class GoogleSheetsService:
                         current_row.append("")
                     current_row[idx] = str(new_val)
 
-            # Пересчитываем "Сумма Договора" если менялась цена или комиссия
+            # Пересчитываем «Сумма Комиссии» и «Сумма Договора», если менялась
+            # цена или процент. Обе цифры уходят в счёт, поручение, акт и отчёт —
+            # оставить их расходиться со ставкой нельзя.
             if "car_price" in updates or "Комиссия %" in updates:
                 try:
                     price_idx = COLUMNS.index("car_price")
                     comm_idx  = COLUMNS.index("Комиссия %")
+                    comm_sum_idx = COLUMNS.index("Сумма Комиссии")
                     sum_idx   = COLUMNS.index("Сумма Договора")
                     price_val = float(str(current_row[price_idx]).replace(" ", "").replace(",", "."))
                     comm_pct  = float(str(current_row[comm_idx] or "1").replace(",", "."))
-                    total_sum = round(price_val * (1 + comm_pct / 100), 2)
+                    comm_sum  = round(price_val * comm_pct / 100, 2)
+                    total_sum = round(price_val + comm_sum, 2)
+                    current_row[comm_sum_idx] = f"{comm_sum:.2f}".replace(".", ",") if comm_sum > 0 else ""
                     current_row[sum_idx] = f"{total_sum:.2f}".replace(".", ",") if total_sum > 0 else ""
                 except Exception as e:
                     logger.warning(f"Не удалось пересчитать сумму договора: {e}")
+
+            # VIN поменялся → номер ДКП тоже (он и есть последние 6 знаков VIN).
+            if "car_vin" in updates:
+                try:
+                    dkp_idx = COLUMNS.index("Номер ДКП")
+                    current_row[dkp_idx] = _dkp_number({"car_vin": updates["car_vin"]})
+                except Exception as e:
+                    logger.warning(f"Не удалось пересчитать номер ДКП: {e}")
 
             last_col = self._col_letter(len(COLUMNS) - 1)
             sheet.values().update(

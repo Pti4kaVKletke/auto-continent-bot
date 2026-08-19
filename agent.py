@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 import memory
 from drive_service import GoogleDriveService
-from doc_builder import DocumentBuilder, MissingDataError
+from doc_builder import DocumentBuilder, MissingDataError, AmountMismatchError
 from gsheets_service import GoogleSheetsService
 
 
@@ -116,6 +116,24 @@ def _missing_data_text(contract_number: str, e: MissingDataError) -> str:
         lines.append("Неизвестные плейсхолдеры в шаблоне: " + ", ".join(e.leftover) + ".")
     lines += ["", "Дозаполните данные в журнале и повторите."]
     return "\n".join(lines)
+
+
+def _amount_mismatch_text(contract_number: str, e: AmountMismatchError) -> str:
+    """
+    Сообщение о том, что комплект не выдан из-за несходящихся сумм.
+
+    Наличные × курс должны давать цену из ДКП: эта же цифра идёт в поручение,
+    расписку, акт и отчёт. Расхождение означает опечатку в одном из трёх
+    чисел — выдавать комплект с ним нельзя, банк увидит противоречие.
+    """
+    return "\n".join([
+        f"🚫 Документ по сделке *{contract_number}* не сформирован — суммы не сходятся.",
+        "",
+        f"{e.cash} × {e.rate} = {e.actual:,.2f}".replace(",", " "),
+        f"а цена в договоре: {e.expected:,.2f}".replace(",", " "),
+        "",
+        "Проверьте в журнале «Сумма нал.», «Курс USD/RUB» и «Цена ДКП» и повторите.",
+    ])
 
 
 def _num_for_sheet(x: float) -> str:
@@ -679,6 +697,11 @@ dkp_date — дата подписания ДКП в формате ДД.ММ.Г
            САМА дату ДКП не придумывай и отдельно не переспрашивай: кнопки её выбора
            показывает бот. Если бот прислал только дату договора — оставь пустым,
            тогда в журнал уйдёт дата договора.
+
+Номер ДКП НЕ спрашивай и не придумывай: он считается сам как последние 6 знаков VIN
+(например VIN LVGEU76A1TG062177 → номер ДКП 062177). Номер сделки кодирует дату её
+открытия, а ДКП часто подписан раньше — поэтому у него отдельный номер без даты.
+Номер сделки по-прежнему один на агентский договор, счёт, акт и отчёт агента.
 
 === ПРАВИЛА ИЗВЛЕЧЕНИЯ ДАННЫХ ИЗ ДОКУМЕНТОВ ===
 
@@ -1787,6 +1810,9 @@ VIN: ...
                 # неидентифицированная сторона не ушла в подписанный комплект.
                 logger.error(f"Сделка {number}: документы не выданы — {e}")
                 return {"message": _missing_data_text(number, e)}
+            except AmountMismatchError as e:
+                logger.error(f"Сделка {number}: документы не выданы — {e}")
+                return {"message": _amount_mismatch_text(number, e)}
             except Exception as e:
                 logger.error(f"Ошибка построения документов для сделки {number}: {e}", exc_info=True)
                 files_done = list(built.keys())
@@ -2018,6 +2044,9 @@ VIN: ...
             except MissingDataError as e:
                 logger.error(f"Сделка {contract_number}: документы не выданы — {e}")
                 return {"message": _missing_data_text(contract_number, e)}
+            except AmountMismatchError as e:
+                logger.error(f"Сделка {contract_number}: документы не выданы — {e}")
+                return {"message": _amount_mismatch_text(contract_number, e)}
             except Exception as e:
                 logger.error(f"Ошибка генерации документов ({doc_type}) для {contract_number}: {e}", exc_info=True)
                 return {"message": f"⚠️ Ошибка создания документов: {e}"}
@@ -2821,6 +2850,11 @@ VIN: ...
         except Exception:
             act_date = payments[-1]["date"]
 
+        # Колонка журнала «Дата расчёта» главнее: акт, расписка и отчёт
+        # датируются днём передачи наличных продавцу, а он не обязан
+        # совпадать с днём последнего платежа принципала.
+        act_date = str(deal.get("Дата расчёта") or "").strip() or act_date
+
         contract_date  = deal.get("Дата договора", "")
         commission_pct = _num(deal.get("Комиссия %", "1")) or 1.0
 
@@ -2852,6 +2886,9 @@ VIN: ...
         except MissingDataError as e:
             logger.error(f"Акт по {contract_number} не выдан — {e}")
             return {"error": _missing_data_text(contract_number, e)}
+        except AmountMismatchError as e:
+            logger.error(f"Акт по {contract_number} не выдан — {e}")
+            return {"error": _amount_mismatch_text(contract_number, e)}
         except FileNotFoundError as e:
             return {"error": f"⚠️ {e}"}
         except Exception as e:
@@ -2926,9 +2963,14 @@ VIN: ...
         except Exception:
             last_date = payments[-1]["date"]
 
-        report_date     = last_date
-        received_date   = last_date
-        settlement_date = last_date
+        # По умолчанию все три даты — дата закрывающего платежа: отчёт, акт
+        # и передача наличных обычно оформляются одним днём. Если в журнале
+        # заполнены колонки «Дата поступления» / «Дата расчёта» — они главнее:
+        # деньги могли зайти и уйти в разные дни, и банк смотрит именно на это.
+        received_date   = str(deal.get("Дата поступления") or "").strip() or last_date
+        settlement_date = str(deal.get("Дата расчёта") or "").strip() or last_date
+        # Дата отчёта = дата расчёта (п. 5 правок от 19.08.2026)
+        report_date     = settlement_date
 
         contract_date  = deal.get("Дата договора", "")
         commission_pct = _num(deal.get("Комиссия %", "1")) or 1.0
@@ -2957,6 +2999,9 @@ VIN: ...
         except MissingDataError as e:
             logger.error(f"Отчёт агента по {contract_number} не выдан — {e}")
             return {"error": _missing_data_text(contract_number, e)}
+        except AmountMismatchError as e:
+            logger.error(f"Отчёт агента по {contract_number} не выдан — {e}")
+            return {"error": _amount_mismatch_text(contract_number, e)}
         except FileNotFoundError as e:
             return {"error": f"⚠️ {e}"}
         except Exception as e:
@@ -3025,6 +3070,9 @@ VIN: ...
         except Exception:
             receipt_date = payments[-1]["date"]
 
+        # Как у акта: дата расписки — день передачи наличных продавцу.
+        receipt_date = str(deal.get("Дата расчёта") or "").strip() or receipt_date
+
         contract_date  = deal.get("Дата договора", "")
         commission_pct = _num(deal.get("Комиссия %", "1")) or 1.0
 
@@ -3051,6 +3099,9 @@ VIN: ...
         except MissingDataError as e:
             logger.error(f"Расписка по {contract_number} не выдана — {e}")
             return {"error": _missing_data_text(contract_number, e)}
+        except AmountMismatchError as e:
+            logger.error(f"Расписка по {contract_number} не выдана — {e}")
+            return {"error": _amount_mismatch_text(contract_number, e)}
         except FileNotFoundError as e:
             return {"error": f"⚠️ {e}"}
         except Exception as e:
