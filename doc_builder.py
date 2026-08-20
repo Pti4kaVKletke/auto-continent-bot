@@ -61,6 +61,10 @@ PLACEHOLDER_LABELS = {
     "{{СУММА_НАЛИЧНЫМИ_ПРОПИСЬЮ}}": "сумма наличными прописью",
     "{{ВАЛЮТА_НАЛИЧНЫМИ}}":         "валюта наличных",
     "{{КУРС_ДОЛЛАРА}}":             "курс доллара",
+    "{{КУРС_ПОРУЧЕНИЯ}}":           "курс на дату поручения (колонка «Курс USD/RUB»)",
+    "{{КУРС_ФАКТИЧЕСКИЙ}}":         "фактический курс конвертации (колонка «Фактический курс»)",
+    "{{СУММА_ПОРУЧЕНИЯ}}":          "расчётная сумма поручения в валюте",
+    "{{СУММА_ПОРУЧЕНИЯ_ПРОПИСЬЮ}}": "расчётная сумма поручения прописью",
     "{{ДАТА_ПОСТУПЛЕНИЯ}}":         "дата поступления средств",
     "{{ДАТА_РАСЧЕТА}}":             "дата расчёта с получателем",
     "{{СЧЕТ_НОМЕР}}":               "номер счёта",
@@ -96,24 +100,32 @@ class AmountMismatchError(Exception):
         )
 
 
+def _to_float(v):
+    """«86 956,52» → 86956.52. Возвращает None, если это не число."""
+    s = str(v or "").replace("\u00a0", "").replace(" ", "").replace(",", ".")
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        return None
+
+
 def _check_amounts(price_val: float, cash_raw, rate_raw, doc_name: str) -> None:
-    """Проверяет СУММА_НАЛИЧНЫМИ × КУРС_ДОЛЛАРА ≈ ЦЕНА_ЦИФРАМИ."""
-    if not STRICT_PLACEHOLDERS:
-        return
-    if not price_val:
+    """
+    Проверяет СУММА_НАЛИЧНЫМИ × КУРС_ФАКТИЧЕСКИЙ ≈ ЦЕНА_ЦИФРАМИ.
+
+    Пару поручения (СУММА_ПОРУЧЕНИЯ × КУРС_ПОРУЧЕНИЯ) не проверяем: сумма
+    поручения считается делением цены на тот же курс, сойтись обязана всегда.
+    Смысл есть только в фактической паре — сумма наличных может быть введена
+    руками по выписке банка и разойтись с курсом.
+
+    Пустой курс или сумма — не ошибка арифметики, а отсутствие данных; ими
+    занимается контроль заполнения (он видит, нужны ли они шаблону).
+    """
+    if not STRICT_PLACEHOLDERS or not price_val:
         return
 
-    def _f(v):
-        s = str(v or "").replace(" ", "").replace(" ", "").replace(",", ".")
-        try:
-            return float(s)
-        except (TypeError, ValueError):
-            return None
-
-    cash = _f(cash_raw)
-    rate = _f(rate_raw)
-    # Пустой курс или наличные — не ошибка арифметики, это отсутствие данных;
-    # им занимается контроль заполнения ниже (он видит, нужны ли они шаблону).
+    cash = _to_float(cash_raw)
+    rate = _to_float(rate_raw)
     if not cash or not rate:
         return
 
@@ -225,6 +237,27 @@ def _three_digits_to_words(n: int, feminine: bool = False) -> str:
     return " ".join(words)
 
 
+def _int_to_words(n: int) -> str:
+    """Целое число прописью, без названия валюты. 3997500 → «три миллиона …»."""
+    if n == 0:
+        return "ноль"
+    groups = []
+    scale_idx = 0
+    while n > 0:
+        n, group = divmod(n, 1000)
+        if group:
+            groups.append((group, scale_idx))
+        scale_idx += 1
+
+    parts = []
+    for group, idx in reversed(groups):
+        one, few, many, feminine = _SCALE[idx]
+        parts.append(_three_digits_to_words(group, feminine=feminine))
+        if idx > 0:
+            parts.append(_plural(group, one, few, many))
+    return " ".join(p for p in parts if p)
+
+
 def amount_to_words_rub(amount) -> str:
     """
     Преобразует сумму в рублях в строку прописью с копейками.
@@ -238,31 +271,40 @@ def amount_to_words_rub(amount) -> str:
     rub = int(amount)
     kop = round((amount - rub) * 100)
 
-    if rub == 0:
-        rub_words = "ноль"
-    else:
-        groups = []
-        n = rub
-        scale_idx = 0
-        while n > 0:
-            n, group = divmod(n, 1000)
-            if group:
-                groups.append((group, scale_idx))
-            scale_idx += 1
-
-        parts = []
-        for group, idx in reversed(groups):
-            one, few, many, feminine = _SCALE[idx]
-            parts.append(_three_digits_to_words(group, feminine=feminine))
-            if idx > 0:
-                parts.append(_plural(group, one, few, many))
-        rub_words = " ".join(p for p in parts if p)
-
+    rub_words = _int_to_words(rub)
     rub_words = rub_words[0].upper() + rub_words[1:]
     rub_label = _plural(rub, "рубль", "рубля", "рублей")
     kop_label = _plural(kop, "копейка", "копейки", "копеек")
 
     return f"{rub_words} {rub_label} {kop:02d} {kop_label}"
+
+
+def amount_to_words_plain(amount) -> str:
+    """
+    Сумма прописью БЕЗ названия валюты — для сумм в долларах.
+
+    В шаблонах валюта стоит отдельным плейсхолдером сразу после скобок:
+    «{{СУММА_ПОРУЧЕНИЯ}} ({{СУММА_ПОРУЧЕНИЯ_ПРОПИСЬЮ}}) {{ВАЛЮТА_НАЛИЧНЫМИ}}»,
+    поэтому слово «рублей»/«долларов» внутрь скобок писать нельзя.
+
+    Дробная часть даётся как «и NN/100» — принятая в договорах запись для
+    валюты, у которой у нас нет склоняемого названия разменной единицы:
+    86956.52 → «Восемьдесят шесть тысяч девятьсот пятьдесят шесть и 52/100».
+    """
+    try:
+        amount = float(amount)
+    except (TypeError, ValueError):
+        return ""
+
+    whole = int(amount)
+    frac  = round((amount - whole) * 100)
+    if frac == 100:            # 0.999 → 1.00, а не «и 100/100»
+        whole += 1
+        frac = 0
+
+    words = _int_to_words(whole)
+    words = words[0].upper() + words[1:]
+    return words if frac == 0 else f"{words} и {frac:02d}/100"
 
 
 class DocumentBuilder:
@@ -1101,11 +1143,35 @@ class DocumentBuilder:
             price_fmt = price_str
             price_val = 0
 
-        cash_amount_raw = str(data.get("cash_amount", ""))
-        try:
-            cash_fmt = f"{float(cash_amount_raw.replace(' ', '')):,.0f}".replace(",", " ")
-        except Exception:
-            cash_fmt = cash_amount_raw
+        # ── Два курса и две суммы в валюте ─────────────────────────────────
+        # Рублёвая сумма зафиксирована договором купли-продажи и не меняется.
+        # Поручение показывает расчёт на СВОЮ дату (курс поручения), а
+        # конвертация происходит позже и по другому курсу — поэтому
+        # фактическая сумма в валюте отличается от расчётной. Расхождение
+        # прямо описано в текстах акта, отчёта и примечании к поручению,
+        # прятать его не нужно, нужно правильно проставить.
+        rate_order = _to_float(data.get("exchange_rate"))          # курс поручения
+        rate_fact  = _to_float(data.get("Фактический курс")
+                               or data.get("exchange_rate_fact"))  # курс конвертации
+
+        # Расчётная сумма поручения = цена / курс поручения. Всегда считается,
+        # руками её не вводят: поручение обязано сходиться само с собой.
+        order_val = round(price_val / rate_order, 2) if (price_val and rate_order) else None
+
+        # Фактическая сумма = то, что реально выдано наличными. Приоритет у
+        # ручного значения из журнала (в выписке банка может быть округление),
+        # иначе считаем от фактического курса.
+        cash_val = _to_float(data.get("cash_amount"))
+        if not cash_val and price_val and rate_fact:
+            cash_val = round(price_val / rate_fact, 2)
+
+        cash_fmt  = _fmt_num(cash_val) if cash_val else str(data.get("cash_amount", ""))
+        order_fmt = _fmt_num(order_val) if order_val else ""
+
+        cash_words = (data.get("cash_amount_words") or "").strip()
+        if not cash_words and cash_val:
+            cash_words = amount_to_words_plain(cash_val)
+        order_words = amount_to_words_plain(order_val) if order_val else ""
 
         # ── Комиссия и итог — считаются в одном месте для всех документов ──
         # Комиссия = ЦЕНА_ЦИФРАМИ × КОМИССИЯ% / 100, база — сумма Поручения
@@ -1116,11 +1182,15 @@ class DocumentBuilder:
 
         # ── Проверка арифметики сделки ─────────────────────────────────────
         # Комиссия и итог считаются здесь же, поэтому сойтись обязаны всегда.
-        # Реально проверять нужно одно: наличные × курс ≈ цена в рублях —
-        # эти три числа вводятся руками и попадают в поручение, расписку,
-        # акт и отчёт. Расхождение = вопрос банка по 115-ФЗ.
-        _check_amounts(price_val, data.get("cash_amount"), data.get("exchange_rate"),
-                       output_name)
+        # Сверяем именно фактическую пару: наличные, выданные продавцу, и курс
+        # конвертации. Расчётная пара поручения сходится по построению —
+        # сумма поручения считается делением цены на тот же курс.
+        _check_amounts(
+            price_val,
+            data.get("cash_amount"),
+            data.get("Фактический курс") or data.get("exchange_rate_fact"),
+            output_name,
+        )
 
         replacements = {
             "{{НОМЕР}}":   number,
@@ -1177,11 +1247,20 @@ class DocumentBuilder:
             "{{ЦЕНА_ЦИФРАМИ}}":            price_fmt,
             "{{ЦЕНА_ПРОПИСЬЮ}}":           data.get("car_price_words", ""),
             "{{ВАЛЮТА}}":                  data.get("currency", "рублей"),
-            "{{СУММА_НАЛИЧНЫМИ}}":         cash_fmt,
-            "{{СУММА_НАЛИЧНЫМИ_ПРОПИСЬЮ}}": data.get("cash_amount_words", ""),
-            "{{СУММА_ПРОПИСЬЮ}}":           data.get("cash_amount_words", ""),
-            "{{ВАЛЮТА_НАЛИЧНЫМИ}}":        data.get("cash_currency", data.get("currency", "рублей")),
+            # Фактические — расписка, акт, отчёт (документы дня расчёта)
+            "{{СУММА_НАЛИЧНЫМИ}}":          cash_fmt,
+            "{{СУММА_НАЛИЧНЫМИ_ПРОПИСЬЮ}}": cash_words,
+            "{{КУРС_ФАКТИЧЕСКИЙ}}":         data.get("Фактический курс")
+                                            or data.get("exchange_rate_fact", ""),
+            # Расчётные — только поручение (Приложение № 1 к агентскому договору)
+            "{{СУММА_ПОРУЧЕНИЯ}}":          order_fmt,
+            "{{СУММА_ПОРУЧЕНИЯ_ПРОПИСЬЮ}}": order_words,
+            "{{КУРС_ПОРУЧЕНИЯ}}":           data.get("exchange_rate", ""),
+            # Старые имена — на случай не обновлённого шаблона
+            "{{СУММА_ПРОПИСЬЮ}}":           order_words or cash_words,
             "{{КУРС_ДОЛЛАРА}}":             data.get("exchange_rate", ""),
+
+            "{{ВАЛЮТА_НАЛИЧНЫМИ}}":        data.get("cash_currency", data.get("currency", "рублей")),
 
             # Банковские реквизиты
             "{{БАНК_КОРР_СТРОКА1}}": data.get("bank_corr_line1", ""),
