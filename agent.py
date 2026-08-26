@@ -2101,6 +2101,11 @@ VIN: ...
                 "extra_names": extra_names,
                 "extra_links": extra_links,
                 "message":     f"Сделка {contract_number}: {total} файлов отправлено{pdf_note}",
+                # Возврат в меню сделки: после выдачи пакета иначе некуда нажать,
+                # приходится заново искать сделку по номеру.
+                "buttons": [
+                    {"text": "◀️ К сделке", "callback_data": f"dealaction:{contract_number}:menu"},
+                ],
             }
 
         elif tool_name == "check_deal":
@@ -2212,6 +2217,10 @@ VIN: ...
             }
             buttons = [
                 {"text": "📄 Полный пакет (АГ + ДКП + Счёт)", "callback_data": f"docmenu:{contract_number}:all"},
+                # «Всё» добавляет к пакету закрывающие документы. Доступно только
+                # по оплаченной сделке с заполненным фактическим курсом — иначе
+                # придут первые три файла и причина по каждому недостающему.
+                {"text": "📦 Всё (+ Акт и Расписка)",          "callback_data": f"docmenu:{contract_number}:full"},
                 {"text": "📋 АГ договор",                      "callback_data": f"docmenu:{contract_number}:ag"},
                 {"text": "🚗 ДКП ТС",                         "callback_data": f"docmenu:{contract_number}:dkp"},
                 {"text": "💰 Счёт на оплату",                  "callback_data": f"docmenu:{contract_number}:invoice"},

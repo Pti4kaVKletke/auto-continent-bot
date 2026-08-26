@@ -1172,14 +1172,26 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             contract_number = parts[1]
             doc_type        = parts[2]
             await query.edit_message_reply_markup(reply_markup=None)
+
+            # «Всё» = базовый пакет + закрывающие документы. Строим их разными
+            # вызовами, а не одним: акт и расписка требуют полной оплаты и
+            # фактического курса, и если сделка до них ещё не дошла — базовый
+            # пакет всё равно должен уйти, а по каждому недостающему документу
+            # придёт своя причина.
+            base_type = "all" if doc_type == "full" else doc_type
             result = await typing_while(
                 update.effective_chat.id, context,
                 agent.process_message(
-                    f"Создай документы для сделки {contract_number}, тип: {doc_type}",
+                    f"Создай документы для сделки {contract_number}, тип: {base_type}",
                     chat_id=str(update.effective_chat.id),
                 )
             )
-            await send_result(query.message, result)
+            await send_result(query.message, result, context=context)
+
+            if doc_type == "full":
+                for step in ("build_act", "build_receipt"):
+                    await run_doc_impl(update, context, query, contract_number, step,
+                                       edit_message=False)
 
     # ── Меню действий по сделке ──────────────────────────────────────────────
     elif data.startswith("dealaction:"):
@@ -1401,54 +1413,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_result(query.message, result)
 
         elif action in ("build_act", "build_receipt", "build_report"):
-            # Формирование акта выполненных услуг / расписки продавца о получении
-            # наличных (Приложение № 1 к акту) / отчёта агента. Даты берутся
-            # автоматически из даты последнего платежа. Если сделка не оплачена
-            # или данные неполные — *_impl вернёт понятную ошибку.
-            labels = {
-                "build_act":     "акт",
-                "build_receipt": "расписку",
-                "build_report":  "отчёт агента",
-            }
-            impls = {
-                "build_act":     agent.build_act_impl,
-                "build_receipt": agent.build_receipt_impl,
-                "build_report":  agent.build_report_impl,
-            }
-            await query.edit_message_text(f"⏳ Формирую {labels[action]} по сделке {num}...")
-            result = await typing_while(
-                update.effective_chat.id, context,
-                impls[action](num),
-            )
-            if result.get("error"):
-                await query.message.reply_text(
-                    result["error"],
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("◀️ К сделке", callback_data=f"dealaction:{num}:menu")
-                    ]]),
-                )
-            else:
-                # Адаптируем формат build_act_impl / build_receipt_impl /
-                # build_report_impl (file/extra_*) в формат send_result (files-list)
-                files = []
-                if result.get("file"):
-                    files.append({
-                        "file":       result["file"],
-                        "filename":   result["filename"],
-                        "drive_link": result.get("drive_link", ""),
-                    })
-                for f_path, f_name, f_link in zip(
-                    result.get("extra_files", []),
-                    result.get("extra_names", []),
-                    result.get("extra_links", [""] * len(result.get("extra_files", []))),
-                ):
-                    files.append({"file": f_path, "filename": f_name, "drive_link": f_link})
-                await send_result(query.message, {
-                    "files":   files,
-                    "text":    result.get("message", ""),
-                    "buttons": result.get("buttons"),
-                }, context=context)
+            # Акт выполненных услуг / расписка продавца о получении наличных
+            # (Приложение № 1 к акту) / отчёт агента. Даты берутся автоматически
+            # из колонки «Дата расчёта» либо из последнего платежа. Если сделка
+            # не оплачена, нет фактического курса или данные неполные — *_impl
+            # вернёт понятную ошибку. Сама логика — в run_doc_impl, она же
+            # используется кнопкой «Всё».
+            await run_doc_impl(update, context, query, num, action)
 
         elif action == "complete":
             keyboard = InlineKeyboardMarkup([
@@ -1932,6 +1903,80 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         agent.process_message(message_to_agent, chat_id=chat_id, force_tool=forced)
     )
     await send_result(update.message, result, context=context, chat_id=str(update.effective_chat.id))
+
+
+# ─── ЗАКРЫВАЮЩИЕ ДОКУМЕНТЫ (акт / расписка / отчёт) ──────────────────────────
+
+_DOC_IMPL_LABELS = {
+    "build_act":     "акт",
+    "build_receipt": "расписку",
+    "build_report":  "отчёт агента",
+}
+
+
+async def run_doc_impl(update, context, query, num: str, action: str, edit_message: bool = True):
+    """
+    Формирует акт / расписку / отчёт агента и отправляет результат в чат.
+
+    Вынесено из handle_callback, потому что вызывается из двух мест: с отдельных
+    кнопок сделки и из «Всё» (docmenu:*:full), где документы идут подряд.
+
+    edit_message=True — правим сообщение с кнопками («⏳ Формирую …»), так ведёт
+    себя одиночная кнопка. Внутри пакета кнопок уже нет, поэтому там False и
+    статус приходит отдельным сообщением.
+
+    Возвращает True, если документ выдан. Ошибка (сделка не оплачена, нет
+    фактического курса, неполные данные) — не исключение: *_impl возвращает
+    понятный текст, он и уходит пользователю, а пакет продолжается дальше.
+    """
+    label = _DOC_IMPL_LABELS.get(action, "документ")
+    impls = {
+        "build_act":     agent.build_act_impl,
+        "build_receipt": agent.build_receipt_impl,
+        "build_report":  agent.build_report_impl,
+    }
+    if action not in impls:
+        return False
+
+    status = f"⏳ Формирую {label} по сделке {num}..."
+    if edit_message:
+        await query.edit_message_text(status)
+    else:
+        await query.message.reply_text(status)
+
+    result = await typing_while(update.effective_chat.id, context, impls[action](num))
+
+    if result.get("error"):
+        await query.message.reply_text(
+            result["error"],
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("◀️ К сделке", callback_data=f"dealaction:{num}:menu")
+            ]]),
+        )
+        return False
+
+    # Адаптируем формат build_*_impl (file/extra_*) в формат send_result (files-list)
+    files = []
+    if result.get("file"):
+        files.append({
+            "file":       result["file"],
+            "filename":   result["filename"],
+            "drive_link": result.get("drive_link", ""),
+        })
+    for f_path, f_name, f_link in zip(
+        result.get("extra_files", []),
+        result.get("extra_names", []),
+        result.get("extra_links", [""] * len(result.get("extra_files", []))),
+    ):
+        files.append({"file": f_path, "filename": f_name, "drive_link": f_link})
+
+    await send_result(query.message, {
+        "files":   files,
+        "text":    result.get("message", ""),
+        "buttons": result.get("buttons"),
+    }, context=context)
+    return True
 
 
 # ─── ОБРАБОТЧИК ОШИБОК ───────────────────────────────────────────────────────
