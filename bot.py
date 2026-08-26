@@ -1173,11 +1173,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             doc_type        = parts[2]
             await query.edit_message_reply_markup(reply_markup=None)
 
-            # «Всё» = базовый пакет + закрывающие документы. Строим их разными
-            # вызовами, а не одним: акт и расписка требуют полной оплаты и
-            # фактического курса, и если сделка до них ещё не дошла — базовый
-            # пакет всё равно должен уйти, а по каждому недостающему документу
-            # придёт своя причина.
+            # «Всё» = базовый пакет + закрывающие документы (акт, расписка,
+            # отчёт агента). Строим их разными вызовами, а не одним: закрывающие
+            # требуют полной оплаты и фактического курса, и если сделка до них
+            # ещё не дошла — базовый пакет всё равно должен уйти, а по каждому
+            # недостающему документу придёт своя причина.
             base_type = "all" if doc_type == "full" else doc_type
             result = await typing_while(
                 update.effective_chat.id, context,
@@ -1189,7 +1189,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_result(query.message, result, context=context)
 
             if doc_type == "full":
-                for step in ("build_act", "build_receipt"):
+                for step in ("build_act", "build_receipt", "build_report"):
                     await run_doc_impl(update, context, query, contract_number, step,
                                        edit_message=False)
 

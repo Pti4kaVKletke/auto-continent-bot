@@ -2220,7 +2220,7 @@ VIN: ...
                 # «Всё» добавляет к пакету закрывающие документы. Доступно только
                 # по оплаченной сделке с заполненным фактическим курсом — иначе
                 # придут первые три файла и причина по каждому недостающему.
-                {"text": "📦 Всё (+ Акт и Расписка)",          "callback_data": f"docmenu:{contract_number}:full"},
+                {"text": "📦 Всё (+ Акт, Расписка, Отчёт)",    "callback_data": f"docmenu:{contract_number}:full"},
                 {"text": "📋 АГ договор",                      "callback_data": f"docmenu:{contract_number}:ag"},
                 {"text": "🚗 ДКП ТС",                         "callback_data": f"docmenu:{contract_number}:dkp"},
                 {"text": "💰 Счёт на оплату",                  "callback_data": f"docmenu:{contract_number}:invoice"},
