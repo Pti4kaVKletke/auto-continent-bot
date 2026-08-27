@@ -2112,7 +2112,13 @@ VIN: ...
                 return {"message": f"⚠️ Ошибка создания документов: {e}"}
 
             total = 1 + len(extra_files)
-            pdf_note = " (PDF отключён)" if skip_pdf else ""
+            pdf_note = ", PDF отключён" if skip_pdf else ""
+            doc_names = {
+                "all":     "агентский договор, ДКП и счёт",
+                "ag":      "агентский договор",
+                "dkp":     "ДКП",
+                "invoice": "счёт",
+            }.get(doc_type, "документы")
             return {
                 "file":        first_file,
                 "filename":    first_name,
@@ -2120,7 +2126,10 @@ VIN: ...
                 "extra_files": extra_files,
                 "extra_names": extra_names,
                 "extra_links": extra_links,
-                "message":     f"Сделка {contract_number}: {total} файлов отправлено{pdf_note}",
+                # Перечисляем именно ДОКУМЕНТЫ, а не файлы: у каждого документа
+                # ещё и PDF, и «6 файлов» читается как «6 документов».
+                "message":     (f"📄 Сделка {contract_number}: сформированы "
+                                f"{doc_names} — {total} файлов{pdf_note}"),
                 # Возврат в меню сделки: после выдачи пакета иначе некуда нажать,
                 # приходится заново искать сделку по номеру.
                 "buttons": [

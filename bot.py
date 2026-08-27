@@ -1205,35 +1205,49 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if doc_type != "closing":
                 base_type = "all" if doc_type == "full" else doc_type
-                result = await typing_while(
-                    update.effective_chat.id, context,
-                    agent.process_message(
-                        f"Создай документы для сделки {contract_number}, тип: {base_type}",
-                        chat_id=str(update.effective_chat.id),
-                    )
+                # Инструмент вызываем напрямую, без LLM: она пересказывала итог
+                # своими словами и путала файлы с документами — писала «все 6
+                # документов сформированы» там, где документов было три.
+                await query.message.reply_text(
+                    f"⏳ Формирую документы по сделке {contract_number}..."
                 )
-                # Внутри пакета кнопку «К сделке» гасим — она придёт одна в конце
-                if in_batch:
-                    result = dict(result)
-                    result["buttons"] = None
-                await send_result(query.message, result, context=context)
+                try:
+                    result = await typing_while(
+                        update.effective_chat.id, context,
+                        agent._execute_tool("generate_docs", {
+                            "contract_number": contract_number,
+                            "doc_type":        base_type,
+                        }),
+                    )
+                except Exception as e:
+                    logger.error(f"Ошибка generate_docs ({base_type}) для {contract_number}: {e}",
+                                 exc_info=True)
+                    result = {"message": f"⚠️ Ошибка создания документов: {e}"}
+
+                files = []
+                if result.get("file"):
+                    files.append({
+                        "file":       result["file"],
+                        "filename":   result["filename"],
+                        "drive_link": result.get("drive_link", ""),
+                    })
+                for f_path, f_name, f_link in zip(
+                    result.get("extra_files", []),
+                    result.get("extra_names", []),
+                    result.get("extra_links", [""] * len(result.get("extra_files", []))),
+                ):
+                    files.append({"file": f_path, "filename": f_name, "drive_link": f_link})
+
+                await send_result(query.message, {
+                    "files":   files,
+                    "text":    result.get("message", ""),
+                    # Внутри пакета кнопку «К сделке» гасим — она придёт одна в конце
+                    "buttons": None if in_batch else result.get("buttons"),
+                }, context=context)
 
             if in_batch:
-                done = 0
-                for step in CLOSING_STEPS:
-                    if await run_doc_impl(update, context, query.message, contract_number,
-                                          step, show_buttons=False):
-                        done += 1
-                await query.message.reply_text(
-                    f"✅ Комплект по сделке *{contract_number}* готов"
-                    if done == len(CLOSING_STEPS)
-                    else f"Комплект по сделке *{contract_number}*: часть документов не сформирована — причины выше",
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("◀️ К сделке",
-                                             callback_data=f"dealaction:{contract_number}:menu")
-                    ]]),
-                )
+                await run_doc_batch(update, context, query.message,
+                                    contract_number, list(CLOSING_STEPS))
 
     # ── Меню действий по сделке ──────────────────────────────────────────────
     elif data.startswith("dealaction:"):
@@ -2045,8 +2059,9 @@ async def run_doc_impl(update, context, message, num: str, action: str,
     пакета. На сообщения об ошибке флаг не влияет: там кнопки — часть
     диалога, ими вводят дату расчёта.
 
-    Возвращает True, если документ выдан. Ошибка не исключение: пакет
-    документов после неё продолжается дальше.
+    Возвращает "ok" — документ выдан, "needs" — не хватает данных и выставлено
+    ожидание ответа, "error" — прочая причина (не оплачено, неполные поля).
+    Ошибка не исключение: вызывающий решает, продолжать пакет или ждать ответа.
     """
     label = _DOC_IMPL_LABELS.get(action, "документ")
     impls = {
@@ -2055,7 +2070,7 @@ async def run_doc_impl(update, context, message, num: str, action: str,
         "build_report":  agent.build_report_impl,
     }
     if action not in impls:
-        return False
+        return "error"
 
     await message.reply_text(f"⏳ Формирую {label} по сделке {num}...")
     result = await typing_while(update.effective_chat.id, context, impls[action](num))
@@ -2083,7 +2098,7 @@ async def run_doc_impl(update, context, message, num: str, action: str,
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
-        return False
+        return "needs" if need else "error"
 
     # Адаптируем формат build_*_impl (file/extra_*) в формат send_result (files-list)
     files = []
@@ -2105,7 +2120,43 @@ async def run_doc_impl(update, context, message, num: str, action: str,
         "text":    result.get("message", ""),
         "buttons": result.get("buttons") if show_buttons else None,
     }, context=context)
-    return True
+    return "ok"
+
+
+async def run_doc_batch(update, context, message, num: str, steps: list):
+    """
+    Формирует несколько документов подряд (расписка → акт → отчёт).
+
+    Если документу не хватает данных, цикл ОСТАНАВЛИВАЕТСЯ: оставшиеся шаги
+    кладутся в ожидание рядом с вопросом. Иначе следующие документы упёрлись
+    бы в ту же нехватку, задали бы тот же вопрос ещё дважды, а ответ применился
+    бы только к последнему. После ответа apply_doc_field продолжит пакет с
+    прерванного места.
+    """
+    done = 0
+    for i, step in enumerate(steps):
+        status = await run_doc_impl(update, context, message, num, step,
+                                    show_buttons=False)
+        if status == "needs":
+            pending = context.user_data.get("awaiting_doc_field")
+            if pending:
+                pending["steps"] = list(steps[i:])
+            return
+        if status == "ok":
+            done += 1
+
+    if done == len(steps):
+        text = f"✅ Комплект по сделке *{num}* готов"
+    else:
+        text = (f"Комплект по сделке *{num}*: сформировано {done} из {len(steps)}, "
+                "причины по остальным — выше")
+    await message.reply_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("◀️ К сделке", callback_data=f"dealaction:{num}:menu")
+        ]]),
+    )
 
 
 # Колонки журнала для полей, которые бот спрашивает по ходу сборки документа.
@@ -2161,6 +2212,8 @@ async def apply_doc_field(update, context, message, value: str) -> bool:
             return True
         value = m.group(0).replace(".", ",")
 
+    # pending нужен ниже (очередь пакета), поэтому берём копию перед сбросом
+    pending = dict(pending)
     context.user_data.pop("awaiting_doc_field", None)
 
     ok = await agent.sheets.update_deal(num, {column: value})
@@ -2169,7 +2222,12 @@ async def apply_doc_field(update, context, message, value: str) -> bool:
         return True
 
     await message.reply_text(f"✅ {column}: {value} — записано по сделке {num}")
-    await run_doc_impl(update, context, message, num, action)
+
+    steps = pending.get("steps")
+    if steps:
+        await run_doc_batch(update, context, message, num, steps)
+    else:
+        await run_doc_impl(update, context, message, num, action)
     return True
 
 
