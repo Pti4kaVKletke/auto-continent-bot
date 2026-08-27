@@ -218,6 +218,10 @@ SCAN_TYPES = [
     ("receipt", "Расписка",               "Подп_Расписка",     ("расписк",)),
     ("report",  "Отчёт агента",           "Подп_Отчет_агента", ("отчет",)),
     ("act",     "Акт",                    "Подп_Акт",          ("акт",)),
+    # Весь комплект одним PDF. Имя без «Подп_» — Илья назвал его «Скан_АД»,
+    # и ловится он отдельным правилом (SCAN_BUNDLE_RE), а не по ключевым
+    # словам: один такой файл закрывает сразу все пять позиций.
+    ("bundle",  "Комплект одним файлом",  "Скан_АД",           ()),
     # Ниже — то, что не подписывается сторонами. В комплект не входит,
     # имена без «Подп_»: их бот и не ищет как подписанные.
     ("invoice", "Платёжка / п.п.",        "Платежка",          ()),
@@ -250,12 +254,21 @@ def _normalize_scan_name(filename: str) -> str:
     return re.sub(r"[\s_\-.]+", " ", name).strip()
 
 
+# Комплект одним файлом: «Скан_АД_010826001.pdf», «Сканы АД 1.pdf».
+# Отдельное правило, потому что имя не начинается с «Подп_».
+SCAN_BUNDLE_RE = re.compile(r"^скан\S*\s+ад\b")
+
+
 def scan_type_of(filename: str) -> str | None:
     """
-    Тип ПОДПИСАННОГО документа по имени файла. None — файл не подписанный
-    (нет «Подп» в начале) или тип не распознан.
+    Тип подписанного документа по имени файла.
+
+    None — файл не подписанный (нет «Подп» в начале) или тип не распознан:
+    платёжка, документы сторон, копия без подписи, фото с телефона.
     """
     name = _normalize_scan_name(filename)
+    if SCAN_BUNDLE_RE.match(name):
+        return "bundle"
     if not name.startswith("подп"):
         return None
     for code, keywords in _SCAN_KEYWORDS:
@@ -280,12 +293,21 @@ def scan_status_text(filenames: list) -> str:
     found = {scan_type_of(n) for n in filenames}
     found.discard(None)
 
+    total = len(REQUIRED_SCANS)
+
+    # Комплект одним PDF закрывает все позиции разом. Отмечаем это в тексте:
+    # искать внутри одного файла — не то же самое, что видеть пять отдельных.
+    if "bundle" in found:
+        extra = len([n for n in filenames if scan_type_of(n) != "bundle"])
+        text = f"{total}/{total} ✓ одним файлом"
+        return text + (f" (+{extra})" if extra else "")
+
     have    = [c for c in REQUIRED_SCANS if c in found]
     missing = [SCAN_LABELS[c] for c in REQUIRED_SCANS if c not in found]
     extra   = len(filenames) - len([n for n in filenames
                                     if scan_type_of(n) in REQUIRED_SCANS])
 
-    text = f"{len(have)}/{len(REQUIRED_SCANS)}"
+    text = f"{len(have)}/{total}"
     text += " ✓" if not missing else " · нет: " + ", ".join(m.lower() for m in missing)
     if extra > 0:
         text += f" (+{extra})"
