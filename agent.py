@@ -2240,12 +2240,19 @@ VIN: ...
                 # «Всё» добавляет к пакету закрывающие документы. Доступно только
                 # по оплаченной сделке с заполненным фактическим курсом — иначе
                 # придут первые три файла и причина по каждому недостающему.
-                {"text": "📦 Всё (+ Акт, Расписка, Отчёт)",    "callback_data": f"docmenu:{contract_number}:full"},
+                # Закрывающие — для сделки, по которой базовый пакет уже выдан,
+                # а деньги продавцу только что переданы. Нужны чаще, чем «Всё»,
+                # поэтому стоят выше.
+                {"text": "🧷 Закрывающие (Расписка + Акт + Отчёт)",
+                                                              "callback_data": f"docmenu:{contract_number}:closing"},
+                {"text": "📦 Всё (+ Расписка, Акт, Отчёт)",   "callback_data": f"docmenu:{contract_number}:full"},
                 {"text": "📋 АГ договор",                      "callback_data": f"docmenu:{contract_number}:ag"},
                 {"text": "🚗 ДКП ТС",                         "callback_data": f"docmenu:{contract_number}:dkp"},
                 {"text": "💰 Счёт на оплату",                  "callback_data": f"docmenu:{contract_number}:invoice"},
-                {"text": "📄 Акт выполненных услуг",           "callback_data": f"dealaction:{contract_number}:build_act"},
+                # Порядок как в сделке: сначала расписка (деньги выданы),
+                # затем акт и отчёт.
                 {"text": "🧾 Расписка о получении денег",       "callback_data": f"dealaction:{contract_number}:build_receipt"},
+                {"text": "📄 Акт выполненных услуг",           "callback_data": f"dealaction:{contract_number}:build_act"},
                 {"text": "📊 Отчёт агента",                    "callback_data": f"dealaction:{contract_number}:build_report"},
             ]
             return {"message": text, "buttons": buttons}

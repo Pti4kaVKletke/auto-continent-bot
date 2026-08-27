@@ -1191,23 +1191,29 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             doc_type        = parts[2]
             await query.edit_message_reply_markup(reply_markup=None)
 
-            # «Всё» = базовый пакет + закрывающие документы (акт, расписка,
-            # отчёт агента). Строим их разными вызовами, а не одним: закрывающие
-            # требуют полной оплаты и фактического курса, и если сделка до них
-            # ещё не дошла — базовый пакет всё равно должен уйти, а по каждому
-            # недостающему документу придёт своя причина.
-            base_type = "all" if doc_type == "full" else doc_type
-            result = await typing_while(
-                update.effective_chat.id, context,
-                agent.process_message(
-                    f"Создай документы для сделки {contract_number}, тип: {base_type}",
-                    chat_id=str(update.effective_chat.id),
-                )
-            )
-            await send_result(query.message, result, context=context)
+            # Закрывающие документы идут в порядке самой сделки: сначала
+            # расписка (деньги выданы), затем акт и отчёт агента.
+            # Строим их отдельными вызовами, а не одним пакетом: они требуют
+            # полной оплаты, даты расчёта и фактического курса. Если сделка до
+            # них ещё не дошла, базовый пакет всё равно уходит, а по каждому
+            # недостающему документу приходит своя причина.
+            CLOSING_STEPS = ("build_receipt", "build_act", "build_report")
 
-            if doc_type == "full":
-                for step in ("build_act", "build_receipt", "build_report"):
+            # full   = базовый пакет + закрывающие
+            # closing = только закрывающие (сделка уже оплачена и рассчитана)
+            if doc_type != "closing":
+                base_type = "all" if doc_type == "full" else doc_type
+                result = await typing_while(
+                    update.effective_chat.id, context,
+                    agent.process_message(
+                        f"Создай документы для сделки {contract_number}, тип: {base_type}",
+                        chat_id=str(update.effective_chat.id),
+                    )
+                )
+                await send_result(query.message, result, context=context)
+
+            if doc_type in ("full", "closing"):
+                for step in CLOSING_STEPS:
                     await run_doc_impl(update, context, query.message, contract_number, step)
 
     # ── Меню действий по сделке ──────────────────────────────────────────────
@@ -1288,8 +1294,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("📎 Загрузить скан",    callback_data=f"dealaction:{num}:scan"),
                  InlineKeyboardButton("🗂 Сканы",             callback_data=f"dealaction:{num}:scans")],
                 [InlineKeyboardButton("💳 Оплаты",            callback_data=f"dealaction:{num}:payments")],
-                [InlineKeyboardButton("📄 Акт",               callback_data=f"dealaction:{num}:build_act"),
-                 InlineKeyboardButton("🧾 Расписка",          callback_data=f"dealaction:{num}:build_receipt")],
+                # Порядок как в сделке: расписка (деньги выданы) → акт → отчёт
+                [InlineKeyboardButton("🧾 Расписка",          callback_data=f"dealaction:{num}:build_receipt"),
+                 InlineKeyboardButton("📄 Акт",               callback_data=f"dealaction:{num}:build_act")],
                 [InlineKeyboardButton("📊 Отчёт агента",      callback_data=f"dealaction:{num}:build_report")],
                 [InlineKeyboardButton("✅ Завершить сделку",  callback_data=f"dealaction:{num}:complete")],
                 [InlineKeyboardButton("❌ Отменить сделку",   callback_data=f"dealaction:{num}:cancel")],
