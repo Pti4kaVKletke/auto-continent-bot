@@ -18,7 +18,8 @@ else:
     logging.getLogger(__name__).info("Используется agent_v1")
 
 # Хелперы форматирования платежей (для локального рендера подменю оплат)
-from agent import _parse_payments, _calc_total_amount, _fmt_money, _money_str
+from agent import (_parse_payments, _calc_total_amount, _fmt_money, _money_str,
+                   SCAN_TYPES, SCAN_LABELS, SCAN_PREFIXES, scan_status_text)
 
 import memory
 import settings_service
@@ -462,24 +463,28 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         contract_number = context.user_data.pop("awaiting_scan_for_deal")
         deal_folder_id  = context.user_data.pop("awaiting_scan_folder_id", None)
 
-        if deal_folder_id:
-            try:
-                scans_folder_id = await agent.drive._get_or_create_folder("Сканы", deal_folder_id)
-                link = await agent.drive.upload_file(filepath, filename, scans_folder_id)
-                # Удаляем из pending_scans — файл уже загружен напрямую, не нужно повторять при create_contract
-                memory.clear_pending_scans(chat_id)
-                await message.reply_text(
-                    f"✅ Скан загружен в папку сделки *{contract_number}*",
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("◀️ К сделке", callback_data=f"dealaction:{contract_number}:menu")
-                    ]])
-                )
-            except Exception as e:
-                logger.error(f"Ошибка загрузки скана для сделки {contract_number}: {e}", exc_info=True)
-                await message.reply_text(f"⚠️ Не удалось загрузить скан: {e}")
-        else:
+        if not deal_folder_id:
             await message.reply_text(f"⚠️ Папка сделки {contract_number} не найдена на Drive.")
+            return
+
+        # Файл не грузим сразу: сначала спрашиваем, что это за документ.
+        # Тип уходит в имя файла — по нему потом читается статус комплекта
+        # и видно содержимое папки без открывания файлов.
+        context.user_data["pending_scan"] = {
+            "num":       contract_number,
+            "folder_id": deal_folder_id,
+            "filepath":  filepath,
+            "filename":  filename,
+        }
+        kb = [[InlineKeyboardButton(label, callback_data=f"scantype:{code}")]
+              for code, label, _, _ in SCAN_TYPES]
+        kb.append([InlineKeyboardButton("◀️ Отмена",
+                                        callback_data=f"dealaction:{contract_number}:menu")])
+        await message.reply_text(
+            f"📎 Файл получен. Что это за документ по сделке *{contract_number}*?",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb),
+        )
         return
 
     # ── Сценарий Г: файл без контекста — спрашиваем что делать ──
@@ -550,6 +555,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # следующий текст не надо принимать за дату или курс.
     if not (query.data or "").startswith("docfield:"):
         context.user_data.pop("awaiting_doc_field", None)
+
+    # То же для файла, ждущего выбора типа: он нужен ветке scantype:
+    if not (query.data or "").startswith("scantype:"):
+        context.user_data.pop("pending_scan", None)
 
     data = query.data or ""
 
@@ -1185,6 +1194,56 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_result(query.message, result)
 
     # ── Меню документов сделки ────────────────────────────────────────────────
+    elif data.startswith("scantype:"):
+        # Пользователь выбрал тип загружаемого скана — грузим на Drive под
+        # осмысленным именем и пересчитываем статус комплекта.
+        code = data.split(":", 1)[1]
+        pending = context.user_data.pop("pending_scan", None)
+        if not pending:
+            await query.edit_message_text("⚠️ Файл потерялся, пришлите его ещё раз.")
+            return
+
+        num      = pending["num"]
+        prefix   = SCAN_PREFIXES.get(code, "Прочее")
+        filepath = pending["filepath"]
+        ext      = Path(pending["filename"]).suffix or ".pdf"
+        base     = f"{prefix}_{num}"
+
+        await query.edit_message_text(f"⏳ Загружаю {SCAN_LABELS.get(code, 'скан')}...")
+        try:
+            scans_folder_id = await agent.drive._get_or_create_folder("Сканы", pending["folder_id"])
+
+            # Имя занято (переснятый скан, вторая страница) — дописываем номер,
+            # а не затираем: потерять уже подписанный документ хуже, чем
+            # оставить в папке лишний файл.
+            _, existing = await agent.list_scan_files(num)
+            taken = {f.get("name", "") for f in existing}
+            new_name, n = f"{base}{ext}", 1
+            while new_name in taken:
+                n += 1
+                new_name = f"{base}_{n}{ext}"
+
+            await agent.drive.upload_file(filepath, new_name, scans_folder_id)
+            # Файл уже на Drive — повторно грузить его при create_contract не нужно
+            memory.clear_pending_scans(str(update.effective_chat.id))
+            status = await agent.refresh_scan_status(num)
+        except Exception as e:
+            logger.error(f"Ошибка загрузки скана для сделки {num}: {e}", exc_info=True)
+            await query.message.reply_text(f"⚠️ Не удалось загрузить скан: {e}")
+            return
+
+        text = [f"✅ {SCAN_LABELS.get(code, 'Скан')} загружен: `{new_name}`"]
+        if status:
+            text.append(f"🗂 Сканы по сделке *{num}*: {status}")
+        await query.message.reply_text(
+            "\n".join(text),
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📎 Загрузить ещё", callback_data=f"dealaction:{num}:scan")],
+                [InlineKeyboardButton("◀️ К сделке",      callback_data=f"dealaction:{num}:menu")],
+            ]),
+        )
+
     elif data.startswith("docfield:"):
         # Кнопка быстрого выбора даты расчёта. Значение уже готовое, поэтому
         # идёт в тот же apply_doc_field, что и ручной ввод.
@@ -1329,6 +1388,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text += f"\n   _{bank_short}_"
             if account_number:
                 text += f"\n   Счёт: `{account_number}`"
+            # Статус сканов пересчитываем прямо здесь, а не берём из журнала:
+            # файлы кладут в папку и напрямую с компьютера, мимо бота, и без
+            # пересчёта в меню висели бы старые цифры. Один запрос к Drive.
+            try:
+                scans_status = await agent.refresh_scan_status(num)
+            except Exception as e:
+                logger.warning(f"Не удалось обновить статус сканов {num}: {e}")
+                scans_status = str(deal.get("Сканы") or "").strip()
+            if scans_status:
+                text += f"\n🗂 Сканы: {scans_status}"
             keyboard = [
                 [InlineKeyboardButton("📋 Создать документы", callback_data=f"dealaction:{num}:docs")],
                 [InlineKeyboardButton("✏️ Изменить данные",   callback_data=f"dealaction:{num}:edit")],
@@ -1404,12 +1473,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
 
+            # Заодно обновляем колонку «Сканы» в журнале: файлы могли положить
+            # в папку и мимо бота, а колонка — только отражение папки.
+            status = scan_status_text([f.get("name", "") for f in files])
+            try:
+                await agent.sheets.update_deal(num, {"Сканы": status})
+            except Exception as e:
+                logger.warning(f"Не удалось записать статус сканов {num}: {e}")
+
             if scans_id is None:
                 text = f"🗂 *Сканы сделки {num}*\n\nПапка «Сканы» не найдена."
             elif not files:
                 text = f"🗂 *Сканы сделки {num}*\n\nПапка пуста — сканов нет."
             else:
-                lines = [f"🗂 *Сканы сделки {num}* · {len(files)} файл(ов)\n"]
+                lines = [f"🗂 *Сканы сделки {num}* · подписано {status}\n"]
                 for f in files:
                     name = f.get("name", "—")
                     size = f.get("size", "")
@@ -2047,6 +2124,10 @@ def _deal_card(d: dict) -> str:
         lines.append(f"📥 Получено: {received}")
     if remainder:
         lines.append(f"⏳ Остаток: {remainder}")
+
+    scans = v("Сканы", "")
+    if scans:
+        lines.append(f"🗂 Сканы: {scans}")
 
     return "\n".join(lines)
 

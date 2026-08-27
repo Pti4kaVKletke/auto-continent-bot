@@ -202,6 +202,96 @@ def _num_for_sheet(x: float) -> str:
     return f"{x:.2f}".replace(".", ",")
 
 
+# ══ СКАНЫ ПОДПИСАННЫХ ДОКУМЕНТОВ ═════════════════════════════════════════
+# Сканы лежат на Drive в подпапке «Сканы» внутри папки сделки. Файлы туда
+# кладут и через бота, и напрямую с компьютера, поэтому тип определяется по
+# ИМЕНИ ФАЙЛА, а не по содержимому.
+#
+# Имя = «Подп_» + имя исходного документа: Подп_АГ_Договор_110826001.pdf.
+# Слово «Подп» в начале обязательно: в папку может попасть копия без подписи
+# или черновик, и без этого признака она сошла бы за подписанный документ.
+#
+# (код, подпись для кнопки, имя при загрузке через бота, ключевые слова)
+SCAN_TYPES = [
+    ("ag",      "АГ договор + поручение", "Подп_АГ_Договор",   ("аг договор", "агентск")),
+    ("dkp",     "ДКП",                    "Подп_ДКП_ТС",       ("дкп",)),
+    ("receipt", "Расписка",               "Подп_Расписка",     ("расписк",)),
+    ("report",  "Отчёт агента",           "Подп_Отчет_агента", ("отчет",)),
+    ("act",     "Акт",                    "Подп_Акт",          ("акт",)),
+    # Ниже — то, что не подписывается сторонами. В комплект не входит,
+    # имена без «Подп_»: их бот и не ищет как подписанные.
+    ("invoice", "Платёжка / п.п.",        "Платежка",          ()),
+    ("id",      "Документы сторон",       "Документы_сторон",  ()),
+    ("other",   "Прочее",                 "Прочее",            ()),
+]
+
+# Что должно быть подписано, чтобы комплект считался собранным.
+# Счёт сюда не входит: подписанного счёта не бывает, оплату подтверждает
+# платёжка. Порядок задаёт и порядок перечисления недостающих.
+REQUIRED_SCANS = ("ag", "dkp", "receipt", "act", "report")
+
+SCAN_LABELS   = {code: label for code, label, _, _ in SCAN_TYPES}
+SCAN_PREFIXES = {code: prefix for code, _, prefix, _ in SCAN_TYPES}
+
+# Порядок проверки — от специфичного к общему: «акт» ищем последним, иначе
+# он поймал бы «Подп_Акт...» раньше, чем более длинные совпадения.
+_SCAN_KEYWORDS = [(code, kws) for code, _, _, kws in SCAN_TYPES if kws]
+
+
+def _normalize_scan_name(filename: str) -> str:
+    """
+    Приводит имя файла к виду, по которому можно искать ключевые слова.
+
+    Регистр, «ё», подчёркивания, дефисы и точки не должны влиять на разбор:
+    «Подп_ДКП_ТС_110826001.pdf», «подп дкп тс.pdf» и «Подп-ДКП.PDF» — одно и
+    то же. Возвращает строку в нижнем регистре со словами через пробел.
+    """
+    name = (filename or "").lower().replace("ё", "е")
+    return re.sub(r"[\s_\-.]+", " ", name).strip()
+
+
+def scan_type_of(filename: str) -> str | None:
+    """
+    Тип ПОДПИСАННОГО документа по имени файла. None — файл не подписанный
+    (нет «Подп» в начале) или тип не распознан.
+    """
+    name = _normalize_scan_name(filename)
+    if not name.startswith("подп"):
+        return None
+    for code, keywords in _SCAN_KEYWORDS:
+        if any(k in name for k in keywords):
+            return code
+    return None
+
+
+def scan_status_text(filenames: list) -> str:
+    """
+    Строка статуса сканов для журнала и карточки сделки.
+
+    «5/5 ✓» — комплект собран; «3/5 · нет: акт, отчёт агента» — чего не
+    хватает; «нет» — папка пуста. Файлы вне комплекта (платёжка, документы
+    сторон, копии без подписи) на счётчик не влияют, но считаются отдельно —
+    иначе непонятно, почему в папке файлов больше, чем в статусе.
+    """
+    filenames = [n for n in (filenames or []) if n]
+    if not filenames:
+        return "нет"
+
+    found = {scan_type_of(n) for n in filenames}
+    found.discard(None)
+
+    have    = [c for c in REQUIRED_SCANS if c in found]
+    missing = [SCAN_LABELS[c] for c in REQUIRED_SCANS if c not in found]
+    extra   = len(filenames) - len([n for n in filenames
+                                    if scan_type_of(n) in REQUIRED_SCANS])
+
+    text = f"{len(have)}/{len(REQUIRED_SCANS)}"
+    text += " ✓" if not missing else " · нет: " + ", ".join(m.lower() for m in missing)
+    if extra > 0:
+        text += f" (+{extra})"
+    return text
+
+
 # ══ СТАТИСТИКА ПО ЖУРНАЛУ СДЕЛОК ═════════════════════════════════════════
 
 def _parse_date_ddmmyyyy(s: str):
@@ -2274,6 +2364,10 @@ VIN: ...
                 lines += ["", f"⚠️ Для расписки, акта и отчёта не хватает: {', '.join(missing)}. "
                               "Спрошу при формировании."]
 
+            scans = str(deal.get("Сканы") or "").strip()
+            if scans and scans != "нет":
+                lines.append(f"🗂 Сканы: {scans}")
+
             lines += ["", "Какие документы создать?"]
             text = "\n".join(lines)
             # Сохраняем данные для использования при нажатии кнопки
@@ -2961,6 +3055,60 @@ VIN: ...
         else:
             logger.warning(f"Сделка {contract_number}: не удалось записать сумму выдана {value}")
         return deal
+
+    async def list_scan_files(self, contract_number: str) -> tuple:
+        """
+        Возвращает (scans_folder_id, [файлы]) из папки «Сканы» сделки.
+
+        Папку сделки берём из колонки «Папка Drive», а если ссылки нет —
+        создаём/находим по номеру. Папки «Сканы» может не быть: тогда
+        (None, []) — это не ошибка, просто сканов ещё не загружали.
+        """
+        import asyncio as _asyncio
+
+        deal = await self.sheets.get_deal(contract_number)
+        folder_link = (deal or {}).get("Папка Drive", "") or ""
+        folder_id = (folder_link.split("/folders/")[-1].split("?")[0]
+                     if "/folders/" in folder_link else "")
+        if not folder_id:
+            folder_id = await self.drive.get_or_create_deal_folder(contract_number)
+        if not folder_id:
+            return None, []
+
+        def _list():
+            svc = self.drive.service
+            q = (f"name='Сканы' and mimeType='application/vnd.google-apps.folder' "
+                 f"and '{folder_id}' in parents and trashed=false")
+            folders = svc.files().list(q=q, fields="files(id,name)").execute().get("files", [])
+            if not folders:
+                return None, []
+            scans_id = folders[0]["id"]
+            files = svc.files().list(
+                q=f"'{scans_id}' in parents and trashed=false",
+                fields="files(id,name,mimeType,size,webViewLink,createdTime)",
+                orderBy="createdTime desc",
+            ).execute().get("files", [])
+            return scans_id, files
+
+        return await _asyncio.to_thread(_list)
+
+    async def refresh_scan_status(self, contract_number: str) -> str:
+        """
+        Пересчитывает статус сканов по папке Drive и пишет его в журнал.
+
+        Источник истины — сама папка: файлы туда может положить и человек
+        мимо бота. Колонка «Сканы» — только отражение, поэтому её всегда
+        перезаписываем, а не дополняем.
+        """
+        try:
+            _, files = await self.list_scan_files(contract_number)
+        except Exception as e:
+            logger.warning(f"Сделка {contract_number}: не удалось прочитать сканы — {e}")
+            return ""
+
+        status = scan_status_text([f.get("name", "") for f in files])
+        await self.sheets.update_deal(contract_number, {"Сканы": status})
+        return status
 
     async def build_act_impl(self, contract_number: str) -> dict:
         """Формирует акт выполненных услуг по сделке.
