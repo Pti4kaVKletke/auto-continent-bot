@@ -18,7 +18,7 @@ else:
     logging.getLogger(__name__).info("Используется agent_v1")
 
 # Хелперы форматирования платежей (для локального рендера подменю оплат)
-from agent import _parse_payments, _calc_total_amount, _fmt_money
+from agent import _parse_payments, _calc_total_amount, _fmt_money, _money_str
 
 import memory
 import settings_service
@@ -410,7 +410,15 @@ async def send_result(message, result: dict, context=None, chat_id=None):
             if not has_back:
                 keyboard.append([InlineKeyboardButton("◀️ Меню", callback_data="menu:back")])
             reply_markup = InlineKeyboardMarkup(keyboard)
-        await message.reply_text(result["text"], reply_markup=reply_markup)
+        # Markdown включаем с откатом: тексты бота размечены (*жирный*, `код`),
+        # а тексты LLM — нет, и случайный `_` или `*` в ФИО ломает разбор.
+        # При ошибке разметки отправляем как есть, лишь бы сообщение дошло.
+        try:
+            await message.reply_text(result["text"], parse_mode="Markdown",
+                                     reply_markup=reply_markup)
+        except Exception as e:
+            logger.warning(f"Markdown не разобран, отправляю без разметки: {e}")
+            await message.reply_text(result["text"], reply_markup=reply_markup)
 
 
 # ─── ОБРАБОТКА ФАЙЛОВ ────────────────────────────────────────────────────────
@@ -2022,21 +2030,23 @@ def _deal_card(d: dict) -> str:
     car = v("car_model")
     lines.append(f"🚗 {car}" + (f" · VIN `{vin}`" if vin else ""))
 
-    price = v("car_price", "")
+    # Суммы приводим к единому виду: в журнале они лежат по-разному —
+    # «3060780», «3 137 299,50», иногда уже с символом ₽.
+    price = _money_str(d.get("car_price"))
     if price:
-        lines.append(f"💰 Цена авто: {price} руб.")
-    total = v("Сумма Договора", "")
+        lines.append(f"💰 Цена авто: {price}")
+    total = _money_str(d.get("Сумма Договора"))
     if total:
-        lines.append(f"💵 Итого к оплате: *{total}* руб.")
+        lines.append(f"💵 Итого к оплате: *{total}*")
 
     # Оплаты показываем только когда по сделке уже что-то происходило —
     # у новой сделки три нулевые строки только зашумляют карточку.
-    received  = v("Получено", "")
-    remainder = v("Остаток", "")
+    received  = _money_str(d.get("Получено"))
+    remainder = _money_str(d.get("Остаток"))
     if received:
-        lines.append(f"📥 Получено: {received} руб.")
+        lines.append(f"📥 Получено: {received}")
     if remainder:
-        lines.append(f"⏳ Остаток: {remainder} руб.")
+        lines.append(f"⏳ Остаток: {remainder}")
 
     return "\n".join(lines)
 

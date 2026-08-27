@@ -68,7 +68,9 @@ def _fmt_money(x: float) -> str:
         return str(x)
     if x == int(x):
         return f"{int(x):,}".replace(",", " ")
-    return f"{x:,.2f}".replace(",", " ")
+    # Русская локаль: разделитель тысяч — пробел, десятичный — запятая.
+    # Через маркер, потому что format даёт запятую в роли разделителя тысяч.
+    return f"{x:,.2f}".replace(",", "\u0000").replace(".", ",").replace("\u0000", " ")
 
 
 def _calc_total_amount(deal: dict) -> float:
@@ -171,6 +173,25 @@ def _amount_mismatch_text(contract_number: str, e: AmountMismatchError) -> str:
         "",
         "Проверьте в журнале «Сумма нал.», «Курс USD/RUB» и «Цена ДКП» и повторите.",
     ])
+
+
+def _money_str(v, suffix: str = " руб.") -> str:
+    """
+    Приводит денежное значение из журнала к виду «3 060 780 руб.».
+
+    Sheets отдаёт числа по-разному: «3060780», «3 137 299,50», иногда уже с
+    символом валюты («3 137 299,50 ₽») — из-за него в сообщении получалось
+    «3 137 299,50 ₽ руб.». Символ и пробелы убираем, число форматируем сами.
+    Не распознали — возвращаем как есть, без приписки.
+    """
+    raw = str(v or "").strip()
+    if not raw:
+        return ""
+    cleaned = re.sub(r"[₽$€]|руб\.?|USD", "", raw, flags=re.IGNORECASE).strip()
+    num = _num(cleaned)
+    if not num:
+        return raw
+    return f"{_fmt_money(num)}{suffix}"
 
 
 def _num_for_sheet(x: float) -> str:
@@ -2236,11 +2257,12 @@ VIN: ...
                 f"👤 Покупатель: {deal.get('buyer_name', '—')}",
                 f"👤 Продавец: {deal.get('seller_name', '—')}",
                 f"🚗 {deal.get('car_model', '—')} · VIN `{deal.get('car_vin', '—')}`",
-                f"💰 Цена авто: {deal.get('car_price', '—')} руб. · комиссия {commission_pct}%",
+                f"💰 Цена авто: {_money_str(deal.get('car_price')) or '—'} · "
+                f"комиссия {str(commission_pct).replace('.', ',')}%",
             ]
-            total_sum = str(deal.get("Сумма Договора", "") or "").strip()
+            total_sum = _money_str(deal.get("Сумма Договора"))
             if total_sum:
-                lines.append(f"💵 Итого к оплате: *{total_sum}* руб.")
+                lines.append(f"💵 Итого к оплате: *{total_sum}*")
 
             # Чего не хватает закрывающим документам — видно сразу, до нажатия
             # кнопки. Обе колонки заполняются вручную после конвертации.
