@@ -1936,6 +1936,28 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
+    # ── Прислали просто номер сделки ────────────────────────────────────────
+    # Отвечаем карточкой из журнала, не спрашивая LLM: она пересказывала данные
+    # своими словами и цифры до пользователя не доходили. Заодно быстрее и без
+    # лишнего вызова модели. Не нашли — пусть дальше разбирается LLM.
+    if re.fullmatch(r"\d{9}", user_text.strip()):
+        num = user_text.strip()
+        deal = await agent.sheets.get_deal(num)
+        if deal:
+            context.user_data["current_deal"] = num
+            await update.message.reply_text(
+                _deal_card(deal),
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📋 Открыть меню сделки",
+                                          callback_data=f"dealaction:{num}:menu")],
+                    [InlineKeyboardButton("📄 Создать документы",
+                                          callback_data=f"dealaction:{num}:docs")],
+                    [InlineKeyboardButton("◀️ Меню", callback_data="menu:back")],
+                ]),
+            )
+            return
+
     # Если есть открытая сделка и пользователь задал короткий вопрос — добавляем контекст
     current_deal = context.user_data.get("current_deal")
     message_to_agent = user_text
@@ -1954,6 +1976,43 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         agent.process_message(message_to_agent, chat_id=chat_id, force_tool=forced)
     )
     await send_result(update.message, result, context=context, chat_id=str(update.effective_chat.id))
+
+
+def _deal_card(d: dict) -> str:
+    """Краткая карточка сделки: кто, что, на сколько и в каком состоянии."""
+    def v(key, default="—"):
+        val = str(d.get(key, "") or "").strip()
+        return val if val and val != "None" else default
+
+    num    = v("Номер договора")
+    vin    = v("car_vin", "")
+    status = v("Статус")
+    lines = [f"📄 *Сделка {num}* от {v('Дата договора')} · {status}", ""]
+
+    buyer = v("buyer_name")
+    lines.append(f"👤 Заказчик: {buyer}")
+    lines.append(f"👤 Продавец: {v('seller_name')}")
+
+    car = v("car_model")
+    lines.append(f"🚗 {car}" + (f" · VIN `{vin}`" if vin else ""))
+
+    price = v("car_price", "")
+    if price:
+        lines.append(f"💰 Цена авто: {price} руб.")
+    total = v("Сумма Договора", "")
+    if total:
+        lines.append(f"💵 Итого к оплате: *{total}* руб.")
+
+    # Оплаты показываем только когда по сделке уже что-то происходило —
+    # у новой сделки три нулевые строки только зашумляют карточку.
+    received  = v("Получено", "")
+    remainder = v("Остаток", "")
+    if received:
+        lines.append(f"📥 Получено: {received} руб.")
+    if remainder:
+        lines.append(f"⏳ Остаток: {remainder} руб.")
+
+    return "\n".join(lines)
 
 
 # ─── ЗАКРЫВАЮЩИЕ ДОКУМЕНТЫ (акт / расписка / отчёт) ──────────────────────────
