@@ -1462,12 +1462,24 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["awaiting_edit_deal"] = num
 
         elif action == "docs":
+            # Инструмент вызываем напрямую, без LLM: она переписывала готовый
+            # текст своими словами и дописывала к нему технические коды
+            # (all / ag / dkp / invoice), которых пользователь не набирает —
+            # рядом стоят кнопки.
             await query.edit_message_text(f"⏳ Загружаю данные сделки {num}...")
-            result = await typing_while(
-                update.effective_chat.id, context,
-                agent.process_message(f"проверь сделку {num}", chat_id=str(update.effective_chat.id))
-            )
-            await send_result(query.message, result)
+            try:
+                result = await typing_while(
+                    update.effective_chat.id, context,
+                    agent._execute_tool("check_deal", {"contract_number": num}),
+                )
+            except Exception as e:
+                logger.error(f"Ошибка check_deal для {num}: {e}", exc_info=True)
+                result = {"message": f"⚠️ Не удалось загрузить сделку {num}: {e}"}
+
+            await send_result(query.message, {
+                "text":    result.get("message") or result.get("error", ""),
+                "buttons": result.get("buttons"),
+            }, context=context)
 
         elif action in ("build_act", "build_receipt", "build_report"):
             # Акт выполненных услуг / расписка продавца о получении наличных

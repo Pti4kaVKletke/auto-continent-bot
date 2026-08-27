@@ -2228,15 +2228,32 @@ VIN: ...
             # перечитывая журнал. Без этой строки в ДКП уходит дата договора.
             data["Дата ДКП"] = deal.get("Дата ДКП", "")
 
-            text = "\n".join([
-                f"✅ Сделка {contract_number} от {contract_date} — все поля заполнены.\n",
+            status = (deal.get("Статус") or "—").strip()
+            lines = [
+                f"📄 *Сделка {contract_number}* от {contract_date} · {status}",
+                "✅ Все обязательные поля заполнены",
+                "",
                 f"👤 Покупатель: {deal.get('buyer_name', '—')}",
                 f"👤 Продавец: {deal.get('seller_name', '—')}",
-                f"🚗 {deal.get('car_model', '—')}, VIN {deal.get('car_vin', '—')}",
-                f"💰 {deal.get('car_price', '—')} руб., {deal.get('cash_amount', '—')} USD",
-                f"📊 Комиссия: {commission_pct}%\n",
-                "Какие документы создать?",
-            ])
+                f"🚗 {deal.get('car_model', '—')} · VIN `{deal.get('car_vin', '—')}`",
+                f"💰 Цена авто: {deal.get('car_price', '—')} руб. · комиссия {commission_pct}%",
+            ]
+            total_sum = str(deal.get("Сумма Договора", "") or "").strip()
+            if total_sum:
+                lines.append(f"💵 Итого к оплате: *{total_sum}* руб.")
+
+            # Чего не хватает закрывающим документам — видно сразу, до нажатия
+            # кнопки. Обе колонки заполняются вручную после конвертации.
+            missing = [name for name, key in (
+                ("дата расчёта", "Дата расчёта"),
+                ("фактический курс", "Фактический курс"),
+            ) if not str(deal.get(key) or "").strip()]
+            if missing:
+                lines += ["", f"⚠️ Для расписки, акта и отчёта не хватает: {', '.join(missing)}. "
+                              "Спрошу при формировании."]
+
+            lines += ["", "Какие документы создать?"]
+            text = "\n".join(lines)
             # Сохраняем данные для использования при нажатии кнопки
             self._pending_check = {
                 "contract_number": contract_number,
@@ -2246,14 +2263,12 @@ VIN: ...
             }
             buttons = [
                 {"text": "📄 Полный пакет (АГ + ДКП + Счёт)", "callback_data": f"docmenu:{contract_number}:all"},
-                # «Всё» добавляет к пакету закрывающие документы. Доступно только
-                # по оплаченной сделке с заполненным фактическим курсом — иначе
-                # придут первые три файла и причина по каждому недостающему.
                 # Закрывающие — для сделки, по которой базовый пакет уже выдан,
                 # а деньги продавцу только что переданы. Нужны чаще, чем «Всё»,
                 # поэтому стоят выше.
                 {"text": "🧷 Закрывающие (Расписка + Акт + Отчёт)",
                                                               "callback_data": f"docmenu:{contract_number}:closing"},
+                # «Всё» = базовый пакет + закрывающие, за один раз.
                 {"text": "📦 Всё (+ Расписка, Акт, Отчёт)",   "callback_data": f"docmenu:{contract_number}:full"},
                 {"text": "📋 АГ договор",                      "callback_data": f"docmenu:{contract_number}:ag"},
                 {"text": "🚗 ДКП ТС",                         "callback_data": f"docmenu:{contract_number}:dkp"},
