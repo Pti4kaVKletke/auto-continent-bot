@@ -2865,13 +2865,14 @@ VIN: ...
         # Отменённые/черновики не трогаем.
         buttons = []
         if remainder <= 0.01 and current_status not in ("отменена", "черновик"):
-            buttons.append({
-                "text":          "📄 Сформировать акт",
-                "callback_data": f"dealaction:{contract_number}:build_act",
-            })
+            # Порядок как в сделке: расписка (деньги выданы) → акт → отчёт
             buttons.append({
                 "text":          "🧾 Сформировать расписку",
                 "callback_data": f"dealaction:{contract_number}:build_receipt",
+            })
+            buttons.append({
+                "text":          "📄 Сформировать акт",
+                "callback_data": f"dealaction:{contract_number}:build_act",
             })
             buttons.append({
                 "text":          "📊 Отчёт агента",
@@ -3044,9 +3045,9 @@ VIN: ...
             "extra_names": extra_names,
             "extra_links": extra_links,
             "message":     f"📄 Акт по сделке *{contract_number}* от {act_date} сформирован",
+            # Следующий шаг после акта — отчёт агента. Расписку не предлагаем:
+            # по порядку сделки она формируется раньше акта.
             "buttons": [
-                {"text": "🧾 Сформировать расписку",
-                 "callback_data": f"dealaction:{contract_number}:build_receipt"},
                 {"text": "📊 Отчёт агента",
                  "callback_data": f"dealaction:{contract_number}:build_report"},
                 {"text": "◀️ К сделке", "callback_data": f"dealaction:{contract_number}:menu"},
@@ -3312,6 +3313,9 @@ VIN: ...
             "extra_links": extra_links,
             "message":     f"🧾 Расписка по сделке *{contract_number}* от {receipt_date} сформирована",
             "buttons": [
+                # Следующий шаг после расписки — акт
+                {"text": "📄 Сформировать акт",
+                 "callback_data": f"dealaction:{contract_number}:build_act"},
                 {"text": "◀️ К сделке", "callback_data": f"dealaction:{contract_number}:menu"},
             ],
         }

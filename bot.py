@@ -1201,6 +1201,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # full   = базовый пакет + закрывающие
             # closing = только закрывающие (сделка уже оплачена и рассчитана)
+            in_batch = doc_type in ("full", "closing")
+
             if doc_type != "closing":
                 base_type = "all" if doc_type == "full" else doc_type
                 result = await typing_while(
@@ -1210,11 +1212,28 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         chat_id=str(update.effective_chat.id),
                     )
                 )
+                # Внутри пакета кнопку «К сделке» гасим — она придёт одна в конце
+                if in_batch:
+                    result = dict(result)
+                    result["buttons"] = None
                 await send_result(query.message, result, context=context)
 
-            if doc_type in ("full", "closing"):
+            if in_batch:
+                done = 0
                 for step in CLOSING_STEPS:
-                    await run_doc_impl(update, context, query.message, contract_number, step)
+                    if await run_doc_impl(update, context, query.message, contract_number,
+                                          step, show_buttons=False):
+                        done += 1
+                await query.message.reply_text(
+                    f"✅ Комплект по сделке *{contract_number}* готов"
+                    if done == len(CLOSING_STEPS)
+                    else f"Комплект по сделке *{contract_number}*: часть документов не сформирована — причины выше",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("◀️ К сделке",
+                                             callback_data=f"dealaction:{contract_number}:menu")
+                    ]]),
+                )
 
     # ── Меню действий по сделке ──────────────────────────────────────────────
     elif data.startswith("dealaction:"):
@@ -1946,7 +1965,8 @@ _DOC_IMPL_LABELS = {
 }
 
 
-async def run_doc_impl(update, context, message, num: str, action: str):
+async def run_doc_impl(update, context, message, num: str, action: str,
+                       show_buttons: bool = True):
     """
     Формирует акт / расписку / отчёт агента и отправляет результат в чат.
 
@@ -1959,6 +1979,12 @@ async def run_doc_impl(update, context, message, num: str, action: str):
     кнопки/просьбу ввести значение. Дальше apply_doc_field запишет ответ в
     журнал и вызовет эту же функцию повторно — возврат к документу не зависит
     от того, помнит ли о нём LLM.
+
+    show_buttons=False — внутри пакета документов: кнопки «следующий шаг» и
+    «К сделке» там только мусорят (предлагают то, что уже сформировано, или
+    повторяются после каждого файла). Итоговая кнопка приходит одна, в конце
+    пакета. На сообщения об ошибке флаг не влияет: там кнопки — часть
+    диалога, ими вводят дату расчёта.
 
     Возвращает True, если документ выдан. Ошибка не исключение: пакет
     документов после неё продолжается дальше.
@@ -2018,7 +2044,7 @@ async def run_doc_impl(update, context, message, num: str, action: str):
     await send_result(message, {
         "files":   files,
         "text":    result.get("message", ""),
-        "buttons": result.get("buttons"),
+        "buttons": result.get("buttons") if show_buttons else None,
     }, context=context)
     return True
 
