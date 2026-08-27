@@ -2956,21 +2956,35 @@ VIN: ...
         except Exception:
             act_date = payments[-1]["date"]
 
+        # Дата последнего платежа — подсказка для кнопки «дата расчёта»,
+        # если колонка пуста.
+        last_payment_date = act_date
+
         # Акт датируется днём передачи наличных продавцу. Колонка проверена
-        # выше и заполнена, поэтому дата последнего платежа здесь уже не нужна.
+        # ниже и заполнена, поэтому дата последнего платежа здесь уже не нужна.
         act_date = str(deal.get("Дата расчёта") or "").strip() or act_date
 
         # Дата расчёта — обязательна: ею подписаны расписка, акт и отчёт.
         # Пустую колонку больше не подменяем датой последнего платежа —
         # деньги приходят на счёт в один день, а выдаются продавцу в другой.
         if not str(deal.get("Дата расчёта") or "").strip():
-            return {"error": _settlement_date_missing_text(contract_number)}
+            # needs — машинная пометка для bot.py: он запомнит, какой документ
+            # просили, спросит недостающее и повторит вызов сам. Без неё
+            # возврат к документу оставался на память LLM, и она его теряла.
+            return {
+                "error": _settlement_date_missing_text(contract_number),
+                "needs": "settlement_date",
+                "needs_hint": last_payment_date,
+            }
 
         # Фактический курс — обязателен для документов дня расчёта.
         # Без него в тексте останется пустое место там, где стоит курс,
         # по которому рублёвое обязательство закрыто валютой.
         if not str(deal.get("Фактический курс") or "").strip():
-            return {"error": _fact_rate_missing_text(contract_number)}
+            return {
+                "error": _fact_rate_missing_text(contract_number),
+                "needs": "fact_rate",
+            }
 
         # Фиксируем фактически выданную сумму в журнале ДО сборки документа.
         deal = await self._ensure_paid_amount(contract_number, deal)
@@ -3083,21 +3097,32 @@ VIN: ...
         except Exception:
             last_date = payments[-1]["date"]
 
-        # По умолчанию все три даты — дата закрывающего платежа: отчёт, акт
-        # и передача наличных обычно оформляются одним днём. Если в журнале
-        # заполнены колонки «Дата поступления» / «Дата расчёта» — они главнее:
-        # деньги могли зайти и уйти в разные дни, и банк смотрит именно на это.
+        # По умолчанию дата поступления — дата закрывающего платежа. Дата
+        # расчёта берётся только из журнала: деньги могли зайти и уйти в
+        # разные дни, и банк смотрит именно на это.
+        last_payment_date = last_date
+
         # Дата расчёта — обязательна: ею подписаны расписка, акт и отчёт.
         # Пустую колонку больше не подменяем датой последнего платежа —
         # деньги приходят на счёт в один день, а выдаются продавцу в другой.
         if not str(deal.get("Дата расчёта") or "").strip():
-            return {"error": _settlement_date_missing_text(contract_number)}
+            # needs — машинная пометка для bot.py: он запомнит, какой документ
+            # просили, спросит недостающее и повторит вызов сам. Без неё
+            # возврат к документу оставался на память LLM, и она его теряла.
+            return {
+                "error": _settlement_date_missing_text(contract_number),
+                "needs": "settlement_date",
+                "needs_hint": last_payment_date,
+            }
 
         # Фактический курс — обязателен для документов дня расчёта.
         # Без него в тексте останется пустое место там, где стоит курс,
         # по которому рублёвое обязательство закрыто валютой.
         if not str(deal.get("Фактический курс") or "").strip():
-            return {"error": _fact_rate_missing_text(contract_number)}
+            return {
+                "error": _fact_rate_missing_text(contract_number),
+                "needs": "fact_rate",
+            }
 
         # Фиксируем фактически выданную сумму в журнале ДО сборки документа.
         deal = await self._ensure_paid_amount(contract_number, deal)
@@ -3205,21 +3230,33 @@ VIN: ...
         except Exception:
             receipt_date = payments[-1]["date"]
 
+        last_payment_date = receipt_date
+
         # Как у акта: дата расписки — день передачи наличных продавцу.
-        # Колонка проверена выше, фоллбэк остаётся только как страховка.
+        # Колонка проверена ниже, фоллбэк остаётся только как страховка.
         receipt_date = str(deal.get("Дата расчёта") or "").strip() or receipt_date
 
         # Дата расчёта — обязательна: ею подписаны расписка, акт и отчёт.
         # Пустую колонку больше не подменяем датой последнего платежа —
         # деньги приходят на счёт в один день, а выдаются продавцу в другой.
         if not str(deal.get("Дата расчёта") or "").strip():
-            return {"error": _settlement_date_missing_text(contract_number)}
+            # needs — машинная пометка для bot.py: он запомнит, какой документ
+            # просили, спросит недостающее и повторит вызов сам. Без неё
+            # возврат к документу оставался на память LLM, и она его теряла.
+            return {
+                "error": _settlement_date_missing_text(contract_number),
+                "needs": "settlement_date",
+                "needs_hint": last_payment_date,
+            }
 
         # Фактический курс — обязателен для документов дня расчёта.
         # Без него в тексте останется пустое место там, где стоит курс,
         # по которому рублёвое обязательство закрыто валютой.
         if not str(deal.get("Фактический курс") or "").strip():
-            return {"error": _fact_rate_missing_text(contract_number)}
+            return {
+                "error": _fact_rate_missing_text(contract_number),
+                "needs": "fact_rate",
+            }
 
         # Фиксируем фактически выданную сумму в журнале ДО сборки документа.
         deal = await self._ensure_paid_amount(contract_number, deal)

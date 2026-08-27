@@ -57,6 +57,10 @@ AWAITING_TAILS = (
     "pending_existing_filename",
 )
 
+# ⚠️  awaiting_doc_field сюда тоже НЕ входит: он живёт между показом просьбы
+# и нажатием кнопки быстрого выбора даты, а _clear_awaiting_flags() вызывается
+# в начале каждого handle_callback — сброс убил бы его ровно в этот момент.
+
 # ⚠️  pending_deal_date сюда НЕ входит: дата договора живёт между двумя
 # нажатиями кнопок (сначала дата договора, затем дата ДКП), а
 # _clear_awaiting_flags() вызывается в начале каждого handle_callback —
@@ -531,6 +535,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # awaiting-флаг (например, stats:custom или dealaction:X:edit) — он
     # установится ниже по коду, уже после сброса.
     _clear_awaiting_flags(context)
+
+    # Ожидание поля для документа живёт в отдельном ключе (его значение нужно
+    # самой ветке docfield:), поэтому сбрасываем его здесь и вручную: клик по
+    # любой ДРУГОЙ кнопке означает, что пользователь ушёл от этого вопроса и
+    # следующий текст не надо принимать за дату или курс.
+    if not (query.data or "").startswith("docfield:"):
+        context.user_data.pop("awaiting_doc_field", None)
 
     data = query.data or ""
 
@@ -1166,6 +1177,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_result(query.message, result)
 
     # ── Меню документов сделки ────────────────────────────────────────────────
+    elif data.startswith("docfield:"):
+        # Кнопка быстрого выбора даты расчёта. Значение уже готовое, поэтому
+        # идёт в тот же apply_doc_field, что и ручной ввод.
+        value = data.split(":", 1)[1]
+        await query.edit_message_reply_markup(reply_markup=None)
+        await apply_doc_field(update, context, query.message, value)
+
     elif data.startswith("docmenu:"):
         parts = data.split(":", 2)
         if len(parts) == 3:
@@ -1190,8 +1208,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if doc_type == "full":
                 for step in ("build_act", "build_receipt", "build_report"):
-                    await run_doc_impl(update, context, query, contract_number, step,
-                                       edit_message=False)
+                    await run_doc_impl(update, context, query.message, contract_number, step)
 
     # ── Меню действий по сделке ──────────────────────────────────────────────
     elif data.startswith("dealaction:"):
@@ -1419,7 +1436,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # не оплачена, нет фактического курса или данные неполные — *_impl
             # вернёт понятную ошибку. Сама логика — в run_doc_impl, она же
             # используется кнопкой «Всё».
-            await run_doc_impl(update, context, query, num, action)
+            await run_doc_impl(update, context, query.message, num, action)
 
         elif action == "complete":
             keyboard = InlineKeyboardMarkup([
@@ -1679,6 +1696,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
     chat_id = str(update.effective_chat.id)
 
+    # ── Ожидание недостающего поля для документа ────────────────────────────
+    # Бот сам помнит, какой документ просили: записывает присланное значение
+    # в журнал и повторяет сборку. Раньше возврат к документу зависел от того,
+    # вспомнит ли о нём LLM, — и она его теряла.
+    if context.user_data.get("awaiting_doc_field"):
+        if await apply_doc_field(update, context, update.message, user_text):
+            return
+
     # ── Ожидание ввода суммы+даты для новой оплаты ──────────────────────────
     if context.user_data.get("awaiting_payment_for_deal"):
         contract_number = context.user_data.pop("awaiting_payment_for_deal")
@@ -1914,20 +1939,22 @@ _DOC_IMPL_LABELS = {
 }
 
 
-async def run_doc_impl(update, context, query, num: str, action: str, edit_message: bool = True):
+async def run_doc_impl(update, context, message, num: str, action: str):
     """
     Формирует акт / расписку / отчёт агента и отправляет результат в чат.
 
-    Вынесено из handle_callback, потому что вызывается из двух мест: с отдельных
-    кнопок сделки и из «Всё» (docmenu:*:full), где документы идут подряд.
+    Вынесено из handle_callback: вызывается с отдельных кнопок сделки, из
+    кнопки «Всё» (docmenu:*:full) и при автоповторе после ввода недостающего
+    поля. message — сообщение, в ответ на которое отправляются файлы и статусы.
 
-    edit_message=True — правим сообщение с кнопками («⏳ Формирую …»), так ведёт
-    себя одиночная кнопка. Внутри пакета кнопок уже нет, поэтому там False и
-    статус приходит отдельным сообщением.
+    Если *_impl вернул `needs` (не заполнены «Дата расчёта» или «Фактический
+    курс»), запоминаем в user_data, какой документ просили, и показываем
+    кнопки/просьбу ввести значение. Дальше apply_doc_field запишет ответ в
+    журнал и вызовет эту же функцию повторно — возврат к документу не зависит
+    от того, помнит ли о нём LLM.
 
-    Возвращает True, если документ выдан. Ошибка (сделка не оплачена, нет
-    фактического курса, неполные данные) — не исключение: *_impl возвращает
-    понятный текст, он и уходит пользователю, а пакет продолжается дальше.
+    Возвращает True, если документ выдан. Ошибка не исключение: пакет
+    документов после неё продолжается дальше.
     """
     label = _DOC_IMPL_LABELS.get(action, "документ")
     impls = {
@@ -1938,21 +1965,31 @@ async def run_doc_impl(update, context, query, num: str, action: str, edit_messa
     if action not in impls:
         return False
 
-    status = f"⏳ Формирую {label} по сделке {num}..."
-    if edit_message:
-        await query.edit_message_text(status)
-    else:
-        await query.message.reply_text(status)
-
+    await message.reply_text(f"⏳ Формирую {label} по сделке {num}...")
     result = await typing_while(update.effective_chat.id, context, impls[action](num))
 
     if result.get("error"):
-        await query.message.reply_text(
+        need = result.get("needs")
+        keyboard = []
+        if need:
+            context.user_data["awaiting_doc_field"] = {
+                "num": num, "action": action, "field": need,
+            }
+            if need == "settlement_date":
+                from datetime import datetime as _dt
+                today = _dt.now().strftime("%d.%m.%Y")
+                keyboard.append([InlineKeyboardButton(
+                    f"📅 Сегодня ({today})", callback_data=f"docfield:{today}")])
+                hint = (result.get("needs_hint") or "").strip()
+                if hint and hint != today:
+                    keyboard.append([InlineKeyboardButton(
+                        f"📅 {hint} (дата платежа)", callback_data=f"docfield:{hint}")])
+        keyboard.append([InlineKeyboardButton("◀️ К сделке",
+                                              callback_data=f"dealaction:{num}:menu")])
+        await message.reply_text(
             result["error"],
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("◀️ К сделке", callback_data=f"dealaction:{num}:menu")
-            ]]),
+            reply_markup=InlineKeyboardMarkup(keyboard),
         )
         return False
 
@@ -1971,11 +2008,76 @@ async def run_doc_impl(update, context, query, num: str, action: str, edit_messa
     ):
         files.append({"file": f_path, "filename": f_name, "drive_link": f_link})
 
-    await send_result(query.message, {
+    await send_result(message, {
         "files":   files,
         "text":    result.get("message", ""),
         "buttons": result.get("buttons"),
     }, context=context)
+    return True
+
+
+# Колонки журнала для полей, которые бот спрашивает по ходу сборки документа.
+_DOC_FIELD_COLUMNS = {
+    "settlement_date": "Дата расчёта",
+    "fact_rate":       "Фактический курс",
+}
+
+
+async def apply_doc_field(update, context, message, value: str) -> bool:
+    """
+    Записывает в журнал значение, которого не хватило документу, и повторяет
+    его сборку.
+
+    Возвращает False, если ожидания не было или значение не распозналось —
+    тогда сообщение обрабатывается дальше обычным путём.
+    """
+    pending = context.user_data.get("awaiting_doc_field")
+    if not pending:
+        return False
+
+    field  = pending.get("field")
+    num    = pending.get("num")
+    action = pending.get("action")
+    column = _DOC_FIELD_COLUMNS.get(field)
+    if not column:
+        context.user_data.pop("awaiting_doc_field", None)
+        return False
+
+    value = (value or "").strip()
+
+    if field == "settlement_date":
+        from datetime import datetime as _dt
+        m = re.search(r"(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{2,4})", value)
+        if not m:
+            await message.reply_text(
+                "⚠️ Не разобрал дату. Пришлите её как ДД.ММ.ГГГГ — например 27.08.2026."
+            )
+            return True   # ожидание не снимаем, ждём корректный ввод
+        d, mo, y = m.groups()
+        y = y if len(y) == 4 else f"20{y}"
+        try:
+            value = _dt.strptime(f"{d.zfill(2)}.{mo.zfill(2)}.{y}", "%d.%m.%Y").strftime("%d.%m.%Y")
+        except ValueError:
+            await message.reply_text(f"⚠️ Такой даты не существует: «{value}». Проверьте и пришлите ещё раз.")
+            return True
+    else:  # fact_rate
+        m = re.search(r"\d+(?:[.,]\d+)?", value.replace(" ", ""))
+        if not m:
+            await message.reply_text(
+                "⚠️ Не разобрал курс. Пришлите число — например 82,80."
+            )
+            return True
+        value = m.group(0).replace(".", ",")
+
+    context.user_data.pop("awaiting_doc_field", None)
+
+    ok = await agent.sheets.update_deal(num, {column: value})
+    if not ok:
+        await message.reply_text(f"⚠️ Не удалось записать «{column}» в журнал сделки {num}.")
+        return True
+
+    await message.reply_text(f"✅ {column}: {value} — записано по сделке {num}")
+    await run_doc_impl(update, context, message, num, action)
     return True
 
 
