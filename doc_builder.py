@@ -1019,58 +1019,66 @@ class DocumentBuilder:
 
     # ─── КАРТОЧКА КОМПАНИИ ДЛЯ КОНТРАГЕНТА ───────────────────────────────
 
-    async def build_company_card(self, rows: list, profile_name: str,
+    async def build_company_card(self, profile: dict, profile_name: str,
                                  getter=None) -> str:
-        """Карточка предприятия: постоянные данные компании плюс один счёт.
+        """Карточка предприятия: данные компании плюс реквизиты одного счёта.
 
-        rows — список пар («Подпись», «значение») и пустых строк-разделителей;
-        собирается в company_ui, чтобы состав карточки правился там же, где
-        живут её поля, а не в двух местах сразу.
+        Собирается из обычного шаблона templates/company_card_template.docx —
+        как и остальные документы, чтобы вид карточки правился в Word, а не в
+        коде. Строки таблицы, значение которых оказалось пустым, удаляются:
+        так у прямого российского счёта сам собой исчезает блок
+        банка-корреспондента, а незаполненные поля карточки не оставляют
+        пустых строк с прочерком.
         """
-        c = company.card(getter)
-        doc = Document()
-        self._setup_page(doc)
+        template = self.templates_dir / "company_card_template.docx"
+        if not template.exists():
+            raise MissingTemplateError(
+                "Не найден company_card_template.docx — шаблон карточки "
+                "предприятия. Карточка не собрана."
+            )
 
-        t = doc.add_paragraph()
-        t.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        r = t.add_run("КАРТОЧКА ПРЕДПРИЯТИЯ")
-        r.bold = True
-        r.font.size = Pt(14)
+        values = dict(company.placeholders(getter))
+        values.update(br.placeholders(profile))
 
-        sub = doc.add_paragraph()
-        sub.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        sr = sub.add_run(c["company_name"])
-        sr.bold = True
-        sr.font.size = Pt(12)
-        doc.add_paragraph()
+        doc = Document(str(template))
 
-        table = doc.add_table(rows=0, cols=2)
-        table.alignment = WD_TABLE_ALIGNMENT.CENTER
-        for item in rows:
-            if item is None:                      # разделитель между блоками
-                doc.add_paragraph()
-                table = doc.add_table(rows=0, cols=2)
-                table.alignment = WD_TABLE_ALIGNMENT.CENTER
-                continue
-            label, value = item
-            if value is None:                     # заголовок блока
-                hp = doc.add_paragraph()
-                hr = hp.add_run(label)
-                hr.bold = True
-                table = doc.add_table(rows=0, cols=2)
-                table.alignment = WD_TABLE_ALIGNMENT.CENTER
-                continue
-            row = table.add_row()
-            row.cells[0].text = str(label)
-            row.cells[1].text = str(value)
-            for par in row.cells[0].paragraphs:
-                for run in par.runs:
-                    run.bold = True
+        def fill(text: str) -> str:
+            for ph, val in values.items():
+                if ph in text:
+                    text = text.replace(ph, str(val))
+            return text
 
-        doc.add_paragraph()
-        sign = doc.add_paragraph()
-        sign.add_run(f"{c['director_position']} _______________________ / "
-                     f"{c['director_initials']}")
+        def replace_in(par):
+            """Подстановка с запасом на разорванный плейсхолдер.
+
+            Сначала пробуем по одному run — так сохраняется форматирование.
+            Если после этого «{{» в абзаце ещё остались, значит Word разрезал
+            плейсхолдер между runs при ручной правке шаблона: тогда сливаем
+            абзац в первый run.
+            """
+            for run in par.runs:
+                if "{{" in run.text:
+                    run.text = fill(run.text)
+            if "{{" in par.text and par.runs:
+                merged = fill("".join(r.text for r in par.runs))
+                par.runs[0].text = merged
+                for extra in par.runs[1:]:
+                    extra.text = ""
+
+        for par in doc.paragraphs:
+            replace_in(par)
+
+        for table in doc.tables:
+            drop = []
+            for row in table.rows:
+                for cell in row.cells:
+                    for par in cell.paragraphs:
+                        replace_in(par)
+                # Пустое значение — строка не нужна.
+                if len(row.cells) == 2 and not row.cells[1].text.strip():
+                    drop.append(row)
+            for row in drop:
+                row._element.getparent().remove(row._element)
 
         safe = re.sub(r"[^\w\-]+", "_", profile_name, flags=re.UNICODE).strip("_")
         path = self.output_dir / f"Карточка_предприятия_{safe}.docx"

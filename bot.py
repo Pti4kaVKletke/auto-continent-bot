@@ -826,9 +826,10 @@ def _make_card_sender(update, context):
     async def _send(profile_name: str):
         message = update.callback_query.message
         try:
-            rows = company_ui.contractor_card_rows(profile_name)
             path = await agent.builder.build_company_card(
-                rows, profile_name, getter=memory.get_setting
+                memory.get_bank_profile(profile_name) or {},
+                profile_name,
+                getter=memory.get_setting,
             )
             if os.environ.get("SKIP_PDF", "0") != "1":
                 pdf = await agent.builder.convert_to_pdf(path)
@@ -2818,6 +2819,14 @@ async def error_handler(update, context):
 
 def main():
     memory.init_db()
+    # Банковские профили в памяти бота переводим на новую модель сразу при
+    # старте: журнал мигрирует отдельно, профилей эта миграция не касается.
+    try:
+        moved = br.migrate_saved_profiles(memory)
+        if moved:
+            logger.info(f"Банковских профилей переведено на новую модель: {moved}")
+    except Exception as e:
+        logger.error(f"Не удалось перевести банковские профили: {e}", exc_info=True)
     memory.cleanup_old_pending_scans()
     settings_service.log_current_settings()
     token = os.environ["TELEGRAM_BOT_TOKEN"]
