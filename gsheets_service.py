@@ -10,6 +10,9 @@ from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 
+import bank_requisites as br
+import memory
+
 logger = logging.getLogger(__name__)
 
 SPREADSHEET_ID = os.environ.get("GOOGLE_SHEETS_ID", "1OHkExAxQzm_3kiOE-h4aGug-MO3yf4OODB8C_fACz08")
@@ -132,12 +135,19 @@ COLUMNS = [
     "cash_currency",
     "account_currency",
     "account_number",
-    "bank_corr_line1",
-    "bank_corr_line2",
-    "bank_corr_line3",
-    "bank_ben_line1",
-    "bank_ben_line2",
-    "bank_kpp",
+    # ── Реквизиты счёта, нормализованные 04.09.2026 ───────────────────────
+    # Восемь колонок на месте прежних шести (bank_corr_line1..3,
+    # bank_ben_line1..2, bank_kpp). Здесь только то, что принадлежит СЧЁТУ:
+    # наименование получателя, оба ИНН и КПП живут в карточке компании
+    # (company.py) и по сделкам не дублируются.
+    "account_type",     # direct_rf | corr — ЯВНЫЙ тип, не догадка по пустоте
+    "bank_name",        # банк, где открыт счёт
+    "bank_bic",         # его БИК
+    "bank_corr_acc",    # его корр. счёт
+    "bank_swift",       # SWIFT — необязателен, нужен для карточки контрагенту
+    "corr_bank_name",   # банк-корреспондент (только для corr)
+    "corr_bank_bic",
+    "corr_bank_acc",
     "Комментарий",
     "Платежи",       # текст "500000 (01.07.2026); 300000 (15.07.2026)"
     "Получено",      # сумма всех платежей
@@ -150,6 +160,7 @@ COLUMNS = [
                      # Пересчитывается ботом по именам файлов в папке «Сканы»
                      # при каждой загрузке скана и при открытии их списка.
                      # Источник истины — Drive, колонка только отражает его.
+
 ]
 
 
@@ -228,12 +239,15 @@ class GoogleSheetsService:
         return None
 
     async def save_deal(self, contract_number: str, contract_date: str,
-                        data: dict, commission_pct: float,
+                        deal_data: dict, commission_pct: float,
                         drive_folder_link: str = "") -> bool:
         """Добавляет строку сделки начиная с DATA_START_ROW."""
         def _do():
             svc = self._get_service()
             sheet = svc.spreadsheets()
+
+            # Реквизиты приводим к модели один раз здесь.
+            data = {**deal_data, **br.normalize(deal_data)}
 
             row = []
             # Вычисляем итоговую сумму: цена + комиссия
@@ -365,6 +379,20 @@ class GoogleSheetsService:
                         current_row.append("")
                     current_row[idx] = str(new_val)
 
+            # Реквизиты правим только целиком. Смена одного поля (например
+            # профиля через кнопку «Реквизиты») обязана пересчитать и тип счёта,
+            # и ИНН, и старую раскладку — иначе в шапке счёта окажется ИНН одной
+            # юрисдикции, а банк другой, и ошибка ничем себя не проявит.
+            if set(br.ALL_FIELDS) & set(updates):
+                row_dict = dict(zip(COLUMNS, current_row))
+                payload = br.normalize(row_dict)
+                for k, v in payload.items():
+                    if k in COLUMNS:
+                        idx = COLUMNS.index(k)
+                        while len(current_row) <= idx:
+                            current_row.append("")
+                        current_row[idx] = str(v)
+
             # Пересчитываем «Сумма Комиссии» и «Сумма Договора», если менялась
             # цена или процент. Обе цифры уходят в счёт, поручение, акт и отчёт —
             # оставить их расходиться со ставкой нельзя.
@@ -447,6 +475,93 @@ class GoogleSheetsService:
         except Exception as e:
             logger.error(f"Ошибка batch-обновления колонки «{col_name}»: {e}", exc_info=True)
             return 0
+
+    # Старая раскладка блока реквизитов — шесть колонок, стоявших там же, где
+    # теперь стоят восемь новых. Нужна ровно один раз, при миграции журнала.
+    LEGACY_BANK_COLUMNS = [
+        "bank_corr_line1", "bank_corr_line2", "bank_corr_line3",
+        "bank_ben_line1", "bank_ben_line2", "bank_kpp",
+    ]
+
+    async def migrate_requisites(self) -> dict:
+        """Разовая идемпотентная миграция блока реквизитов в журнале.
+
+        Читает шесть старых колонок, раскладывает их в восемь новых и
+        переписывает заголовки. Повторный запуск на уже мигрированной таблице
+        стоит один запрос на чтение и ничего не пишет.
+
+        Перед записью проверяет, что под новый блок физически хватает места:
+        восемь колонок пишутся на место шести, поэтому в таблицу должны быть
+        вставлены две пустые колонки перед «Комментарий». Если их нет, запись
+        затёрла бы «Комментарий» и «Платежи» — в этом случае миграция
+        отказывается работать и говорит, что сделать.
+        """
+        first = COLUMNS.index("account_type")
+        last_col = self._col_letter(len(COLUMNS) - 1)
+
+        def _do():
+            svc = self._get_service()
+            sheet = svc.spreadsheets()
+
+            header = sheet.values().get(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"A2:{last_col}2",
+            ).execute().get("values", [[]])
+            header = (header[0] if header else []) + [""] * len(COLUMNS)
+
+            if str(header[first]).strip() == "account_type":
+                logger.info("Миграция реквизитов: журнал уже в новой раскладке")
+                return {"status": "already_migrated"}
+
+            # Две колонки, которые должны быть вставлены вручную.
+            tail = [str(header[first + 6]).strip(), str(header[first + 7]).strip()]
+            if any(t and t not in self.LEGACY_BANK_COLUMNS for t in tail):
+                msg = (f"в журнале не хватает двух колонок перед «Комментарий» "
+                       f"(на их месте: {tail}). Вставь две пустые колонки после "
+                       f"«bank_kpp» и перезапусти бота.")
+                logger.error(f"Миграция реквизитов ОТМЕНЕНА: {msg}")
+                return {"error": msg}
+
+            rows = sheet.values().get(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"A{DATA_START_ROW}:{last_col}",
+            ).execute().get("values", [])
+
+            writes = [
+                {"range": f"{self._col_letter(first + i)}2", "values": [[name]]}
+                for i, name in enumerate(COLUMNS[first:first + 8])
+            ]
+
+            migrated = 0
+            for n, row in enumerate(rows, start=DATA_START_ROW):
+                padded = row + [""] * (len(COLUMNS) - len(row))
+                if not str(padded[0]).strip():
+                    continue
+                legacy = dict(zip(self.LEGACY_BANK_COLUMNS, padded[first:first + 6]))
+                if not any(str(v).strip() for v in legacy.values()):
+                    continue
+                new_values = br.from_legacy(legacy)
+                for i, col in enumerate(COLUMNS[first:first + 8]):
+                    writes.append({
+                        "range": f"{self._col_letter(first + i)}{n}",
+                        "values": [[str(new_values.get(col, ""))]],
+                    })
+                migrated += 1
+
+            for i in range(0, len(writes), 500):
+                sheet.values().batchUpdate(
+                    spreadsheetId=SPREADSHEET_ID,
+                    body={"valueInputOption": "USER_ENTERED", "data": writes[i:i + 500]},
+                ).execute()
+            logger.info(f"Миграция реквизитов: сделок переведено {migrated}, "
+                        f"ячеек записано {len(writes)}")
+            return {"migrated": migrated, "cells": len(writes)}
+
+        try:
+            return await self._sheets_retry(_do) or {}
+        except Exception as e:
+            logger.error(f"Ошибка миграции реквизитов: {e}", exc_info=True)
+            return {"error": str(e)}
 
     async def cancel_deal(self, contract_number: str, reason: str = "") -> bool:
         """Помечает сделку как отменённую."""

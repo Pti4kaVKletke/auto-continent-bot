@@ -23,6 +23,10 @@ from agent import (_parse_payments, _calc_total_amount, _fmt_money, _money_str,
                    _resolve_period, _in_period, _parse_date_ddmmyyyy)
 
 import memory
+import bank_requisites as br
+import bank_ui
+import company
+import company_ui
 import settings_service
 from backup_service import BackupService
 
@@ -182,10 +186,13 @@ def main_menu_keyboard():
         ],
         [
             InlineKeyboardButton("🏦 Реквизиты",       callback_data="menu:bank_profiles"),
-            InlineKeyboardButton("🧠 Память",          callback_data="menu:memory"),
+            InlineKeyboardButton("🏢 Компания",        callback_data="menu:company"),
         ],
         [
+            InlineKeyboardButton("🧠 Память",          callback_data="menu:memory"),
             InlineKeyboardButton("💾 Бэкапы",          callback_data="menu:backup"),
+        ],
+        [
             InlineKeyboardButton("⚙️ Настройки",       callback_data="menu:settings"),
         ],
     ])
@@ -809,6 +816,36 @@ async def show_deals_list(query, context, period, status_code, page,
         await query.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
 
 
+def _make_card_sender(update, context):
+    """Отдаёт карточку предприятия: PDF плюс тот же текст в чат.
+
+    Текст — чтобы переслать в переписку с телефона, файл — чтобы приложить
+    к письму. Если LibreOffice не отработал, уходит DOCX: карточка без PDF
+    полезнее, чем сообщение об ошибке.
+    """
+    async def _send(profile_name: str):
+        message = update.callback_query.message
+        try:
+            rows = company_ui.contractor_card_rows(profile_name)
+            path = await agent.builder.build_company_card(
+                rows, profile_name, getter=memory.get_setting
+            )
+            if os.environ.get("SKIP_PDF", "0") != "1":
+                pdf = await agent.builder.convert_to_pdf(path)
+                if pdf:
+                    path = pdf
+            with open(path, "rb") as f:
+                await message.reply_document(f, filename=os.path.basename(path))
+            await message.reply_text(
+                company_ui.contractor_card_text(profile_name),
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            logger.error(f"Не удалось собрать карточку предприятия: {e}", exc_info=True)
+            await message.reply_text(f"❌ Не удалось собрать карточку: {e}")
+    return _send
+
+
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -834,6 +871,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("pending_scan", None)
 
     data = query.data or ""
+
+    # Меню реквизитов живёт в отдельном модуле: там своя многошаговая форма
+    # и своё состояние в user_data. Клик по любой ДРУГОЙ кнопке эту форму
+    # сбрасывает — иначе следующий текст уйдёт в неё вместо агента.
+    if data.startswith("bp:"):
+        await bank_ui.handle_callback(update, context, data)
+        return
+    if data.startswith("co:"):
+        await company_ui.handle_callback(update, context, data,
+                                         on_send=_make_card_sender(update, context))
+        return
+    bank_ui.clear_state(context)
+    company_ui.clear_state(context)
 
     # ── Главное меню ──────────────────────────────────────────────────────────
     if data.startswith("menu:"):
@@ -920,27 +970,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
         elif action == "bank_profiles":
-            profiles = memory.list_bank_profiles()
-            if profiles:
-                lines = ["🏦 *Банковские профили:*\n"]
-                for name in profiles:
-                    d = memory.get_bank_profile(name)
-                    lines.append(f"*{name}*")
-                    if d.get("account_number"):
-                        lines.append(f"  Счёт: `{d['account_number']}`")
-                    if d.get("bank_ben_line1"):
-                        lines.append(f"  Банк: {d['bank_ben_line1']}")
-                    lines.append("")
-                text = "\n".join(lines)
-            else:
-                text = "🏦 Банковских профилей пока нет.\n\nДобавь реквизиты при создании следующей сделки."
-            await query.edit_message_text(
-                text,
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("◀️ Меню", callback_data="menu:back")
-                ]])
-            )
+            text, kb = bank_ui.list_screen()
+            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
+
+        elif action == "company":
+            text, kb = company_ui.card_screen()
+            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
 
         elif action == "memory":
             companies = memory.list_companies()
@@ -1701,22 +1736,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             total_sum = deal.get("Сумма Договора", "")
             date   = deal.get("Дата договора", "—")
             folder = deal.get("Папка Drive", "")
-            account_number = deal.get("account_number", "")
-            bank_ben       = deal.get("bank_ben_line1", "")
+            deal_bank      = br.normalize(deal)
+            account_number = deal_bank["account_number"]
+            bank_ben       = deal_bank["bank_name"]
 
-            # Определяем название профиля реквизитов по номеру счёта и банку-корреспонденту
+            # Название профиля реквизитов — по номеру счёта и типу счёта:
+            # один и тот же счёт может быть заведён двумя профилями.
             profile_name = "—"
-            deal_corr = deal.get("bank_corr_line1", "").strip().lower()
             for pname in memory.list_bank_profiles():
                 p = memory.get_bank_profile(pname)
                 if not p or not account_number:
                     continue
-                # Совпадение по счёту
-                if p.get("account_number") != account_number:
+                p_bank = br.normalize(p)
+                if p_bank["account_number"] != account_number:
                     continue
-                # Совпадение по банку-корреспонденту (для разных карт с одним счётом)
-                p_corr = (p.get("bank_corr_line1", "") or "").strip().lower()
-                if p_corr == deal_corr:
+                if p_bank["account_type"] == deal_bank["account_type"]:
                     profile_name = pname
                     break
             # Если по паре не нашли — берём первый по номеру счёта (фолбэк)
@@ -2125,7 +2159,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             await query.edit_message_reply_markup(reply_markup=None)
-            ok = await agent.sheets.update_deal(contract_number, profile)
+            # Пишем профиль через нормализацию: вместе с полями уедут и тип
+            # счёта, и ИНН — иначе сделка получит банк одной юрисдикции и ИНН
+            # другой, и в счёте это никак не проявится.
+            ok = await agent.sheets.update_deal(
+                contract_number, br.full_payload(profile, memory.get_setting)
+            )
             if ok:
                 await query.message.reply_text(
                     f"✅ Реквизиты сделки *{contract_number}* обновлены на *{profile_name}*",
@@ -2199,6 +2238,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user_text = update.message.text
     chat_id = str(update.effective_chat.id)
+
+    # ── Форма реквизитов ────────────────────────────────────────────────────
+    # Стоит первой: если бот спросил БИК, ответ «044525974» не должен уходить
+    # в LLM и толковаться как что угодно ещё.
+    if await bank_ui.handle_text(update, context, user_text):
+        return
+    if await company_ui.handle_text(update, context, user_text):
+        return
 
     # ── Ожидание недостающего поля для документа ────────────────────────────
     # Бот сам помнит, какой документ просили: записывает присланное значение
@@ -2825,6 +2872,17 @@ def main():
             logger.info(f"Автобэкап запланирован на {hour:02d}:{minute:02d} Asia/Bishkek")
         except Exception as e:
             logger.error(f"Не удалось запланировать автобэкап: {e}", exc_info=True)
+
+    # ── Разовая миграция блока реквизитов в журнале ──────────────────────
+    # Идемпотентна: на уже мигрированной таблице стоит один запрос на чтение.
+    if app.job_queue is not None:
+        async def _migrate_requisites_job(_ctx):
+            try:
+                stats = await agent.sheets.migrate_requisites()
+                logger.info(f"Миграция реквизитов: {stats}")
+            except Exception as e:
+                logger.error(f"Миграция колонок журнала не удалась: {e}", exc_info=True)
+        app.job_queue.run_once(_migrate_requisites_job, when=5, name="migrate_requisites")
 
     logger.info("Бот запущен")
     app.run_polling()

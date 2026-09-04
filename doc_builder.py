@@ -13,6 +13,14 @@ from docx.enum.table import WD_TABLE_ALIGNMENT
 import openpyxl
 from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
 
+import bank_requisites as br
+import company
+
+try:  # настройки компании лежат в SQLite бота; без неё работают значения по умолчанию
+    from memory import get_setting as _setting
+except Exception:  # pragma: no cover
+    _setting = None
+
 logger = logging.getLogger(__name__)
 logger.info(f"openpyxl version: {openpyxl.__version__}")
 
@@ -76,6 +84,15 @@ PLACEHOLDER_LABELS = {
 # расхождение — копейки (49 198,55 × 82,80 = 4 073 639,94 при цене 4 073 640).
 # Рубля хватает с запасом и при этом ловится любая опечатка в разряде.
 AMOUNT_TOLERANCE_RUB = float(os.environ.get("AMOUNT_TOLERANCE_RUB", "1"))
+
+
+class MissingTemplateError(Exception):
+    """Шаблон под тип счёта не найден.
+
+    Раньше в этом случае счёт молча собирался по шаблону ДРУГОГО типа — с ИНН
+    другой юрисдикции в шапке и без QR. Такой документ уходил заказчику и в
+    банк как настоящий. Лучше не выдать счёт, чем выдать неправильный.
+    """
 
 
 class AmountMismatchError(Exception):
@@ -349,18 +366,22 @@ class DocumentBuilder:
     # ─── АГЕНТСКИЙ ДОГОВОР ────────────────────────────────────────────────
 
     async def build_contract(self, data: dict, number: str, date: str, commission_pct: float = 1.0) -> str:
-        # Если bank_corr_line1 пустой — прямой счёт (ВТБ), используем contract_template_direct.docx
-        is_direct = not data.get("bank_corr_line1", "").strip()
+        # Тип счёта берётся из явного поля (bank_requisites), а не выводится
+        # из пустоты банка-корреспондента, как было до 04.09.2026.
+        acc_type = br.resolve_account_type(data)
+        is_direct = acc_type == br.DIRECT_RF
 
         if is_direct:
             template = self.templates_dir / "contract_template_direct.docx"
             if not template.exists():
-                logger.warning("contract_template_direct.docx не найден, использую стандартный")
-                template = self.templates_dir / "contract_template.docx"
+                raise MissingTemplateError(
+                    "Не найден contract_template_direct.docx — шаблон агентского "
+                    "договора для прямого счёта в РФ. Договор не собран."
+                )
         else:
             template = self.templates_dir / "contract_template.docx"
 
-        logger.info(f"Шаблон АГ договора: {template.name} (прямой={is_direct})")
+        logger.info(f"Шаблон АГ договора: {template.name} (тип счёта: {acc_type})")
 
         if template.exists():
             return await self._fill_template(template, data, number, date,
@@ -501,32 +522,32 @@ class DocumentBuilder:
 
     async def build_invoice(self, data: dict, number: str, date: str, commission_pct: float = 1.0) -> str:
         """
-        Формирует счёт на оплату.
-        Если bank_corr_line1 пустой — прямой счёт (ВТБ), используем invoice_template_direct.xlsx
-        и генерируем QR код по стандарту ГОСТ Р 56042.
+        Формирует счёт на оплату. Шаблон выбирается по account_type:
+        у прямого российского счёта своя вёрстка шапки, ИНН РФ с КПП и QR-код
+        по ГОСТ Р 56042; у счёта через корреспондента — два банковских блока.
         """
-        is_direct = not data.get("bank_corr_line1", "").strip()
+        bank = br.normalize(data)
+        acc_type = bank["account_type"]
+        is_direct = acc_type == br.DIRECT_RF
+        comp = company.card(_setting)
 
-        # ── ОТЛАДКА: выводим все bank поля ────────────────────────────────
-        logger.info(f"build_invoice DEBUG: number={number}, is_direct={is_direct}")
-        logger.info(f"  bank_corr_line1={repr(data.get('bank_corr_line1', 'ОТСУТСТВУЕТ'))}")
-        logger.info(f"  bank_corr_line2={repr(data.get('bank_corr_line2', 'ОТСУТСТВУЕТ'))}")
-        logger.info(f"  bank_corr_line3={repr(data.get('bank_corr_line3', 'ОТСУТСТВУЕТ'))}")
-        logger.info(f"  bank_ben_line1={repr(data.get('bank_ben_line1', 'ОТСУТСТВУЕТ'))}")
-        logger.info(f"  bank_kpp={repr(data.get('bank_kpp', 'ОТСУТСТВУЕТ'))}")
-        logger.info(f"  account_number={repr(data.get('account_number', 'ОТСУТСТВУЕТ'))}")
+        logger.info(f"build_invoice: number={number}, тип счёта={acc_type}, "
+                    f"банк={bank['bank_name']!r}, БИК={bank['bank_bic']!r}, "
+                    f"счёт={bank['account_number']!r}")
 
         if is_direct:
             template = self.templates_dir / "invoice_template_direct.xlsx"
-            if not template.exists():
-                # Фолбэк на основной шаблон
-                template = self.templates_dir / "invoice_template.xlsx"
-                is_direct = False
         else:
             template = self.templates_dir / "invoice_template.xlsx"
+        if not template.exists():
+            # Никакой подмены на шаблон другого типа: у них разный ИНН в шапке.
+            raise MissingTemplateError(
+                f"Не найден {template.name} — шаблон счёта для типа "
+                f"«{br.ACCOUNT_TYPE_LABELS[acc_type]}». Счёт не собран."
+            )
 
-        logger.info(f"Шаблон счёта: {template.name} (прямой={is_direct}), "
-                    f"размер: {template.stat().st_size if template.exists() else 0} байт")
+        logger.info(f"Шаблон счёта: {template.name}, "
+                    f"размер: {template.stat().st_size} байт")
         wb = openpyxl.load_workbook(str(template))
         ws = wb.active
         logger.info(f"Шаблон загружен, изображений: {len(ws._images)}")
@@ -540,7 +561,7 @@ class DocumentBuilder:
         commission = round(price_val * commission_pct / 100, 2)
         total       = round(price_val + commission, 2)
         currency    = data.get("currency", "RUB")
-        acc_cur     = data.get("account_currency", currency)
+        acc_cur     = bank["account_currency"] or currency
         buyer       = data.get("buyer_name", data.get("company_name", ""))
         car         = (f"{data.get('car_model', '')} год выпуска {data.get('car_year', '')} "
                        f"VIN {data.get('car_vin', '')}").strip()
@@ -553,33 +574,48 @@ class DocumentBuilder:
         total_fmt   = f"{total:,.2f}".replace(",", " ")
         total_words = amount_to_words_rub(total) if acc_cur == "RUB" else ""
 
+        # Шапка счёта: данные компании из карточки, данные счёта из профиля.
+        # Какой из двух ИНН печатать, решает не код, а шаблон — их два, и
+        # каждый знает свою юрисдикцию. Старые имена плейсхолдеров оставлены
+        # синонимами, чтобы не обновлённый шаблон не превратился в пустой бланк.
+        replacements = dict(company.placeholders(_setting))
+        replacements.update(br.placeholders(data))
+        replacements.update({
+            "{{QR}}":               "",   # заменяется изображением ниже
+            "{{QR_CODE}}":          "",
+            "{{ACCOUNT_NUMBER}}":   bank["account_number"],
+            "{{ПОЛУЧАТЕЛЬ}}":       comp["company_name"],
+            "{{BANK_BEN_NAME2}}":   comp["company_name"],
+            "{{ПОЛУЧАТЕЛЬ_ИНН}}":   comp["company_inn_rf"] if is_direct else comp["company_inn"],
+            "{{BANK_BEN_INN}}":     comp["company_inn_rf"] if is_direct else comp["company_inn"],
+            "{{ПОЛУЧАТЕЛЬ_КПП}}":   comp["company_kpp_rf"] if is_direct else "",
+        })
         if is_direct:
-            replacements = {
-                "{{BANK_DIRECT_NAME}}": data.get("bank_ben_line1", ""),
-                "{{BANK_DIRECT_BIK}}":  data.get("bank_corr_line2", ""),
-                "{{BANK_DIRECT_CORR}}": data.get("bank_corr_line3", ""),
-                "{{BANK_BEN_INN}}":     "9909768607",
-                "{{BANK_DIRECT_KPP}}":  data.get("bank_kpp", ""),
-                "{{ACCOUNT_NUMBER}}":   data.get("account_number", ""),
-                "{{QR_CODE}}":          "",  # будет заменён изображением ниже
-            }
+            replacements.update({
+                "{{BANK_DIRECT_NAME}}": bank["bank_name"],
+                "{{BANK_DIRECT_BIK}}":  bank["bank_bic"],
+                "{{BANK_DIRECT_CORR}}": bank["bank_corr_acc"],
+                "{{BANK_DIRECT_KPP}}":  comp["company_kpp_rf"],
+            })
         else:
-            replacements = {
-                "{{BANK_CORR_NAME}}":    data.get("bank_corr_line1", ""),
-                "{{BANK_CORR_BIK}}":     data.get("bank_corr_line2", ""),
-                "{{BANK_CORR_ACC}}":     data.get("bank_corr_line3", ""),
-                "{{BANK_BEN_NAME}}":     data.get("bank_ben_line1", ""),
-                "{{BANK_BEN_LINE2}}":    data.get("bank_ben_line2", ""),
-                "{{BANK_BEN_INN}}":      "01905202610324",
-                "{{ACCOUNT_NUMBER}}":    data.get("account_number", ""),
-            }
+            replacements.update({
+                "{{BANK_CORR_NAME}}": bank["corr_bank_name"],
+                "{{BANK_CORR_BIK}}":  bank["corr_bank_bic"],
+                "{{BANK_CORR_ACC}}":  bank["corr_bank_acc"],
+                "{{BANK_BEN_NAME}}":  bank["bank_name"],
+                "{{BANK_BEN_BIK}}":   bank["bank_bic"],
+                "{{BANK_BEN_CORR}}":  bank["bank_corr_acc"],
+                "{{BANK_BEN_LINE2}}": (f"БИК: {bank['bank_bic']}, корр. счёт: "
+                                       f"{bank['bank_corr_acc']}")
+                                      if bank["bank_bic"] else "",
+            })
 
         # Находим координату ячейки с {{QR_CODE}} до замены
         qr_cell_coord = None
         if is_direct:
             for row in ws.iter_rows():
                 for cell in row:
-                    if cell.value == "{{QR_CODE}}":
+                    if cell.value in ("{{QR}}", "{{QR_CODE}}"):
                         qr_cell_coord = cell.coordinate
                         break
 
@@ -593,8 +629,8 @@ class DocumentBuilder:
         # Для прямого счёта дополнительно пишем БИК и корр.счёт напрямую
         # на случай если ячейки объединены и замена плейсхолдера не сработала
         if is_direct:
-            bik  = data.get("bank_corr_line2", "")
-            corr = data.get("bank_corr_line3", "")
+            bik  = bank["bank_bic"]
+            corr = bank["bank_corr_acc"]
             if bik and ws["S4"].value in ("", None, "{{BANK_DIRECT_BIK}}"):
                 ws["S4"] = bik
             if corr and ws["S6"].value in ("", None, "{{BANK_DIRECT_CORR}}"):
@@ -628,11 +664,15 @@ class DocumentBuilder:
                 from openpyxl.drawing.image import Image as XLImage
                 import io
 
-                account = data.get("account_number", "")
-                bic     = data.get("bank_corr_line2", "")
-                corr    = data.get("bank_corr_line3", "")
-                kpp     = data.get("bank_kpp", "")
-                bank_name = data.get("bank_ben_line1", "")
+                account   = bank["account_number"]
+                bic       = bank["bank_bic"]
+                corr      = bank["bank_corr_acc"]
+                bank_name = bank["bank_name"]
+                # QR по ГОСТ Р 56042 читает банковское приложение плательщика,
+                # поэтому здесь всегда российские реквизиты компании.
+                kpp       = comp["company_kpp_rf"]
+                payee     = comp["company_name"]
+                payee_inn = comp["company_inn_rf"]
                 sum_kopecks = int(round(total * 100))
 
                 # ГОСТ Р 56042 — порядок обязательных полей:
@@ -641,12 +681,12 @@ class DocumentBuilder:
                 car_vin = data.get("car_vin", "")
                 qr_str = (
                     "ST00012|"
-                    "Name=ОсОО Авто Континент|"
+                    f"Name={payee}|"
                     f"PersonalAcc={account}|"
                     f"BankName={bank_name}|"
                     f"BIC={bic}|"
                     f"CorrespAcc={corr}|"
-                    "PayeeINN=9909768607|"
+                    f"PayeeINN={payee_inn}|"
                     f"KPP={kpp}|"
                     f"Sum={sum_kopecks}|"
                     f"Purpose=Оплата по счету №{number} от {date} по Агентскому договору №{number} от {date} за автомобиль VIN {car_vin}. Без НДС."
@@ -977,6 +1017,67 @@ class DocumentBuilder:
 
     # ─── КОНВЕРТАЦИЯ В PDF ────────────────────────────────────────────────
 
+    # ─── КАРТОЧКА КОМПАНИИ ДЛЯ КОНТРАГЕНТА ───────────────────────────────
+
+    async def build_company_card(self, rows: list, profile_name: str,
+                                 getter=None) -> str:
+        """Карточка предприятия: постоянные данные компании плюс один счёт.
+
+        rows — список пар («Подпись», «значение») и пустых строк-разделителей;
+        собирается в company_ui, чтобы состав карточки правился там же, где
+        живут её поля, а не в двух местах сразу.
+        """
+        c = company.card(getter)
+        doc = Document()
+        self._setup_page(doc)
+
+        t = doc.add_paragraph()
+        t.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        r = t.add_run("КАРТОЧКА ПРЕДПРИЯТИЯ")
+        r.bold = True
+        r.font.size = Pt(14)
+
+        sub = doc.add_paragraph()
+        sub.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        sr = sub.add_run(c["company_name"])
+        sr.bold = True
+        sr.font.size = Pt(12)
+        doc.add_paragraph()
+
+        table = doc.add_table(rows=0, cols=2)
+        table.alignment = WD_TABLE_ALIGNMENT.CENTER
+        for item in rows:
+            if item is None:                      # разделитель между блоками
+                doc.add_paragraph()
+                table = doc.add_table(rows=0, cols=2)
+                table.alignment = WD_TABLE_ALIGNMENT.CENTER
+                continue
+            label, value = item
+            if value is None:                     # заголовок блока
+                hp = doc.add_paragraph()
+                hr = hp.add_run(label)
+                hr.bold = True
+                table = doc.add_table(rows=0, cols=2)
+                table.alignment = WD_TABLE_ALIGNMENT.CENTER
+                continue
+            row = table.add_row()
+            row.cells[0].text = str(label)
+            row.cells[1].text = str(value)
+            for par in row.cells[0].paragraphs:
+                for run in par.runs:
+                    run.bold = True
+
+        doc.add_paragraph()
+        sign = doc.add_paragraph()
+        sign.add_run(f"{c['director_position']} _______________________ / "
+                     f"{c['director_initials']}")
+
+        safe = re.sub(r"[^\w\-]+", "_", profile_name, flags=re.UNICODE).strip("_")
+        path = self.output_dir / f"Карточка_предприятия_{safe}.docx"
+        doc.save(str(path))
+        logger.info(f"Карточка предприятия собрана: {path.name}")
+        return str(path)
+
     async def convert_to_pdf(self, filepath: str) -> str | None:
         """
         Конвертирует файл в PDF через LibreOffice.
@@ -1229,6 +1330,11 @@ class DocumentBuilder:
             (cash_val,  rate_fact,  "расчёт наличными"),
         ], output_name)
 
+        # Реквизиты приводим к модели один раз на документ. Данные компании
+        # приходят из карточки (company.py), данные счёта — из сделки.
+        bank = br.normalize(data)
+        comp = company.placeholders(_setting)
+
         replacements = {
             "{{НОМЕР}}":   number,
             "{{ДЕНЬ}}":    day,
@@ -1299,21 +1405,28 @@ class DocumentBuilder:
 
             "{{ВАЛЮТА_НАЛИЧНЫМИ}}":        data.get("cash_currency", data.get("currency", "рублей")),
 
-            # Банковские реквизиты
-            "{{БАНК_КОРР_СТРОКА1}}": data.get("bank_corr_line1", ""),
-            "{{БАНК_КОРР_СТРОКА2}}": data.get("bank_corr_line2", ""),
-            "{{БАНК_КОРР_СТРОКА3}}": data.get("bank_corr_line3", ""),
-            "{{БАНК_ПОЛ_СТРОКА1}}":  data.get("bank_ben_line1", ""),
-            "{{БАНК_ПОЛ_СТРОКА2}}":  data.get("bank_ben_line2", ""),
-            # Для прямого шаблона (ВТБ без корреспондента)
-            "{{БАНК_ПРЯМОЙ_НАЗВАНИЕ}}": data.get("bank_ben_line1", ""),
-            "{{БАНК_ПРЯМОЙ_БИК}}":      data.get("bank_corr_line2", ""),
-            "{{БАНК_ПРЯМОЙ_КОРР}}":     data.get("bank_corr_line3", ""),
-            "{{БАНК_ПРЯМОЙ_ИНН}}":      "9909768607",
-            "{{БАНК_ПРЯМОЙ_КПП}}":      data.get("bank_kpp", ""),
-            "{{СЧЕТ_ВАЛЮТА}}":       data.get("account_currency", ""),
-            "{{СЧЕТ_НОМЕР}}":        data.get("account_number", ""),
+            # Реквизиты счёта — плейсхолдеры новой схемы ({{БАНК}}, {{СЧЕТ}} …)
+            # добавляются ниже целиком из bank_requisites. Здесь только имена,
+            # которые остались в шаблонах договоров: их текст пока не трогаем,
+            # чтобы уже выпускаемые документы не изменились.
+            "{{БАНК_КОРР_СТРОКА1}}": bank.get("corr_bank_name", ""),
+            "{{БАНК_КОРР_СТРОКА2}}": bank.get("corr_bank_bic", ""),
+            "{{БАНК_КОРР_СТРОКА3}}": bank.get("corr_bank_acc", ""),
+            "{{БАНК_ПОЛ_СТРОКА1}}":  bank.get("bank_name", ""),
+            # В договоре БИК и корр. счёт банка получателя стоят одной строкой.
+            # В счёте мы их разнесли, договор оставлен как был.
+            "{{БАНК_ПОЛ_СТРОКА2}}":  (f"БИК: {bank['bank_bic']}, корр. счёт: "
+                                      f"{bank['bank_corr_acc']}")
+                                     if bank.get("bank_bic") else "",
+            "{{БАНК_ПРЯМОЙ_НАЗВАНИЕ}}": bank.get("bank_name", ""),
+            "{{БАНК_ПРЯМОЙ_БИК}}":      bank.get("bank_bic", ""),
+            "{{БАНК_ПРЯМОЙ_КОРР}}":     bank.get("bank_corr_acc", ""),
+            "{{СЧЕТ_НОМЕР}}":           bank.get("account_number", ""),
         }
+
+        # Карточка компании и реквизиты счёта — целиком, под своими именами.
+        replacements.update(comp)
+        replacements.update(br.placeholders(data))
 
         # ── Номер и дата в разрезе каждого документа ──────────────────────
         # Номер сделки один на весь комплект (присваивается один раз при

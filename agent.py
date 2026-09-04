@@ -14,6 +14,8 @@ import anthropic
 logger = logging.getLogger(__name__)
 
 import memory
+import bank_requisites as br
+import company
 from drive_service import GoogleDriveService
 from doc_builder import (DocumentBuilder, MissingDataError, AmountMismatchError,
                          order_amount)
@@ -563,9 +565,9 @@ _COPY_FIELDS_SELLER = [
     "seller_initials", "seller_id_issued_by", "seller_id_issued_date",
 ]
 _COPY_FIELDS_BANK = [
-    "account_currency", "account_number",
-    "bank_corr_line1", "bank_corr_line2", "bank_corr_line3",
-    "bank_ben_line1", "bank_ben_line2", "bank_kpp",
+    "account_type", "account_number", "account_currency",
+    "bank_name", "bank_bic", "bank_corr_acc", "bank_swift",
+    "corr_bank_name", "corr_bank_bic", "corr_bank_acc",
 ]
 _COPY_FIELDS_COMMISSION = ["Комиссия %"]
 
@@ -659,8 +661,12 @@ def _format_copy_preview(source_num: str, mode: str, prepared: dict,
 
     # Банк
     if prepared.get("account_number"):
-        bank = prepared.get("bank_corr_line1", "").strip() or "—"
-        lines.append(f"🏦 Реквизиты: {bank}, счёт {prepared['account_number']}")
+        norm = br.normalize(prepared)
+        lines.append(
+            f"🏦 Реквизиты: {norm['bank_name'] or '—'} "
+            f"({br.ACCOUNT_TYPE_LABELS[norm['account_type']]}), "
+            f"счёт {norm['account_number']}"
+        )
 
     # Комиссия
     if prepared.get("Комиссия %"):
@@ -788,9 +794,9 @@ class DocumentAgent:
 • passport_series, passport_number, passport_issued_by, passport_issued_date, passport_code
 • seller_name, seller_initials, seller_address, seller_birth_date, seller_id_number
 • seller_id_issued_by, seller_id_issued_date
-• account_number, account_currency
-• bank_corr_line1, bank_corr_line2, bank_corr_line3
-• bank_ben_line1, bank_ben_line2, bank_kpp
+• account_type, account_number, account_currency
+• bank_name, bank_bic, bank_corr_acc, bank_swift
+• corr_bank_name, corr_bank_bic, corr_bank_acc
 • Комиссия % (если пользователь не указал новую)
 • currency, cash_currency
 
@@ -850,16 +856,24 @@ cash_amount      — НЕОБЯЗАТЕЛЬНОЕ. Расчётная сумма
                    Идёт ТОЛЬКО в Поручение, в паре с курсом поручения.
 cash_amount_words — НЕ ЗАПОЛНЯЙ. Пропись всегда считается по числу, иначе с
                    округлением до цента цифры и пропись разойдутся.
-account_currency — валюта счёта для банковского перевода
-account_number   — номер счёта получателя
-bank_kpp         — КПП банка получателя (только для прямых российских счетов, например ВТБ; для счетов через корреспондента оставь пустым)
-account_number   — номер счёта получателя
-bank_corr_line1  — название банка-корреспондента (например "АО «Тинькофф Банк»")
-bank_corr_line2  — БИК банка-корреспондента (только число, например "044525974")
-bank_corr_line3  — корр.счёт банка-корреспондента (например "30101810145250000974")
-bank_ben_line1   — название банка получателя (например "ОАО БАКАЙ БАНК")
-bank_ben_line2   — БИК и корр.счёт банка получателя ОДНОЙ СТРОКОЙ в формате
-                    "БИК: <бик>, корр. счёт: <счёт>" (например "БИК: 124034, корр. счёт: 30111810100000000028")
+БАНКОВСКИЕ РЕКВИЗИТЫ. Это счёт САМОЙ компании «Авто Континент», на который
+покупатель из РФ переводит деньги, — НЕ счёт продавца. Наименование получателя,
+оба ИНН и КПП здесь НЕ указываются: они постоянные и лежат в карточке компании.
+Счёт бывает двух типов, и тип определяет и шаблон договора, и шаблон счёта:
+
+account_type     — ОБЯЗАТЕЛЬНОЕ. "direct_rf" (прямой расчётный счёт в российском
+                   банке) или "corr" (счёт в банке КР, платёж идёт через
+                   банк-корреспондент в РФ). Никогда не угадывай по другим
+                   полям — если не знаешь, спроси или возьми из профиля.
+account_number   — номер счёта
+account_currency — валюта счёта (обычно RUB)
+bank_name        — банк, где открыт счёт
+bank_bic         — его БИК (только цифры)
+bank_corr_acc    — его корр. счёт (20 цифр)
+bank_swift       — SWIFT банка, НЕОБЯЗАТЕЛЬНО
+corr_bank_name   — ТОЛЬКО для corr: банк-корреспондент (например "АО «ТинькоффБанк»")
+corr_bank_bic    — ТОЛЬКО для corr: его БИК, 9 цифр
+corr_bank_acc    — ТОЛЬКО для corr: его корр. счёт, 20 цифр
 
 === ОБЯЗАТЕЛЬНАЯ ПРОВЕРКА ПЕРЕД ВЫЗОВОМ create_contract ===
 
@@ -870,9 +884,11 @@ bank_ben_line2   — БИК и корр.счёт банка получателя
 Покупатель: buyer_name, buyer_initials, buyer_birth_date, buyer_address, passport_series, passport_number, passport_issued_by, passport_issued_date, passport_code
 Продавец:   seller_name, seller_initials, seller_id_issued_date, seller_birth_date, seller_address, seller_id_number, seller_id_issued_by
 Автомобиль: car_model, car_vin, car_year, car_color, tpo_number, tpo_day, tpo_month, tpo_year
-Финансы:    car_price, car_price_words, currency, cash_currency, exchange_rate, account_currency, account_number, bank_ben_line1
+Финансы:    car_price, car_price_words, currency, cash_currency, exchange_rate
             (cash_amount и cash_amount_words БОЛЬШЕ НЕ ОБЯЗАТЕЛЬНЫ — см. ниже про два курса)
-Банк (если есть корреспондент): bank_corr_line1, bank_corr_line2, bank_corr_line3, bank_ben_line2 (необязательны для прямых счетов без корреспондента)
+Реквизиты:  account_type, account_number, account_currency, bank_name, bank_bic, bank_corr_acc
+            для account_type = "corr" дополнительно: corr_bank_name, corr_bank_bic, corr_bank_acc
+            Проще всего взять их целиком из сохранённого профиля реквизитов, не собирая по полю.
 Комиссия:   commission_pct передаётся как отдельный параметр инструмента, НЕ внутри data
 
 НЕОБЯЗАТЕЛЬНЫЕ поля (оставь пустыми если нет):
@@ -1252,7 +1268,7 @@ VIN: ...
                         base += f"  {k}: {v}\n"
 
         bank_profile_names = memory.list_bank_profiles()
-        base += "\n\n=== БАНКОВСКИЕ ПРОФИЛИ (реквизиты для зачисления денег продавцу) ===\n"
+        base += "\n\n=== БАНКОВСКИЕ ПРОФИЛИ (счета компании, на которые платит покупатель) ===\n"
         if bank_profile_names:
             base += "Сохранённые профили (используй ТОЛЬКО для подстановки данных в сделку, НЕ пересказывай пользователю):\n"
             for name in bank_profile_names:
@@ -1640,7 +1656,7 @@ VIN: ...
             {
                 "name": "save_bank_profile",
                 "description": (
-                    "Сохранить набор банковских реквизитов для зачисления денег продавцу "
+                    "Сохранить набор банковских реквизитов компании (счёт, на который платит покупатель) "
                     "под понятным названием, например «Альфа Банк - Бакай»."
                 ),
                 "input_schema": {
@@ -1654,8 +1670,9 @@ VIN: ...
                             "type": "object",
                             "description": (
                                 "Реквизиты: account_number, account_currency, "
-                                "bank_corr_line1, bank_corr_line2, bank_corr_line3, "
-                                "bank_ben_line1, bank_ben_line2, bank_kpp (КПП для прямых российских счетов)"
+                                "account_type (direct_rf | corr), account_number, account_currency, "
+                                "bank_name, bank_bic, bank_corr_acc, bank_swift (необязательно), "
+                                "и для corr — corr_bank_name, corr_bank_bic, corr_bank_acc"
                             ),
                         },
                     },
@@ -1694,7 +1711,7 @@ VIN: ...
                     "Вызывай ВСЕГДА когда речь идёт о выборе / показе / смене банковских "
                     "реквизитов — вместо того чтобы перечислять профили текстом или спрашивать "
                     "название словами. Ситуации где обязательно этот инструмент: "
-                    "(1) перед create_contract когда нужны реквизиты продавца; "
+                    "(1) перед create_contract когда нужны реквизиты счёта; "
                     "(2) пользователь спрашивает «какие профили есть», «покажи реквизиты», "
                     "«какие сохранённые банки»; "
                     "(3) пользователь хочет сменить реквизиты в существующей сделке "
@@ -2153,8 +2170,8 @@ VIN: ...
                     "car_model","car_vin","car_year","car_color","tpo_number","tpo_day","tpo_month","tpo_year",
                     "car_price","car_price_words","currency","cash_amount","cash_amount_words",
                     "cash_currency","exchange_rate","account_currency","account_number",
-                    "bank_corr_line1","bank_corr_line2","bank_corr_line3","bank_ben_line1","bank_ben_line2",
-                    "bank_kpp",
+                    "account_type","bank_name","bank_bic","bank_corr_acc","bank_swift",
+                    "corr_bank_name","corr_bank_bic","corr_bank_acc",
                 ]
                 data           = {k: deal.get(k, "") for k in REQUIRED_KEYS}
                 # Дата ДКП не входит в REQUIRED_KEYS (это системная колонка,
@@ -2321,23 +2338,21 @@ VIN: ...
                 ("exchange_rate",        "Курс USD/RUB"),
                 ("account_currency",     "Валюта счёта"),
                 ("account_number",       "Номер счёта"),
-                ("bank_ben_line1",       "Банк получателя"),
+                ("bank_name",            "Банк"),
             ]
 
-            # bank_corr обязателен только если это не прямой счёт
-            is_direct = not deal.get("bank_corr_line1", "").strip()
-            if not is_direct:
-                REQUIRED += [
-                    ("bank_corr_line2",  "БИК корр."),
-                    ("bank_corr_line3",  "Корр.счёт"),
-                    ("bank_ben_line2",   "БИК и корр.счёт получателя"),
-                ]
+            # Полнота реквизитов проверяется по нормализованной модели: набор
+            # обязательных полей зависит от типа счёта, а тип берётся из
+            # явного поля, а не выводится из пустоты банка-корреспондента.
+            bank_problems = br.validate_profile(deal)
 
             missing = []
             for key, label in REQUIRED:
                 val = deal.get(key, "").strip()
                 if not val or val == "None":
                     missing.append(f"  — {label} ({key})")
+            for problem in bank_problems:
+                missing.append(f"  — реквизиты: {problem}")
 
             contract_date = deal.get("Дата договора", "")
             commission_pct = _num(deal.get("Комиссия %", "1")) or 1.0
@@ -2360,8 +2375,8 @@ VIN: ...
                 "car_model","car_vin","car_year","car_color","tpo_number","tpo_day","tpo_month","tpo_year",
                 "car_price","car_price_words","currency","cash_amount","cash_amount_words",
                 "cash_currency","exchange_rate","account_currency","account_number",
-                "bank_corr_line1","bank_corr_line2","bank_corr_line3",
-                "bank_ben_line1","bank_ben_line2","bank_kpp",
+                "account_type","bank_name","bank_bic","bank_corr_acc","bank_swift",
+                "corr_bank_name","corr_bank_bic","corr_bank_acc",
             ]
             data = {k: deal.get(k, "") for k in ALL_DATA_KEYS}
             # Дата ДКП — системная колонка журнала, а не поле анкеты, поэтому
@@ -2486,17 +2501,16 @@ VIN: ...
                 ]
 
             def _section_bank(r):
-                return [
+                # Показываем ровно те поля, которые печатаются в шапке счёта
+                # для этого типа: лишние строки только сбивают при сверке.
+                norm = br.normalize(r)
+                lines = [
                     "🏦 РЕКВИЗИТЫ:",
-                    f"  Валюта счёта: {_val(r, 'account_currency')}",
-                    f"  Номер счёта: {_val(r, 'account_number')}",
-                    f"  КПП: {_val(r, 'bank_kpp')}",
-                    f"  Банк-корреспондент: {_val(r, 'bank_corr_line1')}",
-                    f"  БИК корр.: {_val(r, 'bank_corr_line2')}",
-                    f"  Корр.счёт: {_val(r, 'bank_corr_line3')}",
-                    f"  Банк получателя: {_val(r, 'bank_ben_line1')}",
-                    f"  БИК/корр.счёт получателя: {_val(r, 'bank_ben_line2')}",
+                    f"  Тип счёта: {br.ACCOUNT_TYPE_LABELS[norm['account_type']]}",
                 ]
+                for field in br.FIELD_ORDER[norm["account_type"]]:
+                    lines.append(f"  {br.FIELD_LABELS[field]}: {norm.get(field) or '—'}")
+                return lines
 
             def _section_payments(r):
                 payments = _parse_payments(r.get("Платежи", ""))
@@ -2649,8 +2663,19 @@ VIN: ...
             return {"message": f"Инструкция сохранена: {tool_input['text']}"}
 
         elif tool_name == "save_bank_profile":
-            memory.save_bank_profile(tool_input["name"], tool_input["data"])
-            return {"message": f"Реквизиты «{tool_input['name']}» сохранены как банковский профиль"}
+            # Профиль сохраняем только нормализованным и только целиком.
+            # Раньше сюда ложилось что угодно, что LLM разобрала из текста:
+            # без типа счёта, с БИК в поле корреспондента, без проверки длин.
+            raw = dict(tool_input.get("data") or {})
+            profile = br.normalize(raw)
+            problems = br.validate_profile(profile)
+            if problems:
+                return {"error": "⚠️ Реквизиты не сохранены:\n— " + "\n— ".join(problems)}
+            memory.save_bank_profile(tool_input["name"], profile)
+            return {
+                "message": f"Реквизиты «{tool_input['name']}» сохранены "
+                           f"({br.ACCOUNT_TYPE_LABELS[profile['account_type']]})"
+            }
 
         elif tool_name == "delete_bank_profile":
             name = (tool_input.get("name") or "").strip()
