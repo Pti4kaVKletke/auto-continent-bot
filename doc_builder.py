@@ -356,6 +356,70 @@ def amount_to_words_plain(amount) -> str:
     return f"{words} {frac:02d} {_plural(frac, 'цент', 'цента', 'центов')}"
 
 
+# ─── Варианты шаблона счёта ────────────────────────────────────────────────
+# Вёрстку счёта правят в Excel, и держать несколько бланков рядом безопаснее,
+# чем перезаписывать боевой файл. Вариант — это суффикс в имени шаблона:
+#   invoice_template.xlsx     / invoice_template_direct.xlsx     → v1
+#   invoice_template_v2.xlsx  / invoice_template_direct_v2.xlsx  → v2
+# Какой печатать, решает настройка INVOICE_TEMPLATE (меню «⚙️ Настройки»).
+
+INVOICE_VARIANT_KEY     = "INVOICE_TEMPLATE"
+INVOICE_VARIANT_DEFAULT = "v1"
+
+
+def templates_dir() -> Path:
+    return Path(os.environ.get("TEMPLATES_DIR", "./templates"))
+
+
+def invoice_template_name(variant: str, is_direct: bool) -> str:
+    base = "invoice_template_direct" if is_direct else "invoice_template"
+    suffix = "" if variant in ("", "v1", None) else f"_{variant}"
+    return f"{base}{suffix}.xlsx"
+
+
+def invoice_variants() -> list:
+    """Варианты бланка, реально лежащие в templates/. Вариант считается
+    пригодным, только если есть оба шаблона — прямой и корреспондентский:
+    выбрать в настройках половину комплекта нельзя."""
+    tpl = templates_dir()
+    found = set()
+    for f in tpl.glob("invoice_template*.xlsx"):
+        stem = f.stem
+        for base in ("invoice_template_direct", "invoice_template"):
+            if stem == base:
+                found.add(INVOICE_VARIANT_DEFAULT)
+                break
+            if stem.startswith(base + "_"):
+                found.add(stem[len(base) + 1:])
+                break
+    complete = [
+        v for v in sorted(found)
+        if all((tpl / invoice_template_name(v, d)).exists() for d in (True, False))
+    ]
+    return complete or [INVOICE_VARIANT_DEFAULT]
+
+
+def invoice_variant() -> str:
+    """Текущий вариант: настройка в БД бота → env → v1.
+    Если выбранного комплекта в папке нет, берём первый доступный и пишем
+    предупреждение — счёт нужен здесь и сейчас, падать из-за настройки нельзя."""
+    val = ""
+    if _setting:
+        try:
+            val = (_setting(INVOICE_VARIANT_KEY) or "").strip()
+        except Exception as e:  # pragma: no cover
+            logger.warning(f"Не прочитать настройку {INVOICE_VARIANT_KEY}: {e}")
+    val = val or os.environ.get(INVOICE_VARIANT_KEY, "").strip() or INVOICE_VARIANT_DEFAULT
+    available = invoice_variants()
+    if val not in available:
+        logger.warning(
+            f"Вариант шаблона счёта {val!r} не найден в {templates_dir()}; "
+            f"беру {available[0]!r} (доступны: {available})"
+        )
+        val = available[0]
+    return val
+
+
 class DocumentBuilder:
 
     def __init__(self):
@@ -522,28 +586,35 @@ class DocumentBuilder:
 
     async def build_invoice(self, data: dict, number: str, date: str, commission_pct: float = 1.0) -> str:
         """
-        Формирует счёт на оплату. Шаблон выбирается по account_type:
-        у прямого российского счёта своя вёрстка шапки, ИНН РФ с КПП и QR-код
-        по ГОСТ Р 56042; у счёта через корреспондента — два банковских блока.
+        Формирует счёт на оплату.
+
+        Шаблон выбирается по двум признакам: тип счёта (прямой РФ или через
+        банк-корреспондент — у них разная шапка и разный ИНН) и вариант
+        вёрстки из настройки INVOICE_TEMPLATE.
+
+        Заполнение идёт ТОЛЬКО по плейсхолдерам {{...}}, без привязки к
+        координатам ячеек: вёрстку счёта правят в Excel, и любой сдвиг строк
+        раньше ломал сборку. Плейсхолдер сам приходит туда, куда его
+        поставили в шаблоне.
         """
         bank = br.normalize(data)
         acc_type = bank["account_type"]
         is_direct = acc_type == br.DIRECT_RF
         comp = company.card(_setting)
+        variant = invoice_variant()
 
         logger.info(f"build_invoice: number={number}, тип счёта={acc_type}, "
+                    f"вариант шаблона={variant}, "
                     f"банк={bank['bank_name']!r}, БИК={bank['bank_bic']!r}, "
                     f"счёт={bank['account_number']!r}")
 
-        if is_direct:
-            template = self.templates_dir / "invoice_template_direct.xlsx"
-        else:
-            template = self.templates_dir / "invoice_template.xlsx"
+        # Никакой подмены на шаблон другого типа: у них разный ИНН в шапке.
+        template = self.templates_dir / invoice_template_name(variant, is_direct)
         if not template.exists():
-            # Никакой подмены на шаблон другого типа: у них разный ИНН в шапке.
             raise MissingTemplateError(
                 f"Не найден {template.name} — шаблон счёта для типа "
-                f"«{br.ACCOUNT_TYPE_LABELS[acc_type]}». Счёт не собран."
+                f"«{br.ACCOUNT_TYPE_LABELS[acc_type]}», вариант «{variant}». "
+                f"Счёт не собран."
             )
 
         logger.info(f"Шаблон счёта: {template.name}, "
@@ -589,6 +660,17 @@ class DocumentBuilder:
             "{{ПОЛУЧАТЕЛЬ_ИНН}}":   comp["company_inn_rf"] if is_direct else comp["company_inn"],
             "{{BANK_BEN_INN}}":     comp["company_inn_rf"] if is_direct else comp["company_inn"],
             "{{ПОЛУЧАТЕЛЬ_КПП}}":   comp["company_kpp_rf"] if is_direct else "",
+            # Тело счёта — раньше эти строки писались по координатам B14/G20/D23…
+            "{{НОМЕР}}":            number,
+            "{{ДАТА}}":             f"{date_str} г.",
+            "{{ДАТА_ЦИФРАМИ}}":     date,
+            "{{ПОКУПАТЕЛЬ}}":       buyer,
+            "{{АВТО}}":             car,
+            "{{ВАЛЮТА}}":           acc_cur,
+            "{{СЧЕТ_ВАЛЮТА}}":      acc_cur,
+            "{{ИТОГО_ЧИСЛОМ}}":     total_fmt,
+            "{{ИТОГО_ПРОПИСЬЮ}}":   total_words,
+            "{{КОЛИЧЕСТВО}}":       "1",
         })
         if is_direct:
             replacements.update({
@@ -610,7 +692,15 @@ class DocumentBuilder:
                                       if bank["bank_bic"] else "",
             })
 
-        # Находим координату ячейки с {{QR_CODE}} до замены
+        # Суммы записываем числами, иначе формулы «Сумма» и «Итого» в
+        # шаблоне посчитают по тексту и дадут ноль.
+        numeric = {
+            "{{ЦЕНА_АВТО}}":       price_val,
+            "{{КОМИССИЯ_СУММА}}":  commission,
+            "{{ИТОГО_ЧИСЛОМ_ЧИСЛО}}": total,
+        }
+
+        # Координату ячейки с QR запоминаем до замены — после она станет пустой.
         qr_cell_coord = None
         if is_direct:
             for row in ws.iter_rows():
@@ -619,42 +709,37 @@ class DocumentBuilder:
                         qr_cell_coord = cell.coordinate
                         break
 
+        # ── Заполнение по плейсхолдерам ───────────────────────────────────
+        # iter_rows отдаёт объединённые ячейки как MergedCell со значением
+        # None, поэтому фильтр по строке заодно защищает от записи в них.
+        filled = 0
         for row in ws.iter_rows():
             for c in row:
-                if isinstance(c.value, str):
-                    for ph, val in replacements.items():
-                        if ph in c.value:
-                            c.value = c.value.replace(ph, str(val))
+                if not isinstance(c.value, str):
+                    continue
+                raw = c.value.strip()
+                if raw in numeric:
+                    c.value = numeric[raw]
+                    filled += 1
+                    continue
+                val = c.value
+                for ph, rep in replacements.items():
+                    if ph in val:
+                        val = val.replace(ph, str(rep))
+                if val != c.value:
+                    c.value = val
+                    filled += 1
 
-        # Для прямого счёта дополнительно пишем БИК и корр.счёт напрямую
-        # на случай если ячейки объединены и замена плейсхолдера не сработала
-        if is_direct:
-            bik  = bank["bank_bic"]
-            corr = bank["bank_corr_acc"]
-            if bik and ws["S4"].value in ("", None, "{{BANK_DIRECT_BIK}}"):
-                ws["S4"] = bik
-            if corr and ws["S6"].value in ("", None, "{{BANK_DIRECT_CORR}}"):
-                ws["S6"] = corr
-
-        # Заголовок счёта
-        if is_direct:
-            ws["B14"] = f"Счет на оплату № {number} от {date_str} г."
-            ws["G20"] = buyer
-            ws["D23"] = f"Оплата по Агентскому договору {number} от {date_str} г. на оплату автомобиля {car}"
-            ws["Z23"] = price_val
-            ws["D24"] = f"Комиссия по Агентскому договору {number} от {date_str} г."
-            ws["Z24"] = commission
-            ws["B29"] = f"Всего наименований 2, на сумму {total_fmt} {acc_cur}"
-            ws["B30"] = total_words
-        else:
-            ws["B16"] = f"Счет на оплату № {number} от {date_str} г."
-            ws["G22"] = buyer
-            ws["D25"] = f"Оплата по Агентскому договору {number} от {date_str} г. на оплату автомобиля {car}"
-            ws["Z25"] = price_val
-            ws["D26"] = f"Комиссия по Агентскому договору {number} от {date_str} г."
-            ws["Z26"] = commission
-            ws["B31"] = f"Всего наименований 2, на сумму {total_fmt} {acc_cur}"
-            ws["B32"] = total_words
+        leftover = sorted({
+            m for row in ws.iter_rows() for c in row
+            if isinstance(c.value, str)
+            for m in re.findall(r"\{\{[^}]+\}\}", c.value)
+        })
+        logger.info(f"Счёт: заполнено ячеек {filled}, вариант шаблона {variant}")
+        if leftover:
+            # Не роняем выдачу: счёт с лишним плейсхолдером видно глазом,
+            # а вот молчаливо не собранный счёт хуже.
+            logger.warning(f"В счёте остались незаполненные плейсхолдеры: {leftover}")
 
         # ── QR код для прямого счёта ──────────────────────────────────────
         if is_direct and qr_cell_coord:

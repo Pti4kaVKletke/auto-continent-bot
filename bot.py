@@ -221,7 +221,7 @@ def setting_options_keyboard(setting_index: int):
         ]])
     current = settings_service.get_current_value(setting)
     kb = []
-    for j, opt in enumerate(setting["options"]):
+    for j, opt in enumerate(settings_service.get_options(setting)):
         marker = "✅ " if opt["value"] == current else "○ "
         kb.append([InlineKeyboardButton(
             marker + opt["label"],
@@ -1176,16 +1176,28 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"⏳ Обновляю *{setting['label']}*…",
                 parse_mode="Markdown",
             )
-            ok, err = await asyncio.to_thread(
-                settings_service.set_railway_variable,
-                setting["key"], option["value"],
+            ok, err, needs_restart = await asyncio.to_thread(
+                settings_service.apply_setting,
+                setting, option["value"],
             )
-            if ok:
+            if ok and needs_restart:
                 text = (
                     f"✅ *{setting['label']}* обновлена:\n"
                     f"  {option['label']}\n\n"
                     "_Railway автоматически передеплоит сервис (~30 сек)._\n"
                     "_После рестарта бот подхватит новое значение._"
+                )
+            elif ok:
+                # Настройки из БД применяются к следующему же документу.
+                text = (
+                    f"✅ *{setting['label']}* обновлена:\n"
+                    f"  {option['label']}\n\n"
+                    "_Применится со следующего документа, перезапуск не нужен._"
+                )
+            elif setting.get("storage") == "db":
+                text = (
+                    f"❌ Не удалось сохранить *{setting['label']}*.\n\n"
+                    f"`{err}`"
                 )
             else:
                 text = (
@@ -1203,10 +1215,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Клик по самой настройке — показать варианты
         current_label = settings_service.get_current_label(setting)
+        where = ("настройка бота: `{}` (без перезапуска)".format(setting["key"])
+                 if setting.get("storage") == "db"
+                 else "Env-переменная: `{}`".format(setting["key"]))
         text = (
             f"*{setting['label']}*\n\n"
             f"Текущее значение: _{current_label}_\n\n"
-            f"Env-переменная: `{setting['key']}`"
+            f"{where}"
         )
         await query.edit_message_text(
             text,

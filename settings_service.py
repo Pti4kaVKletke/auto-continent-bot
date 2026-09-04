@@ -1,4 +1,12 @@
-"""settings_service.py — управление настройками бота через Railway env-переменные."""
+"""settings_service.py — управление настройками бота.
+
+Настройки бывают двух видов:
+  storage="env" (по умолчанию) — env-переменная на Railway; смена вызывает
+      передеплой сервиса, значение подхватывается после рестарта;
+  storage="db"  — значение живёт в SQLite бота (таблица settings) и
+      применяется сразу, без передеплоя. Так сделано для того, что меняют
+      часто и на ходу — например, вариант бланка счёта.
+"""
 import json
 import logging
 import os
@@ -55,16 +63,63 @@ SETTINGS: list = [
             {"label": "90 дней",  "value": "90"},
         ],
     },
+    {
+        "key":      "INVOICE_TEMPLATE",
+        "label":    "🧾 Бланк счёта",
+        "default":  "v1",
+        "storage":  "db",          # применяется сразу, без передеплоя
+        "options_fn": lambda: _invoice_template_options(),
+    },
 ]
 
 
+def _invoice_template_options() -> list:
+    """Варианты бланка счёта = комплекты шаблонов, лежащие в templates/.
+    Список собирается на лету, поэтому добавленный в папку invoice_template_v3
+    появляется в меню сам, без правки кода."""
+    try:
+        import doc_builder
+        variants = doc_builder.invoice_variants()
+    except Exception as e:  # pragma: no cover
+        logger.warning(f"settings: не удалось прочитать варианты счёта: {e}")
+        return [{"label": "v1 · основной бланк", "value": "v1"}]
+
+    opts = []
+    for v in variants:
+        if v == "v1":
+            opts.append({"label": "v1 · основной бланк", "value": v})
+        else:
+            opts.append({"label": f"{v} · invoice_template_{v}.xlsx", "value": v})
+    return opts
+
+
+def get_options(setting) -> list:
+    """Варианты настройки: статический список или собранный функцией."""
+    fn = setting.get("options_fn")
+    if fn:
+        try:
+            return fn()
+        except Exception as e:  # pragma: no cover
+            logger.warning(f"settings: options_fn для {setting['key']} упал: {e}")
+            return []
+    return setting.get("options", [])
+
+
 def get_current_value(setting):
+    if setting.get("storage") == "db":
+        try:
+            import memory
+            val = memory.get_setting(setting["key"])
+            if val:
+                return val
+        except Exception as e:  # pragma: no cover
+            logger.warning(f"settings: не прочитать {setting['key']} из БД: {e}")
     return os.environ.get(setting["key"], setting["default"])
 
 
 def get_current_label(setting):
     current = get_current_value(setting)
-    for opt in setting["options"]:
+    for opt in get_options(setting):
         if opt["value"] == current:
             return opt["label"]
     return f"(кастом) {current}"
@@ -77,7 +132,7 @@ def get_setting_by_index(i):
 
 
 def get_option_by_index(setting, j):
-    opts = setting.get("options", [])
+    opts = get_options(setting)
     if 0 <= j < len(opts):
         return opts[j]
     return None
@@ -132,6 +187,26 @@ def set_railway_variable(name, value):
     os.environ[name] = value
     logger.info(f"settings: переменная {name}={value} сохранена в Railway")
     return True, ""
+
+
+def apply_setting(setting, value):
+    """Сохраняет значение настройки. Возвращает (ok, error, needs_restart).
+
+    Для storage="db" пишем в SQLite и сразу зеркалим в os.environ, чтобы
+    текущий процесс подхватил значение без перезапуска."""
+    if setting.get("storage") == "db":
+        try:
+            import memory
+            memory.set_setting(setting["key"], value)
+            os.environ[setting["key"]] = value
+            logger.info(f"settings: {setting['key']}={value} сохранено в БД")
+            return True, "", False
+        except Exception as e:
+            logger.warning(f"settings: не сохранить {setting['key']} в БД: {e}")
+            return False, str(e), False
+
+    ok, err = set_railway_variable(setting["key"], value)
+    return ok, err, ok
 
 
 def log_current_settings():
