@@ -348,6 +348,14 @@ def _resolve_period(period: str, date_from: str = "", date_to: str = ""):
         _MONTHS_RU = ["январь","февраль","март","апрель","май","июнь",
                       "июль","август","сентябрь","октябрь","ноябрь","декабрь"]
         return start, today, f"{_MONTHS_RU[start.month - 1]} {start.year}"
+    if p == "last_month":
+        # Прошлый календарный месяц целиком: с 1-го по последний день.
+        first_this = today.replace(day=1)
+        last_prev  = first_this - timedelta(days=1)
+        start = last_prev.replace(day=1)
+        _MONTHS_RU = ["январь","февраль","март","апрель","май","июнь",
+                      "июль","август","сентябрь","октябрь","ноябрь","декабрь"]
+        return start, last_prev, f"{_MONTHS_RU[start.month - 1]} {start.year}"
     if p == "quarter":
         q_start_month = ((today.month - 1) // 3) * 3 + 1
         start = today.replace(month=q_start_month, day=1)
@@ -1799,7 +1807,8 @@ VIN: ...
                             "type": "string",
                             "description": (
                                 "Период: today (сегодня), yesterday (вчера), week (текущая неделя), "
-                                "month (текущий месяц), quarter (текущий квартал), year (текущий год), "
+                                "month (текущий месяц), last_month (прошлый календарный месяц целиком), "
+                                "quarter (текущий квартал), year (текущий год), "
                                 "all (всё время), custom (указать date_from и date_to). "
                                 "По умолчанию month."
                             ),

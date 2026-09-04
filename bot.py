@@ -19,7 +19,8 @@ else:
 
 # Хелперы форматирования платежей (для локального рендера подменю оплат)
 from agent import (_parse_payments, _calc_total_amount, _fmt_money, _money_str,
-                   SCAN_TYPES, SCAN_LABELS, SCAN_PREFIXES, scan_status_text)
+                   SCAN_TYPES, SCAN_LABELS, SCAN_PREFIXES, scan_status_text,
+                   _resolve_period, _in_period, _parse_date_ddmmyyyy)
 
 import memory
 import settings_service
@@ -40,6 +41,7 @@ backup = BackupService()
 AWAITING_FLAGS = (
     "awaiting_search",
     "awaiting_stats_dates",
+    "awaiting_deals_dates",
     "awaiting_deal_date",
     "awaiting_dkp_date",
     "awaiting_scan_for_deal",
@@ -175,7 +177,7 @@ def main_menu_keyboard():
             InlineKeyboardButton("🔍 Найти сделку",    callback_data="menu:find_deal"),
         ],
         [
-            InlineKeyboardButton("✅ Активные сделки", callback_data="menu:active"),
+            InlineKeyboardButton("📋 Сделки",          callback_data="menu:deals"),
             InlineKeyboardButton("📊 Статистика",      callback_data="menu:stats"),
         ],
         [
@@ -536,6 +538,248 @@ async def ask_dkp_date(message, deal_date: str):
     )
 
 
+# ─── СПИСОК СДЕЛОК ЗА ПЕРИОД ────────────────────────────────────────────────
+# Период считаем тем же _resolve_period, что и статистика: «месяц» в списке и
+# «месяц» в статистике обязаны означать одно и то же. Фильтр — по «Дате
+# договора», не по датам платежей.
+# Статус сканов берём из колонки журнала, БЕЗ запроса к Drive: на странице 5
+# сделок, это были бы 5 запросов и заметная задержка. Точное число, как и
+# раньше, пересчитывается при открытии самой сделки (dealaction:*:menu).
+
+DEALS_PER_PAGE = 5
+
+# Ряды кнопок подменю срезов (код периода → подпись)
+_DEAL_PERIOD_ROWS = [
+    [("today", "📅 Сегодня"),      ("yesterday", "📅 Вчера")],
+    [("week", "📅 Неделя"),        ("month", "📅 Месяц")],
+    [("last_month", "📅 Пр. месяц"), ("quarter", "📅 Квартал")],
+    [("year", "📅 Год"),           ("all", "📊 Все")],
+]
+
+_DEAL_STATUS_ICONS = {
+    "черновик":     "🔵",
+    "активна":      "🟢",
+    "ждём доплату": "⏳",
+    "завершена":    "✅",
+    "отменена":     "❌",
+}
+
+# Фильтры по статусу: код → (подпись, набор статусов). None = все, кроме
+# отменённых — отменённые видны только по явному фильтру.
+_DEAL_STATUS_FILTERS = [
+    ("all",       "Все",          None),
+    ("active",    "Активные",     ("активна", "ждём доплату")),
+    ("pending",   "Ждём доплату", ("ждём доплату",)),
+    ("done",      "Завершённые",  ("завершена",)),
+    ("cancelled", "Отменённые",   ("отменена",)),
+]
+
+_SCAN_COUNT_RE = re.compile(r"^\s*(\d+)\s*/\s*(\d+)")
+
+
+def deals_menu_keyboard():
+    """Подменю срезов: «Активные» первой строкой (как раньше, в один клик
+    от главного меню), дальше периоды."""
+    kb = [[InlineKeyboardButton("✅ Активные", callback_data="deals:all:active:0")]]
+    for row in _DEAL_PERIOD_ROWS:
+        kb.append([InlineKeyboardButton(title, callback_data=f"deals:{code}:all:0")
+                   for code, title in row])
+    kb.append([InlineKeyboardButton("📅 Свой период", callback_data="deals:ask_custom")])
+    kb.append([InlineKeyboardButton("◀️ Меню", callback_data="menu:back")])
+    return InlineKeyboardMarkup(kb)
+
+
+def _plural_deals(n: int) -> str:
+    """1 сделка / 2 сделки / 5 сделок."""
+    n = abs(int(n))
+    if 11 <= n % 100 <= 14:
+        return "сделок"
+    return {1: "сделка", 2: "сделки", 3: "сделки", 4: "сделки"}.get(n % 10, "сделок")
+
+
+def _deal_status_of(d) -> str:
+    return (d.get("Статус") or "").strip().lower()
+
+
+def _deal_scans_complete(d) -> bool:
+    """True, если в колонке «Сканы» полный комплект (например «5/5 ✓»)."""
+    m = _SCAN_COUNT_RE.match(str(d.get("Сканы") or ""))
+    return bool(m) and m.group(1) == m.group(2)
+
+
+def _build_deals_view(deals, period, status_code, page, date_from="", date_to=""):
+    """Собирает текст и клавиатуру списка сделок.
+    Возвращает (text, InlineKeyboardMarkup, page) — page уточнён по факту."""
+    from datetime import date as _date
+
+    df, dt, label = _resolve_period(period, date_from, date_to)
+
+    # Сначала период, потом статус: набор кнопок-фильтров зависит от того,
+    # какие статусы вообще встретились в периоде.
+    if df is None and dt is None:
+        in_period = list(deals)
+    else:
+        in_period = [
+            d for d in deals
+            if _in_period(_parse_date_ddmmyyyy(d.get("Дата договора")), df, dt)
+        ]
+    present = {_deal_status_of(d) for d in in_period}
+
+    allowed = None
+    known = False
+    for code, _lbl, statuses in _DEAL_STATUS_FILTERS:
+        if code == status_code:
+            allowed, known = statuses, True
+            break
+    if not known:
+        status_code, allowed = "all", None
+
+    if allowed is None:
+        rows = [d for d in in_period if _deal_status_of(d) != "отменена"]
+    else:
+        rows = [d for d in in_period if _deal_status_of(d) in allowed]
+
+    rows.sort(key=lambda d: _parse_date_ddmmyyyy(d.get("Дата договора")) or _date.min,
+              reverse=True)
+
+    total = len(rows)
+    total_pages = max(1, (total + DEALS_PER_PAGE - 1) // DEALS_PER_PAGE)
+    page = max(0, min(page, total_pages - 1))
+    chunk = rows[page * DEALS_PER_PAGE:(page + 1) * DEALS_PER_PAGE]
+
+    if period == "all" and status_code == "active":
+        title = "✅ *Активные сделки*"
+    else:
+        title = f"📋 *Сделки · {label}*"
+    head = f"{title} · {total} шт"
+    if total_pages > 1:
+        head += f" · стр. {page + 1}/{total_pages}"
+
+    lines = [head, ""]
+
+    for d in chunk:
+        num   = d.get("Номер договора", "—")
+        fio   = d.get("buyer_initials") or d.get("buyer_name") or "—"
+        car   = d.get("car_model") or "—"
+        vin   = str(d.get("car_vin") or "")
+        st    = _deal_status_of(d) or "—"
+        icon  = _DEAL_STATUS_ICONS.get(st, "▫️")
+        ddate = d.get("Дата договора") or "—"
+        curr  = (d.get("currency") or "руб").strip() or "руб"
+
+        total_amt = _calc_total_amount(d)
+        received  = sum(p["amount"] for p in _parse_payments(d.get("Платежи", "")))
+        rest      = total_amt - received
+        money = f"💰 {_fmt_money(total_amt)} {curr}"
+        money += " · оплачено" if rest <= 0.01 else f" · остаток *{_fmt_money(rest)}*"
+
+        scans = str(d.get("Сканы") or "").strip() or "нет"
+        if len(scans) > 45:
+            scans = scans[:44] + "…"
+
+        vin_tail = f" · `...{vin[-6:]}`" if vin else ""
+        lines.append(
+            f"📄 `{num}` · *{fio}*\n"
+            f"   🚗 {car}{vin_tail}\n"
+            f"   {icon} {st} · {ddate}\n"
+            f"   {money}\n"
+            f"   📎 Сканы: {scans}\n"
+        )
+
+    if not rows:
+        lines.append("_Сделок за этот период нет._")
+    else:
+        # Итог по периоду. Отменённые в деньги не берём — как в статистике.
+        by_curr = {}
+        for d in rows:
+            if _deal_status_of(d) == "отменена":
+                continue
+            c = (d.get("currency") or "руб").strip() or "руб"
+            t = _calc_total_amount(d)
+            r = sum(p["amount"] for p in _parse_payments(d.get("Платежи", "")))
+            acc = by_curr.setdefault(c, [0.0, 0.0])
+            acc[0] += t
+            acc[1] += r
+
+        lines.append("─" * 16)
+        items = sorted(by_curr.items())
+        if items:
+            sums = ", ".join(f"*{_fmt_money(v[0])} {c}*" for c, v in items)
+            lines.append(f"💼 Итого за период: {total} {_plural_deals(total)} на {sums}")
+            got  = ", ".join(f"{_fmt_money(v[1])} {c}" for c, v in items)
+            left = ", ".join(f"{_fmt_money(v[0] - v[1])} {c}"
+                             for c, v in items if v[0] - v[1] > 0.01)
+            line = f"📥 Получено {got}"
+            if left:
+                line += f" · ⏳ остаток {left}"
+            lines.append(line)
+        else:
+            lines.append(f"💼 Итого за период: {total} {_plural_deals(total)}")
+        lines.append(f"📎 Комплект сканов собран: "
+                     f"{sum(1 for d in rows if _deal_scans_complete(d))} из {total}")
+
+    # ── Клавиатура ───────────────────────────────────────────────────────
+    kb = []
+    for d in chunk:
+        num  = d.get("Номер договора", "—")
+        init = d.get("buyer_initials") or d.get("buyer_name") or "—"
+        kb.append([InlineKeyboardButton(f"📄 {num} · {init}"[:32],
+                                        callback_data=f"dealaction:{num}:menu")])
+
+    filt = []
+    for code, lbl, _st in _DEAL_STATUS_FILTERS:
+        if code == "cancelled" and "отменена" not in present:
+            continue
+        mark = "• " if code == status_code else ""
+        filt.append(InlineKeyboardButton(f"{mark}{lbl}",
+                                         callback_data=f"deals:{period}:{code}:0"))
+    for i in range(0, len(filt), 3):   # больше 3 кнопок в ряд не влезает по ширине
+        kb.append(filt[i:i + 3])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(
+            "← Пред.", callback_data=f"deals:{period}:{status_code}:{page - 1}"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton(
+            "След. →", callback_data=f"deals:{period}:{status_code}:{page + 1}"))
+    if nav:
+        kb.append(nav)
+
+    kb.append([InlineKeyboardButton("◀️ К срезам", callback_data="menu:deals"),
+               InlineKeyboardButton("◀️ Меню",     callback_data="menu:back")])
+
+    text = "\n".join(lines)
+    if len(text) > 3900:      # лимит сообщения Telegram ~4096
+        text = text[:3800] + "\n\n_(текст обрезан)_"
+    return text, InlineKeyboardMarkup(kb), page
+
+
+async def show_deals_list(query, context, period, status_code, page,
+                          date_from="", date_to=""):
+    """Рисует список сделок на месте текущего сообщения."""
+    back_kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("◀️ К срезам", callback_data="menu:deals"),
+    ]])
+    try:
+        deals = await agent.sheets.get_all_deals()
+    except Exception as e:
+        logger.error(f"Ошибка получения сделок для списка: {e}", exc_info=True)
+        await query.edit_message_text(f"⚠️ Ошибка получения сделок: {e}",
+                                      reply_markup=back_kb)
+        return
+
+    text, kb, page = _build_deals_view(deals, period, status_code, page,
+                                       date_from, date_to)
+    # Запоминаем экран, чтобы «◀️ Назад» из карточки сделки вернула сюда же
+    context.user_data["last_deals_view"] = f"deals:{period}:{status_code}:{page}"
+    try:
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
+    except Exception as e:
+        logger.warning(f"Не удалось отредактировать список сделок, шлём новым: {e}")
+        await query.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+
+
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -593,68 +837,24 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ]])
             )
             context.user_data["awaiting_search"] = True
+            # Пришли из поиска — из карточки сделки возвращаемся в меню,
+            # а не в список за период, открытый когда-то раньше.
+            context.user_data.pop("last_deals_view", None)
+
+        elif action == "deals":
+            await query.edit_message_text(
+                "📋 *Сделки*\n\nВыбери срез:",
+                parse_mode="Markdown",
+                reply_markup=deals_menu_keyboard(),
+            )
 
         elif action == "active" or action.startswith("active:"):
+            # Старая кнопка «Активные сделки». Оставлена для сообщений,
+            # которые уже висят в чате со старой разметкой: срез тот же —
+            # статусы «активна» + «ждём доплату» без ограничения по периоду.
             page = int(action.split(":")[1]) if ":" in action else 0
-            per_page = 5
-
             await query.edit_message_text("🔄 Загружаю активные сделки...")
-            # Пустой запрос вернёт все сделки, потом отфильтруем по статусу.
-            # Раньше передавали "активна" как поиск по подстроке — статус
-            # «ждём доплату» так не поймать, поэтому берём все и фильтруем.
-            deals = await agent.sheets.find_deal("")
-            deals = [
-                d for d in deals
-                if d.get("Статус", "").strip().lower() in ("активна", "ждём доплату")
-            ]
-
-            if not deals:
-                await query.edit_message_text(
-                    "Активных сделок нет.",
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("◀️ Меню", callback_data="menu:back")
-                    ]])
-                )
-            else:
-                total   = len(deals)
-                total_pages = (total + per_page - 1) // per_page
-                page    = max(0, min(page, total_pages - 1))
-                chunk   = deals[page * per_page : (page + 1) * per_page]
-
-                # Текст сообщения — 5 сделок подробно
-                lines = [f"🔄 *Активные сделки* · {total} шт · стр. {page+1}/{total_pages}\n"]
-                for d in chunk:
-                    num      = d.get("Номер договора", "—")
-                    car      = d.get("car_model", "—")
-                    vin      = d.get("car_vin", "—")
-                    # Фамилия И.О.
-                    full     = d.get("buyer_initials") or d.get("buyer_name", "—")
-                    lines.append(f"📄 `{num}` {full}\n    🚗 {car} · `...{vin[-6:]}`")
-
-                # Кнопки — номер + Фамилия И.О.
-                keyboard = []
-                for d in chunk:
-                    num   = d.get("Номер договора", "—")
-                    init  = d.get("buyer_initials") or d.get("buyer_name", "—")
-                    # Обрезаем до 25 символов чтобы влезло в кнопку
-                    label = f"📄 {num} · {init}"[:32]
-                    keyboard.append([InlineKeyboardButton(label, callback_data=f"dealaction:{num}:menu")])
-
-                # Навигация
-                nav = []
-                if page > 0:
-                    nav.append(InlineKeyboardButton("← Пред.", callback_data=f"menu:active:{page-1}"))
-                if page < total_pages - 1:
-                    nav.append(InlineKeyboardButton("След. →", callback_data=f"menu:active:{page+1}"))
-                if nav:
-                    keyboard.append(nav)
-                keyboard.append([InlineKeyboardButton("◀️ Меню", callback_data="menu:back")])
-
-                await query.edit_message_text(
-                    "\n".join(lines),
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup(keyboard)
-                )
+            await show_deals_list(query, context, "all", "active", page)
 
         elif action == "stats":
             # Подменю выбора периода. Сам расчёт — в обработчике "stats:<period>".
@@ -668,10 +868,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     InlineKeyboardButton("📅 Месяц",   callback_data="stats:month"),
                 ],
                 [
-                    InlineKeyboardButton("📅 Квартал", callback_data="stats:quarter"),
-                    InlineKeyboardButton("📅 Год",     callback_data="stats:year"),
+                    InlineKeyboardButton("📅 Пр. месяц", callback_data="stats:last_month"),
+                    InlineKeyboardButton("📅 Квартал",   callback_data="stats:quarter"),
                 ],
                 [
+                    InlineKeyboardButton("📅 Год",       callback_data="stats:year"),
                     InlineKeyboardButton("📊 Всё время", callback_data="stats:all"),
                 ],
                 [
@@ -1006,6 +1207,39 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── Статистика: выбор периода ────────────────────────────────────────────
+    if data.startswith("deals:"):
+        parts = data.split(":")
+
+        # Свой период — просим ввести диапазон дат (как в статистике)
+        if len(parts) == 2 and parts[1] == "ask_custom":
+            context.user_data["awaiting_deals_dates"] = True
+            await query.edit_message_text(
+                "📅 *Свой период*\n\n"
+                "Введи диапазон дат в одном из форматов:\n"
+                "• `01.06.2026 - 30.06.2026`\n"
+                "• `01.06.2026 30.06.2026`\n"
+                "• `01.06.2026` (одна дата — от неё до сегодня)",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("◀️ Отмена", callback_data="menu:deals"),
+                ]]),
+            )
+            return
+
+        period      = parts[1] if len(parts) > 1 else "all"
+        status_code = parts[2] if len(parts) > 2 else "all"
+        try:
+            page = int(parts[3]) if len(parts) > 3 else 0
+        except ValueError:
+            page = 0
+        # Даты своего периода в callback_data не влезают (лимит 64 байта),
+        # поэтому держим их в user_data — как и остальное состояние диалога.
+        df, dt = context.user_data.get("deals_custom", ("", ""))
+
+        await query.edit_message_text("🔄 Загружаю сделки...")
+        await show_deals_list(query, context, period, status_code, page, df, dt)
+        return
+
     if data.startswith("stats:"):
         period = data.split(":", 1)[1]
 
@@ -1127,6 +1361,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "yesterday": "вчера",
             "week":      "неделю",
             "month":     "месяц",
+            "last_month": "прошлый месяц",
             "quarter":   "квартал",
             "year":      "год",
             "all":       "всё время",
@@ -1413,7 +1648,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
             if folder:
                 keyboard.insert(0, [InlineKeyboardButton("📁 Открыть на Drive", url=folder)])
-            keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="menu:active")])
+            # Возврат туда, откуда пришли: тот же срез и та же страница
+            # списка (запомнили в show_deals_list). Если пришли из поиска или
+            # по номеру договора — в главное меню.
+            back_cb = context.user_data.get("last_deals_view") or "menu:back"
+            keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data=back_cb)])
             await query.edit_message_text(
                 text,
                 parse_mode="Markdown",
@@ -1915,6 +2154,61 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"Ошибка загрузки скана: {e}", exc_info=True)
             await update.message.reply_text(f"⚠️ Ошибка загрузки: {e}")
+        return
+
+    if context.user_data.get("awaiting_deals_dates"):
+        context.user_data["awaiting_deals_dates"] = False
+        raw = user_text.strip()
+
+        import re as _re
+        matches = _re.findall(r"\d{1,2}\.\d{1,2}\.\d{4}", raw)
+        back_kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("◀️ К срезам", callback_data="menu:deals"),
+        ]])
+
+        if not matches:
+            await update.message.reply_text(
+                "⚠️ Не нашёл ни одной даты. Ожидаю формат ДД.ММ.ГГГГ, например "
+                "`01.06.2026 - 30.06.2026`",
+                parse_mode="Markdown", reply_markup=back_kb,
+            )
+            return
+
+        date_from = matches[0]
+        date_to   = matches[1] if len(matches) >= 2 else ""  # пусто → до сегодня
+
+        from datetime import datetime as _dt
+        try:
+            _df = _dt.strptime(date_from, "%d.%m.%Y").date()
+            _dtend = _dt.strptime(date_to, "%d.%m.%Y").date() if date_to else None
+            if _dtend and _df > _dtend:
+                await update.message.reply_text(
+                    f"⚠️ Начало периода `{date_from}` позже конца `{date_to}`. "
+                    "Проверь порядок дат.",
+                    parse_mode="Markdown", reply_markup=back_kb,
+                )
+                return
+        except ValueError as e:
+            await update.message.reply_text(
+                f"⚠️ Не удалось разобрать дату: {e}", reply_markup=back_kb,
+            )
+            return
+
+        context.user_data["deals_custom"] = (date_from, date_to)
+        loading = await update.message.reply_text(
+            f"🔄 Загружаю сделки за {date_from} — {date_to or 'сегодня'}..."
+        )
+        try:
+            deals = await agent.sheets.get_all_deals()
+        except Exception as e:
+            logger.error(f"Ошибка получения сделок за свой период: {e}", exc_info=True)
+            await loading.edit_text(f"⚠️ Ошибка: {e}", reply_markup=back_kb)
+            return
+
+        text_out, kb, _page = _build_deals_view(deals, "custom", "all", 0,
+                                                date_from, date_to)
+        context.user_data["last_deals_view"] = "deals:custom:all:0"
+        await loading.edit_text(text_out, parse_mode="Markdown", reply_markup=kb)
         return
 
     if context.user_data.get("awaiting_stats_dates"):
