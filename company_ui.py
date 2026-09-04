@@ -163,8 +163,11 @@ async def handle_callback(update, context, data: str, on_send=None) -> bool:
         key, label, placeholder, _ = company.FIELDS[idx]
         context.user_data["co_wait"] = key
         current = company.get(key, memory.get_setting)
+        # Плейсхолдер только в обратных кавычках и никогда в курсиве:
+        # подчёркивания внутри {{КОМПАНИЯ_ТЕЛЕФОН}} Telegram принимает за
+        # разметку, и сообщение не уходит вовсе.
         await query.edit_message_text(
-            f"*{label}*\n_плейсхолдер {placeholder}_\n\n"
+            f"*{label}*\nплейсхолдер `{placeholder}`\n\n"
             + (f"Сейчас: `{current}`\n\n" if current else "")
             + "Введи новое значение (или «-», чтобы очистить):",
             parse_mode="Markdown",
