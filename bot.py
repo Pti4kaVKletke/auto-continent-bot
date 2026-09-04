@@ -549,11 +549,13 @@ async def ask_dkp_date(message, deal_date: str):
 DEALS_PER_PAGE = 5
 
 # Ряды кнопок подменю срезов (код периода → подпись)
+# «Сегодня» и «вчера» убраны сознательно (Илья, 04.09.2026): для списка
+# сделок такие срезы почти всегда пустые, полезный минимум — неделя.
+# Сами периоды в _resolve_period остались, статистика ими пользуется.
 _DEAL_PERIOD_ROWS = [
-    [("today", "📅 Сегодня"),      ("yesterday", "📅 Вчера")],
-    [("week", "📅 Неделя"),        ("month", "📅 Месяц")],
+    [("week", "📅 Неделя"),          ("month", "📅 Месяц")],
     [("last_month", "📅 Пр. месяц"), ("quarter", "📅 Квартал")],
-    [("year", "📅 Год"),           ("all", "📊 Все")],
+    [("year", "📅 Год"),             ("all", "📊 Все")],
 ]
 
 _DEAL_STATUS_ICONS = {
@@ -585,7 +587,19 @@ def deals_menu_keyboard():
         kb.append([InlineKeyboardButton(title, callback_data=f"deals:{code}:all:0")
                    for code, title in row])
     kb.append([InlineKeyboardButton("📅 Свой период", callback_data="deals:ask_custom")])
+    kb.append([InlineKeyboardButton("🔄 Обновить сканы", callback_data="rescan:menu")])
     kb.append([InlineKeyboardButton("◀️ Меню", callback_data="menu:back")])
+    return InlineKeyboardMarkup(kb)
+
+
+def rescan_menu_keyboard():
+    """За какой срез пересчитывать сканы. Сетка та же, что у списка сделок:
+    «срез» должен означать одно и то же в обоих меню. «📊 Все» = весь журнал."""
+    kb = [[InlineKeyboardButton("✅ Активные", callback_data="rescan:all:active")]]
+    for row in _DEAL_PERIOD_ROWS:
+        kb.append([InlineKeyboardButton(title, callback_data=f"rescan:{code}:all")
+                   for code, title in row])
+    kb.append([InlineKeyboardButton("◀️ Назад", callback_data="menu:deals")])
     return InlineKeyboardMarkup(kb)
 
 
@@ -607,15 +621,17 @@ def _deal_scans_complete(d) -> bool:
     return bool(m) and m.group(1) == m.group(2)
 
 
-def _build_deals_view(deals, period, status_code, page, date_from="", date_to=""):
-    """Собирает текст и клавиатуру списка сделок.
-    Возвращает (text, InlineKeyboardMarkup, page) — page уточнён по факту."""
+def _select_deals(deals, period, status_code, date_from="", date_to=""):
+    """Отбирает сделки среза: сначала период (по «Дате договора»), потом статус.
+    Возвращает (rows, present, label, status_code) — status_code уточнён, если
+    пришёл неизвестный. Общая точка для списка и для обновления сканов, чтобы
+    «срез» в обоих местах означал одно и то же."""
     from datetime import date as _date
 
     df, dt, label = _resolve_period(period, date_from, date_to)
 
-    # Сначала период, потом статус: набор кнопок-фильтров зависит от того,
-    # какие статусы вообще встретились в периоде.
+    # Порядок важен: набор кнопок-фильтров зависит от того, какие статусы
+    # вообще встретились в периоде.
     if df is None and dt is None:
         in_period = list(deals)
     else:
@@ -641,6 +657,16 @@ def _build_deals_view(deals, period, status_code, page, date_from="", date_to=""
 
     rows.sort(key=lambda d: _parse_date_ddmmyyyy(d.get("Дата договора")) or _date.min,
               reverse=True)
+    return rows, present, label, status_code
+
+
+def _build_deals_view(deals, period, status_code, page, date_from="", date_to="",
+                      note=""):
+    """Собирает текст и клавиатуру списка сделок.
+    note — служебная строка под заголовком (итог обновления сканов).
+    Возвращает (text, InlineKeyboardMarkup, page) — page уточнён по факту."""
+    rows, present, label, status_code = _select_deals(
+        deals, period, status_code, date_from, date_to)
 
     total = len(rows)
     total_pages = max(1, (total + DEALS_PER_PAGE - 1) // DEALS_PER_PAGE)
@@ -655,7 +681,10 @@ def _build_deals_view(deals, period, status_code, page, date_from="", date_to=""
     if total_pages > 1:
         head += f" · стр. {page + 1}/{total_pages}"
 
-    lines = [head, ""]
+    lines = [head]
+    if note:
+        lines.append(note)
+    lines.append("")
 
     for d in chunk:
         num   = d.get("Номер договора", "—")
@@ -858,11 +887,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         elif action == "stats":
             # Подменю выбора периода. Сам расчёт — в обработчике "stats:<period>".
+            # «Сегодня» и «вчера» убраны (Илья, 04.09.2026): слишком короткий
+            # срез, минимально полезный — неделя. В _resolve_period периоды
+            # остались, текстовый запрос «за сегодня» через LLM работает.
             kb = [
-                [
-                    InlineKeyboardButton("📅 Сегодня", callback_data="stats:today"),
-                    InlineKeyboardButton("📅 Вчера",   callback_data="stats:yesterday"),
-                ],
                 [
                     InlineKeyboardButton("📅 Неделя",  callback_data="stats:week"),
                     InlineKeyboardButton("📅 Месяц",   callback_data="stats:month"),
@@ -1207,6 +1235,106 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── Статистика: выбор периода ────────────────────────────────────────────
+    if data.startswith("rescan:"):
+        parts = data.split(":")
+
+        if len(parts) == 2 and parts[1] == "menu":
+            await query.edit_message_text(
+                "🔄 *Обновление сканов*\n\n"
+                "Перечитаю папки «Сканы» на Drive и пропишу статусы в журнал.\n"
+                "За какой срез обновляем?",
+                parse_mode="Markdown",
+                reply_markup=rescan_menu_keyboard(),
+            )
+            return
+
+        # rescan:force:<period>:<status> — повтор в обход троттлинга
+        force = len(parts) > 3 and parts[1] == "force"
+        if force:
+            period, status_code = parts[2], parts[3]
+        else:
+            period      = parts[1] if len(parts) > 1 else "all"
+            status_code = parts[2] if len(parts) > 2 else "all"
+
+        df, dt = context.user_data.get("deals_custom", ("", ""))
+
+        # Троттлинг: подряд идущие нажатия не гоняют Drive впустую.
+        ago = int(time.time() - context.user_data.get("last_rescan_ts", 0))
+        if not force and ago < 120:
+            await query.edit_message_text(
+                f"⏳ Сканы обновлялись {ago} сек назад.\n"
+                "Если с тех пор ничего не докладывал в папки — обновлять нечего.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(
+                        "🔄 Всё равно обновить",
+                        callback_data=f"rescan:force:{period}:{status_code}")],
+                    [InlineKeyboardButton(
+                        "📋 Показать список",
+                        callback_data=f"deals:{period}:{status_code}:0")],
+                    [InlineKeyboardButton("◀️ К срезам", callback_data="menu:deals")],
+                ]),
+            )
+            return
+
+        back_kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("◀️ К срезам", callback_data="menu:deals"),
+        ]])
+
+        await query.edit_message_text("🔄 Читаю папки «Сканы» на Drive...")
+        try:
+            deals = await agent.sheets.get_all_deals()
+        except Exception as e:
+            logger.error(f"Ошибка получения сделок перед обновлением сканов: {e}",
+                         exc_info=True)
+            await query.edit_message_text(f"⚠️ Ошибка: {e}", reply_markup=back_kb)
+            return
+
+        rows, _present, label, status_code = _select_deals(
+            deals, period, status_code, df, dt)
+        if not rows:
+            await query.edit_message_text(
+                f"📋 За период «{label}» сделок нет — обновлять нечего.",
+                reply_markup=back_kb,
+            )
+            return
+
+        try:
+            res = await typing_while(
+                update.effective_chat.id, context,
+                agent.refresh_scans_bulk(rows),
+            )
+        except Exception as e:
+            logger.error(f"Ошибка массового обновления сканов: {e}", exc_info=True)
+            await query.edit_message_text(f"⚠️ Ошибка обновления сканов: {e}",
+                                          reply_markup=back_kb)
+            return
+
+        context.user_data["last_rescan_ts"] = time.time()
+
+        # Свежие статусы подставляем в уже загруженный журнал — второй раз
+        # читать лист незачем.
+        statuses = res.get("statuses") or {}
+        for d in deals:
+            num = (d.get("Номер договора") or "").strip()
+            if num in statuses:
+                d["Сканы"] = statuses[num]
+
+        note = (f"_🔄 Проверено {res['checked']} · обновлено {res['updated']} · "
+                f"без изменений {max(0, res['checked'] - res['updated'])}")
+        if res.get("skipped"):
+            note += f" · без папки на Drive {res['skipped']}"
+        note += "_"
+
+        text, kb, page = _build_deals_view(deals, period, status_code, 0, df, dt,
+                                           note=note)
+        context.user_data["last_deals_view"] = f"deals:{period}:{status_code}:{page}"
+        try:
+            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
+        except Exception as e:
+            logger.warning(f"Не удалось показать список после обновления сканов: {e}")
+            await query.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+        return
+
     if data.startswith("deals:"):
         parts = data.split(":")
 

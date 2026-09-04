@@ -260,6 +260,76 @@ class GoogleDriveService:
                     return ""
         return ""
 
+    async def list_scans_bulk(self, deal_folder_ids: list) -> dict:
+        """{id папки сделки: [имена файлов в её подпапке «Сканы»]}.
+
+        Одним проходом, а не по сделке: сначала ОДИН запрос на все папки
+        «Сканы» разом (лишние отсеиваем у себя по parents — это дешевле, чем
+        спрашивать Drive про каждую сделку), потом файлы пачками по 50
+        родителей. На 100 сделок выходит 3-4 запроса вместо 200-300.
+        """
+        ids = [i for i in dict.fromkeys(deal_folder_ids) if i]
+        if not ids:
+            return {}
+        id_set = set(ids)
+
+        def _do():
+            svc = self.service
+
+            scans_by_deal = {}          # id папки сделки → id папки «Сканы»
+            token = None
+            while True:
+                res = svc.files().list(
+                    q=("name='Сканы' and mimeType='application/vnd.google-apps.folder' "
+                       "and trashed=false"),
+                    fields="nextPageToken, files(id,parents)",
+                    pageSize=1000, pageToken=token,
+                ).execute()
+                for f in res.get("files", []):
+                    for parent in f.get("parents", []) or []:
+                        if parent in id_set:
+                            scans_by_deal[parent] = f["id"]
+                token = res.get("nextPageToken")
+                if not token:
+                    break
+
+            if not scans_by_deal:
+                return {}
+
+            deal_by_scans = {v: k for k, v in scans_by_deal.items()}
+            names = {}
+            scan_ids = list(deal_by_scans)
+            BATCH = 50                  # длина q ограничена, 50 родителей влезают с запасом
+            for i in range(0, len(scan_ids), BATCH):
+                chunk = scan_ids[i:i + BATCH]
+                q = ("(" + " or ".join(f"'{s}' in parents" for s in chunk) +
+                     ") and trashed=false")
+                token = None
+                while True:
+                    res = svc.files().list(
+                        q=q, fields="nextPageToken, files(name,parents)",
+                        pageSize=1000, pageToken=token,
+                    ).execute()
+                    for f in res.get("files", []):
+                        for parent in f.get("parents", []) or []:
+                            deal_id = deal_by_scans.get(parent)
+                            if deal_id is not None:
+                                names.setdefault(deal_id, []).append(f.get("name", ""))
+                    token = res.get("nextPageToken")
+                    if not token:
+                        break
+
+            # Папка «Сканы» есть, но пустая — это тоже результат, а не «нет данных»
+            for deal_id in scans_by_deal:
+                names.setdefault(deal_id, [])
+            return names
+
+        try:
+            return await asyncio.to_thread(_do)
+        except Exception as e:
+            logger.error(f"Ошибка массового чтения сканов с Drive: {e}", exc_info=True)
+            return {}
+
     async def _get_or_create_folder(self, name: str, parent_id: str) -> str:
         def _do_find_or_create():
             query = (

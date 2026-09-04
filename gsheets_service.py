@@ -407,6 +407,47 @@ class GoogleSheetsService:
             logger.error(f"Ошибка обновления Sheets: {e}", exc_info=True)
             return False
 
+    async def batch_update_column(self, col_name: str, values: dict) -> int:
+        """Пишет ОДНУ колонку сразу многим сделкам одним запросом.
+
+        values: {номер договора: значение}. Трогаем только эти ячейки —
+        остальные 56 колонок не переписываются, поэтому параллельная правка
+        сделки ничего не затирает (в отличие от update_deal, который читает и
+        пишет строку целиком). Возвращает число записанных ячеек.
+        """
+        if col_name not in COLUMNS or not values:
+            return 0
+        col = self._col_letter(COLUMNS.index(col_name))
+
+        def _do():
+            svc = self._get_service()
+            sheet = svc.spreadsheets()
+            nums = sheet.values().get(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"A{DATA_START_ROW}:A",
+            ).execute().get("values", [])
+
+            data = []
+            for i, row in enumerate(nums, start=DATA_START_ROW):
+                num = (row[0] if row else "").strip()
+                if num in values:
+                    data.append({"range": f"{col}{i}", "values": [[str(values[num])]]})
+            if not data:
+                return 0
+
+            sheet.values().batchUpdate(
+                spreadsheetId=SPREADSHEET_ID,
+                body={"valueInputOption": "USER_ENTERED", "data": data},
+            ).execute()
+            logger.info(f"Колонка «{col_name}»: обновлено {len(data)} ячеек одним запросом")
+            return len(data)
+
+        try:
+            return await self._sheets_retry(_do)
+        except Exception as e:
+            logger.error(f"Ошибка batch-обновления колонки «{col_name}»: {e}", exc_info=True)
+            return 0
+
     async def cancel_deal(self, contract_number: str, reason: str = "") -> bool:
         """Помечает сделку как отменённую."""
         updates = {"Статус": "отменена"}

@@ -3141,6 +3141,45 @@ VIN: ...
         await self.sheets.update_deal(contract_number, {"Сканы": status})
         return status
 
+    async def refresh_scans_bulk(self, deals: list) -> dict:
+        """Пересчитывает статус сканов сразу по списку сделок — одним проходом.
+
+        refresh_scan_status в цикле стоил бы ~5 запросов на сделку (поиск папки,
+        поиск подпапки, список файлов + чтение и перезапись всей строки листа).
+        Здесь: ~3-4 запроса к Drive и ОДИН к Sheets на любое число сделок.
+
+        Возвращает {'checked', 'updated', 'skipped', 'statuses'}.
+        """
+        folder_of = {}          # номер договора → id папки сделки
+        for d in deals:
+            num  = (d.get("Номер договора") or "").strip()
+            link = str(d.get("Папка Drive") or "")
+            if num and "/folders/" in link:
+                folder_of[num] = link.split("/folders/")[-1].split("?")[0]
+
+        # Папку по номеру здесь НЕ ищем и не создаём: это снова запрос на сделку.
+        # Нет ссылки в журнале — сделку просто пропускаем и говорим об этом.
+        skipped = len(deals) - len(folder_of)
+        if not folder_of:
+            return {"checked": 0, "updated": 0, "skipped": skipped, "statuses": {}}
+
+        names_by_folder = await self.drive.list_scans_bulk(list(folder_of.values()))
+
+        changed, statuses = {}, {}
+        for d in deals:
+            num    = (d.get("Номер договора") or "").strip()
+            folder = folder_of.get(num)
+            if not folder or folder not in names_by_folder:
+                continue
+            status = scan_status_text(names_by_folder[folder])
+            statuses[num] = status
+            if status != str(d.get("Сканы") or "").strip():
+                changed[num] = status
+
+        updated = await self.sheets.batch_update_column("Сканы", changed) if changed else 0
+        return {"checked": len(statuses), "updated": updated,
+                "skipped": skipped, "statuses": statuses}
+
     async def build_act_impl(self, contract_number: str) -> dict:
         """Формирует акт выполненных услуг по сделке.
 
