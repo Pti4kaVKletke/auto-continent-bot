@@ -426,6 +426,32 @@ def invoice_variant() -> str:
     return val
 
 
+def _image_last_row(ws, img) -> int:
+    """Последняя строка, которую занимает картинка (1-based).
+
+    Штамп и подпись висят на «одноклеточном» якоре: Excel хранит только
+    верхний угол и размер в EMU, поэтому нижнюю границу надо набрать
+    высотами строк — иначе область печати обрежет их по середине."""
+    anchor = img.anchor
+    to = getattr(anchor, "_to", None)
+    if to is not None:                      # двухклеточный якорь — есть готовый низ
+        return to.row + 1
+
+    start = anchor._from.row + 1
+    ext = getattr(anchor, "ext", None)
+    if ext is None or not ext.cy:
+        return start
+
+    EMU_PER_PX = 9525
+    need_px = ext.cy / EMU_PER_PX + (anchor._from.rowOff or 0) / EMU_PER_PX
+    def_h = ws.sheet_format.defaultRowHeight or 15.0
+    acc, row = 0.0, start
+    while acc < need_px and row < ws.max_row:
+        acc += (ws.row_dimensions[row].height or def_h) * 96 / 72
+        row += 1
+    return row
+
+
 def _anchor_box_px(ws, coord: str) -> tuple:
     """Размер области под картинку в пикселях: если ячейка входит в
     объединённый диапазон — размер всего диапазона, иначе самой ячейки.
@@ -881,9 +907,9 @@ class DocumentBuilder:
                         last = max(last, c.row)
             for img in getattr(ws, "_images", []):
                 try:
-                    last = max(last, img.anchor._from.row + 8)
-                except Exception:
-                    pass
+                    last = max(last, _image_last_row(ws, img))
+                except Exception as e:
+                    logger.warning(f"Не посчитать низ картинки: {e}")
             last = min(last + 1, ws.max_row)
             ws.print_area = f"A1:{get_column_letter(ws.max_column)}{last}"
             ws.page_setup.orientation = "portrait"
