@@ -11,6 +11,7 @@ from docx.shared import Pt, Cm
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_TABLE_ALIGNMENT
 import openpyxl
+from openpyxl.utils import get_column_letter
 from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
 
 import bank_requisites as br
@@ -363,6 +364,11 @@ def amount_to_words_plain(amount) -> str:
 #   invoice_template_v2.xlsx  / invoice_template_direct_v2.xlsx  → v2
 # Какой печатать, решает настройка INVOICE_TEMPLATE (меню «⚙️ Настройки»).
 
+# Поле внутри ячейки и разумные пределы стороны QR (в пикселях).
+QR_CELL_PADDING_PX = 6
+QR_MIN_PX          = 60
+QR_MAX_PX          = 300
+
 INVOICE_VARIANT_KEY     = "INVOICE_TEMPLATE"
 INVOICE_VARIANT_DEFAULT = "v1"
 
@@ -418,6 +424,40 @@ def invoice_variant() -> str:
         )
         val = available[0]
     return val
+
+
+def _anchor_box_px(ws, coord: str) -> tuple:
+    """Размер области под картинку в пикселях: если ячейка входит в
+    объединённый диапазон — размер всего диапазона, иначе самой ячейки.
+
+    Excel хранит ширину колонки в символах шрифта, а высоту строки в пунктах,
+    поэтому переводим: px = width * 7 + 5 и px = pt * 96 / 72."""
+    from openpyxl.utils import coordinate_to_tuple
+
+    row, col = coordinate_to_tuple(coord)
+    min_c = max_c = col
+    min_r = max_r = row
+    for rng in ws.merged_cells.ranges:
+        if rng.min_row <= row <= rng.max_row and rng.min_col <= col <= rng.max_col:
+            min_c, max_c = rng.min_col, rng.max_col
+            min_r, max_r = rng.min_row, rng.max_row
+            break
+
+    # Ширины колонок в шаблоне заданы диапазонами (min..max), а не по одной.
+    widths = {}
+    for dim in ws.column_dimensions.values():
+        if dim.width is None:
+            continue
+        for i in range(dim.min or 1, (dim.max or dim.min or 1) + 1):
+            widths[i] = dim.width
+
+    def_w = ws.sheet_format.defaultColWidth or 8.43
+    def_h = ws.sheet_format.defaultRowHeight or 15.0
+
+    w_px = sum(widths.get(i, def_w) * 7 + 5 for i in range(min_c, max_c + 1))
+    h_px = sum((ws.row_dimensions[i].height or def_h) * 96 / 72
+               for i in range(min_r, max_r + 1))
+    return w_px, h_px
 
 
 class DocumentBuilder:
@@ -780,14 +820,26 @@ class DocumentBuilder:
                 # Кодируем в cp1251 как требует ГОСТ
                 qr_bytes = qr_str.encode("cp1251")
 
+                # Размер берём из шаблона: QR занимает отведённую ему ячейку
+                # целиком. Сторона — по меньшей стороне области, чтобы код
+                # остался квадратным и не вылез за рамку.
+                box_w, box_h = _anchor_box_px(ws, qr_cell_coord)
+                side = int(min(box_w, box_h)) - QR_CELL_PADDING_PX
+                side = max(QR_MIN_PX, min(side, QR_MAX_PX))
+
                 qr = qrcode.QRCode(
                     version=None,
                     error_correction=ERROR_CORRECT_M,
-                    box_size=4,
+                    box_size=1,
                     border=2,
                 )
                 qr.add_data(qr_bytes, optimize=0)
                 qr.make(fit=True)
+
+                # Подгоняем разрешение картинки под итоговый размер, иначе
+                # растянутый QR замылится и телефон его не прочитает.
+                modules = qr.modules_count + 2 * qr.border
+                qr.box_size = max(2, int(round(side / modules)) + 1)
                 img = qr.make_image(fill_color="black", back_color="white")
 
                 buf = io.BytesIO()
@@ -795,26 +847,46 @@ class DocumentBuilder:
                 buf.seek(0)
 
                 xl_img = XLImage(buf)
-                xl_img.width  = 90
-                xl_img.height = 90
+                xl_img.width  = side
+                xl_img.height = side
                 ws.add_image(xl_img, qr_cell_coord)
-                logger.info(f"QR код вставлен в {qr_cell_coord} ({len(qr_bytes)} байт)")
+                logger.info(
+                    f"QR код вставлен в {qr_cell_coord} ({len(qr_bytes)} байт), "
+                    f"область {box_w:.0f}×{box_h:.0f} px → сторона {side} px"
+                )
                 logger.info(f"QR содержимое: {qr_str}")
             except ImportError:
                 logger.warning("Библиотека qrcode не установлена — QR пропущен")
             except Exception as e:
                 logger.warning(f"Ошибка генерации QR: {e}", exc_info=True)
 
-        # Настройка области печати
+        # Настройка области печати: счёт должен влезать в лист по ширине.
+        # fitToPage ставим НЕ через ws.page_setup — у загруженного из файла
+        # листа тот объект приходит без ссылки на лист, и обращение падает
+        # с «NoneType has no attribute sheet_properties» (openpyxl 3.1.5),
+        # обрывая настройку до fitToWidth/fitToHeight. Пишем в свойства листа
+        # напрямую, там это тот же самый флаг.
         try:
-            from openpyxl.worksheet.properties import WorksheetProperties, PageSetupProperties
-            if ws.sheet_properties is None:
-                ws.sheet_properties = WorksheetProperties()
+            from openpyxl.worksheet.properties import PageSetupProperties
             if ws.sheet_properties.pageSetUpPr is None:
                 ws.sheet_properties.pageSetUpPr = PageSetupProperties()
-            ws.print_area = ws.dimensions
+            ws.sheet_properties.pageSetUpPr.fitToPage = True
+            # ws.dimensions у этих шаблонов тянется почти на 1000 строк
+            # (пустые, но отформатированные), и печать из Excel дала бы
+            # пачку пустых листов. Берём последнюю строку с содержимым.
+            last = 1
+            for row in ws.iter_rows():
+                for c in row:
+                    if c.value not in (None, ""):
+                        last = max(last, c.row)
+            for img in getattr(ws, "_images", []):
+                try:
+                    last = max(last, img.anchor._from.row + 8)
+                except Exception:
+                    pass
+            last = min(last + 1, ws.max_row)
+            ws.print_area = f"A1:{get_column_letter(ws.max_column)}{last}"
             ws.page_setup.orientation = "portrait"
-            ws.page_setup.fitToPage = True
             ws.page_setup.fitToWidth = 1
             ws.page_setup.fitToHeight = 0
         except Exception as e:
