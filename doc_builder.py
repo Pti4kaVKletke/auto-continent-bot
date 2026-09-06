@@ -489,6 +489,8 @@ def _anchor_box_px(ws, coord: str) -> tuple:
 class DocumentBuilder:
 
     def __init__(self):
+        # спек разброса подписи/печати последнего собранного документа
+        self.last_jitter_spec = ""
         self.templates_dir = Path(os.environ.get("TEMPLATES_DIR", "./templates"))
         self.output_dir = Path(tempfile.gettempdir()) / "tg_agent_docs"
         self.output_dir.mkdir(exist_ok=True)
@@ -650,7 +652,8 @@ class DocumentBuilder:
 
     # ─── СЧЁТ (XLSX) ──────────────────────────────────────────────────────
 
-    async def build_invoice(self, data: dict, number: str, date: str, commission_pct: float = 1.0) -> str:
+    async def build_invoice(self, data: dict, number: str, date: str, commission_pct: float = 1.0,
+                            jitter_spec: str | None = None) -> str:
         """
         Формирует счёт на оплату.
 
@@ -929,12 +932,25 @@ class DocumentBuilder:
             logger.warning("Изображения потерялись — восстанавливаю из шаблона")
             self._restore_images_from_template(path, template)
 
+        # ── Разброс подписи и печати ──────────────────────────────────
+        # Счёт правится уже сохранённым файлом: openpyxl не умеет ни
+        # поворота картинки, ни отрицательного смещения якоря.
+        self.last_jitter_spec = jitter_spec or ""
+        try:
+            import sign_jitter
+            self.last_jitter_spec = sign_jitter.apply_xlsx(
+                path, f"Счёт_{number}", jitter_spec
+            )
+        except Exception as e:
+            logger.warning(f"sign_jitter пропущен для счёта {number}: {e}")
+
         return str(path)
 
     # ─── АКТ ВЫПОЛНЕННЫХ УСЛУГ ────────────────────────────────────────────
 
     async def build_act(self, data: dict, contract_number: str, contract_date: str,
-                        act_date: str, commission_pct: float = 1.0) -> str:
+                        act_date: str, commission_pct: float = 1.0,
+                        jitter_spec: str | None = None) -> str:
         """
         Формирует акт об оказании услуг по агентскому договору.
 
@@ -969,13 +985,16 @@ class DocumentBuilder:
             template, data, contract_number, contract_date,
             f"Акт_{contract_number}", commission_pct,
             extra_replacements=extra,
+            jitter_signature=True,
+            jitter_spec=jitter_spec,
         )
 
     # ─── ОТЧЁТ АГЕНТА ─────────────────────────────────────────────────────
 
     async def build_report(self, data: dict, contract_number: str, contract_date: str,
                            report_date: str, received_date: str, settlement_date: str,
-                           commission_pct: float = 1.0) -> str:
+                           commission_pct: float = 1.0,
+                           jitter_spec: str | None = None) -> str:
         """
         Формирует отчёт агента по агентскому договору.
 
@@ -1014,12 +1033,15 @@ class DocumentBuilder:
             template, data, contract_number, contract_date,
             f"Отчёт_агента_{contract_number}", commission_pct,
             extra_replacements=extra,
+            jitter_signature=True,
+            jitter_spec=jitter_spec,
         )
 
     # ─── РАСПИСКА О ПОЛУЧЕНИИ ДЕНЕЖНЫХ СРЕДСТВ ───────────────────────────
 
     async def build_receipt(self, data: dict, contract_number: str, contract_date: str,
-                            receipt_date: str, commission_pct: float = 1.0) -> str:
+                            receipt_date: str, commission_pct: float = 1.0,
+                            jitter_spec: str | None = None) -> str:
         """
         Формирует расписку продавца о получении наличных денежных средств
         (Приложение № 1 к акту об оказании услуг).
@@ -1106,6 +1128,8 @@ class DocumentBuilder:
             template, data, contract_number, contract_date,
             f"Расписка_{contract_number}", commission_pct,
             extra_replacements=extra,
+            jitter_signature=True,
+            jitter_spec=jitter_spec,
         )
 
     # ─── ВОССТАНОВЛЕНИЕ КАРТИНОК ИЗ ШАБЛОНА xlsx ─────────────────────────
@@ -1445,7 +1469,9 @@ class DocumentBuilder:
 
     async def _fill_template(self, template_path, data, number, date, output_name,
                               commission_pct: float = 1.0,
-                              extra_replacements: dict | None = None) -> str:
+                              extra_replacements: dict | None = None,
+                              jitter_signature: bool = False,
+                              jitter_spec: str | None = None) -> str:
         from lxml import etree
         from copy import deepcopy
 
@@ -1793,6 +1819,21 @@ class DocumentBuilder:
                 elem.getparent().remove(elem)
             for elem in list(section.footer._element.iter(f"{{{W}}}proofErr")):
                 elem.getparent().remove(elem)
+
+        # ── Разброс подписи и печати ──────────────────────────────────
+        # jitter_spec — то, что выпало при первой сборке этого документа
+        # (журнал, колонка «Штамп и подпись»). Передан — повторяем его
+        # один в один; пуст — разыгрываем и кладём результат в
+        # self.last_jitter_spec, вызывающий код сохранит его в журнал.
+        self.last_jitter_spec = jitter_spec or ""
+        if jitter_signature:
+            try:
+                import sign_jitter
+                self.last_jitter_spec = sign_jitter.apply(
+                    doc, output_name, jitter_spec
+                )
+            except Exception as e:
+                logger.warning(f"sign_jitter пропущен для {output_name}: {e}")
 
         path = self.output_dir / f"{output_name}.docx"
         doc.save(str(path))

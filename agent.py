@@ -2022,7 +2022,11 @@ VIN: ...
                 built["dkp"] = await self.builder.build_dkp(tool_input["data"], number, date)
 
                 logger.info("Строю счёт...")
-                built["invoice"] = await self.builder.build_invoice(tool_input["data"], number, date, commission_pct)
+                inv_cell, inv_spec = self._jitter_read(tool_input["data"], f"Счёт_{number}")
+                built["invoice"] = await self.builder.build_invoice(
+                    tool_input["data"], number, date, commission_pct,
+                    jitter_spec=inv_spec,
+                )
 
             except MissingDataError as e:
                 # Строгая проверка заполнения: документ не выдаём, чтобы
@@ -2107,6 +2111,9 @@ VIN: ...
                         commission_pct=commission_pct,
                         drive_folder_link=drive_folder_link,
                     )
+                # Строка сделки появляется только сейчас, поэтому спек
+                # разброса для счёта записывается после неё, а не при сборке.
+                await self._jitter_write(number, inv_cell, f"Счёт_{number}")
             except Exception as e:
                 logger.error(f"Ошибка записи в Sheets (сделка {number}): {e}", exc_info=True)
 
@@ -2231,7 +2238,13 @@ VIN: ...
 
             async def _build_and_upload_invoice():
                 nonlocal first_file, first_name, first_link
-                path = await self.builder.build_invoice(data, contract_number, contract_date, commission_pct)
+                key = f"Счёт_{contract_number}"
+                cell, spec = self._jitter_read(data, key)
+                path = await self.builder.build_invoice(
+                    data, contract_number, contract_date, commission_pct,
+                    jitter_spec=spec,
+                )
+                await self._jitter_write(contract_number, cell, key)
                 fname = f"Счёт_{contract_number}.xlsx"
                 link = await self.drive.upload_file(path, fname, deal_folder_id)
                 if first_file is None:
@@ -3083,6 +3096,37 @@ VIN: ...
             "buttons": buttons,
         }
 
+    # ─── РАЗБРОС ПОДПИСИ И ПЕЧАТИ ────────────────────────────────────────
+    # Колонка «Штамп и подпись» хранит по строке на документ сделки: что
+    # выпало подписи и печати при первой сборке. Пересборка повторяет вид
+    # один в один — иначе у контрагента на руках и в архиве окажутся два
+    # внешне разных экземпляра одного подписанного документа.
+
+    @staticmethod
+    def _jitter_read(deal: dict, doc_key: str) -> tuple:
+        """(вся ячейка журнала, спек нужного документа)."""
+        try:
+            import sign_jitter
+        except Exception:
+            return "", None
+        cell = str(deal.get("Штамп и подпись") or "")
+        return cell, (sign_jitter.ledger_get(cell, doc_key) or None)
+
+    async def _jitter_write(self, contract_number: str, cell: str, doc_key: str) -> None:
+        """Сохраняет в журнал то, что выпало последнему собранному документу."""
+        try:
+            import sign_jitter
+            spec = getattr(self.builder, "last_jitter_spec", "")
+            if not spec:
+                return
+            updated = sign_jitter.ledger_set(cell, doc_key, spec)
+            if updated != cell:
+                await self.sheets.update_deal(
+                    contract_number, {"Штамп и подпись": updated}
+                )
+        except Exception as e:
+            logger.warning(f"Не удалось записать «Штамп и подпись» по {contract_number}: {e}")
+
     async def _ensure_paid_amount(self, contract_number: str, deal: dict) -> dict:
         """
         Записывает в журнал фактически выданную сумму в валюте, если её там нет.
@@ -3295,9 +3339,12 @@ VIN: ...
 
         try:
             deal_folder_id = await self.drive.get_or_create_deal_folder(contract_number)
+            cell, spec = self._jitter_read(deal, f"Акт_{contract_number}")
             docx_path = await self.builder.build_act(
                 data, contract_number, contract_date, act_date, commission_pct,
+                jitter_spec=spec,
             )
+            await self._jitter_write(contract_number, cell, f"Акт_{contract_number}")
             docx_name = f"Акт_{contract_number}.docx"
             docx_link = await self.drive.upload_file(docx_path, docx_name, deal_folder_id)
 
@@ -3436,10 +3483,14 @@ VIN: ...
 
         try:
             deal_folder_id = await self.drive.get_or_create_deal_folder(contract_number)
+            key = f"Отчёт_агента_{contract_number}"
+            cell, spec = self._jitter_read(deal, key)
             docx_path = await self.builder.build_report(
                 data, contract_number, contract_date,
                 report_date, received_date, settlement_date, commission_pct,
+                jitter_spec=spec,
             )
+            await self._jitter_write(contract_number, cell, key)
             docx_name = f"Отчёт_агента_{contract_number}.docx"
             docx_link = await self.drive.upload_file(docx_path, docx_name, deal_folder_id)
 
@@ -3565,9 +3616,13 @@ VIN: ...
 
         try:
             deal_folder_id = await self.drive.get_or_create_deal_folder(contract_number)
+            key = f"Расписка_{contract_number}"
+            cell, spec = self._jitter_read(deal, key)
             docx_path = await self.builder.build_receipt(
                 data, contract_number, contract_date, receipt_date, commission_pct,
+                jitter_spec=spec,
             )
+            await self._jitter_write(contract_number, cell, key)
             docx_name = f"Расписка_{contract_number}.docx"
             docx_link = await self.drive.upload_file(docx_path, docx_name, deal_folder_id)
 
