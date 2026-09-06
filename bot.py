@@ -1817,10 +1817,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("📎 Загрузить скан",    callback_data=f"dealaction:{num}:scan"),
                  InlineKeyboardButton("🗂 Сканы",             callback_data=f"dealaction:{num}:scans")],
                 [InlineKeyboardButton("💳 Оплаты",            callback_data=f"dealaction:{num}:payments")],
-                # Порядок как в сделке: расписка (деньги выданы) → акт → отчёт
-                [InlineKeyboardButton("🧾 Расписка",          callback_data=f"dealaction:{num}:build_receipt"),
-                 InlineKeyboardButton("📄 Акт",               callback_data=f"dealaction:{num}:build_act")],
-                [InlineKeyboardButton("📊 Отчёт агента",      callback_data=f"dealaction:{num}:build_report")],
+                # Расписка, акт и отчёт живут в меню «📋 Создать документы» —
+                # в карточке сделки их не дублируем.
                 [InlineKeyboardButton("✅ Завершить сделку",  callback_data=f"dealaction:{num}:complete")],
                 [InlineKeyboardButton("❌ Отменить сделку",   callback_data=f"dealaction:{num}:cancel")],
             ]
