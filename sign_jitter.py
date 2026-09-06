@@ -259,12 +259,54 @@ def _pick(pool: list, name: str):
     return None
 
 
+def _smooth_noise(size, rnd, cells: int, blur: float):
+    """Гладкий шум 0..1 нужной крупности — на нём держится и непропечатка
+    факсимиле, и уникализация края живого оттиска."""
+    from PIL import Image, ImageFilter
+    w, h = size
+    small = Image.new("L", (cells, cells))
+    small.putdata([rnd.randrange(256) for _ in range(cells * cells)])
+    img = small.resize((w, h), Image.BICUBIC)
+    if blur:
+        img = img.filter(ImageFilter.GaussianBlur(blur))
+    return img
+
+
+def _uniquify(alpha, rnd):
+    """Слабое шевеление края живого оттиска.
+
+    Набор конечен, и один и тот же скан рано или поздно попадётся дважды.
+    Здесь порог бинаризации гуляет вдоль контура на доли пикселя: сам
+    оттиск остаётся собой, но два документа с одной базой не совпадают
+    при наложении (расходятся примерно по 2% площади). Заменять этим
+    живую фактуру нельзя — только шевелить: амплитуда вдвое слабее той,
+    что понадобилась бы нарисованному факсимиле.
+    """
+    from PIL import Image, ImageChops, ImageFilter
+    soft = alpha.filter(ImageFilter.GaussianBlur(0.7))
+    n = _smooth_noise(alpha.size, rnd, 220, 0.6)
+    a = np_from(soft); noise = np_from(n)
+    out = (a - (128 + (noise / 255.0 * 2 - 1) * 34)) * 1.5 + 140
+    return np_to(out, alpha.size)
+
+
+def np_from(img):
+    import numpy as np
+    return np.asarray(img).astype("float32")
+
+
+def np_to(arr, size):
+    import numpy as np
+    from PIL import Image
+    return Image.fromarray(np.clip(arr, 0, 255).astype("uint8"))
+
+
 def _mul(a, b):
     from PIL import ImageChops
     return ImageChops.multiply(a, b)
 
 
-def _ink(blob: bytes, kind: str, d: dict) -> bytes | None:
+def _ink(blob: bytes, kind: str, d: dict, from_pool: bool = False) -> bytes | None:
     """Прозрачность, размытие и непропечатка по разыгранным значениям.
     None — если Pillow нет или картинка не поддалась: тогда остаётся
     оригинал."""
@@ -285,16 +327,22 @@ def _ink(blob: bytes, kind: str, d: dict) -> bytes | None:
         if blur > 0.05:
             alpha = alpha.filter(ImageFilter.GaussianBlur(blur))
 
-        if p["mottle"] > 0 and "m" in d:
-            # Низкочастотный шум: мелкая случайная картинка, растянутая на
-            # весь оттиск. Даёт пятна непропечатки, а не «телевизионный снег».
-            # Своя Random от сохранённого seed — чтобы пятна повторялись.
+        # Поле «m» — seed фактуры чернил. Что именно оно задаёт, зависит от
+        # источника картинки: у живого оттиска из набора уже есть своя
+        # неровность, ему нужна только уникализация края; рисованному
+        # факсимиле нужна имитация непропечатки.
+        if "m" in d:
             mr = random.Random(int(d["m"]))
-            w, h = im.size
-            small = Image.new("L", (mr.randint(5, 9), mr.randint(4, 7)))
-            lo = int(255 * (1 - p["mottle"]))
-            small.putdata([mr.randint(lo, 255) for _ in range(small.width * small.height)])
-            alpha = _mul(alpha, small.resize((w, h), Image.BICUBIC))
+            if from_pool:
+                alpha = _uniquify(alpha, mr)
+            elif p["mottle"] > 0:
+                # Низкочастотный шум: мелкая случайная картинка, растянутая
+                # на весь оттиск. Даёт пятна непропечатки, а не «снег».
+                w, h = im.size
+                small = Image.new("L", (mr.randint(5, 9), mr.randint(4, 7)))
+                lo = int(255 * (1 - p["mottle"]))
+                small.putdata([mr.randint(lo, 255) for _ in range(small.width * small.height)])
+                alpha = _mul(alpha, small.resize((w, h), Image.BICUBIC))
 
         a_factor = float(d.get("a", 1.0))
         if a_factor < 0.999:
@@ -435,7 +483,7 @@ def apply(doc, doc_key: str, spec: str | None = None) -> str:
                     if fit:
                         cx, cy, base_dx, base_dy = fit
                     blob = variant
-                part._blob = _ink(blob, kind, d) or blob
+                part._blob = _ink(blob, kind, d, path is not None) or blob
 
         # ── сдвиг ──────────────────────────────────────────────────────
         ncx0 = int(cx * float(d["k"]))      # ширина после масштаба — для
@@ -591,7 +639,7 @@ def apply_xlsx(path, doc_key: str, spec: str | None = None) -> str:
                                 if fit:
                                     fit_ext, fit_off = fit[:2], fit[2:]
                             blob = variant
-                        parts[media] = _ink(blob, kind, d) or blob
+                        parts[media] = _ink(blob, kind, d, pick is not None) or blob
 
                 # размер
                 ext = re.search(r'<xdr:ext cx="(\d+)" cy="(\d+)"/>', block)
