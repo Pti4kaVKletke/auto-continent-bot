@@ -27,6 +27,7 @@ import bank_requisites as br
 import bank_ui
 import company
 import company_ui
+import sign_ui
 import settings_service
 from backup_service import BackupService
 
@@ -53,6 +54,7 @@ AWAITING_FLAGS = (
     "awaiting_scan_for_existing",
     "awaiting_edit_deal",
     "awaiting_payment_for_deal",
+    "awaiting_doc_to_sign",
 )
 
 # Дополнительные "хвосты" — временные данные, привязанные к awaiting-состояниям
@@ -193,6 +195,7 @@ def main_menu_keyboard():
             InlineKeyboardButton("💾 Бэкапы",          callback_data="menu:backup"),
         ],
         [
+            InlineKeyboardButton("✍️ Подписать",       callback_data="menu:sign_doc"),
             InlineKeyboardButton("⚙️ Настройки",       callback_data="menu:settings"),
         ],
     ])
@@ -467,6 +470,12 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     filepath, filename = saved
 
+    # ── Сценарий П: ждём документ на подпись (кнопка "✍️ Подписать") ──
+    if context.user_data.pop("awaiting_doc_to_sign", None):
+        await sign_ui.start(message, context, filepath, filename,
+                            agent.builder, getter=memory.get_setting)
+        return
+
     # ── Сценарий А: ждём скан для конкретной сделки (кнопка "📎 Загрузить скан") ──
     if context.user_data.get("awaiting_scan_for_deal"):
         contract_number = context.user_data.pop("awaiting_scan_for_deal")
@@ -506,6 +515,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if has_history:
         buttons.append([InlineKeyboardButton("➕ Читать и добавить к текущей сделке", callback_data="scan_route:add")])
     buttons.append([InlineKeyboardButton("📂 Сохранить скан в существующую сделку", callback_data="scan_route:existing")])
+    buttons.append([InlineKeyboardButton("✍️ Подписать документ", callback_data="scan_route:sign")])
     buttons.append([InlineKeyboardButton("◀️ Меню", callback_data="menu:back")])
 
     context.user_data["last_scan_filepath"] = filepath
@@ -883,12 +893,28 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await company_ui.handle_callback(update, context, data,
                                          on_send=_make_card_sender(update, context))
         return
+    if data.startswith("sign:"):
+        await sign_ui.handle_callback(update, context, data, drive=agent.drive)
+        return
     bank_ui.clear_state(context)
     company_ui.clear_state(context)
 
     # ── Главное меню ──────────────────────────────────────────────────────────
     if data.startswith("menu:"):
         action = data.split(":", 1)[1]
+
+        if action == "sign_doc":
+            context.user_data["awaiting_doc_to_sign"] = True
+            await query.edit_message_text(
+                "✍️ *Подписать документ*\n\n"
+                "Пришли договор или другой документ — PDF или Word.\n"
+                "Найду, где стоит наша подпись, поставлю росчерк и печать "
+                "и покажу, что получилось.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("◀️ Меню", callback_data="menu:back")]]),
+            )
+            return
 
         if action == "new_deal":
             await query.edit_message_text(
@@ -2218,6 +2244,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             )
             await send_result(query.message, result)
+
+        elif route == "sign":
+            # Подпись чужого документа: файл уже скачан, дальше всё в sign_ui
+            await query.edit_message_text("✍️ Смотрю, где здесь подписывать…")
+            await sign_ui.start(query.message, context, filepath, filename,
+                                agent.builder, getter=memory.get_setting)
 
         elif route == "existing":
             # Сохраняем скан в папку существующей сделки
