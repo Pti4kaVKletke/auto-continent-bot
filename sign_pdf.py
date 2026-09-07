@@ -38,10 +38,16 @@ def _fitz():
     должен подгружаться (бот стартует, просто подпись чужих PDF не работает)."""
     try:
         import pymupdf
-        return pymupdf
     except ImportError:
-        import fitz
-        return fitz
+        import fitz as pymupdf
+    try:
+        # Чужие PDF часто собраны криво (битые ссылки на ресурсы), и MuPDF
+        # сыплет этим в stderr сотнями строк. На разбор это не влияет, а
+        # логи Railway забивает.
+        pymupdf.TOOLS.mupdf_display_errors(False)
+    except Exception:
+        pass
+    return pymupdf
 
 
 PT_MM = 72.0 / 25.4          # 1 мм в пунктах PDF
@@ -87,13 +93,19 @@ MP_SPAN_MM = 16.0
 STAMP_BELOW_MM = 12.0
 STAMP_AT_LINE = 0.25
 
+# Место без линии и без «М.П.» — подпись просто над фамилией. Насколько выше
+# верха строки с фамилией проходит воображаемая линия подписи, и насколько
+# выше неё встаёт центр оттиска: печать должна накрыть росчерк, а не фамилию.
+NAME_ABOVE_MM = 6.0
+STAMP_OVER_NAME_MM = 8.0
+
 # Насколько картинке позволено вылезать за границы своей колонки. Печать
 # 40 мм шире типовой линии подписи (20–45 мм), так что свисать она будет
 # всегда; допуск подобран так, чтобы у розыгрыша остался ход, а оттиск не
 # заезжал в соседний блок реквизитов.
 OVER_MM = 10.0
 
-MIN_LINE_MM = 12.0           # короче — это не линия для подписи, а рамка ячейки
+MIN_LINE_MM = 20.0           # короче — это не линия для подписи, а рамка ячейки
 MAX_LINE_MM = 110.0
 
 # ─── Кто здесь мы ───────────────────────────────────────────────────────
@@ -167,7 +179,92 @@ def _rules(page):
             merged[-1] = (px0, max(px1, x1), (py + y) / 2)
         else:
             merged.append((x0, x1, y))
-    return [m for m in merged if lo <= m[1] - m[0] <= hi]
+    merged = [m for m in merged if lo <= m[1] - m[0] <= hi]
+    return [m for m in merged if not _in_grid(m, merged)]
+
+
+def _in_grid(line, all_lines) -> bool:
+    """Линия — это граница ячейки таблицы, а не место для подписи?
+
+    Поймано на заявлении в ГНС (07.09.2026): в таблице определений сверху и
+    снизу каждой ячейки нарисована горизонтальная черта нужной длины, и бот
+    воткнул подпись с печатью в середину договорного текста. Признак таблицы —
+    несколько линий ОДНОЙ ширины, стоящих друг под другом: у настоящей строки
+    для подписи соседей сверху и снизу нет.
+    """
+    x0, x1, y = line
+    twins = 0
+    for ox0, ox1, oy in all_lines:
+        if (ox0, ox1, oy) == line:
+            continue
+        # та же колонка (края совпадают в пределах 2 пунктов) и рядом по высоте
+        if abs(ox0 - x0) < 2 and abs(ox1 - x1) < 2 and abs(oy - y) < 60:
+            twins += 1
+    return twins >= 2
+
+
+def _cells(page):
+    """Прямоугольники таблиц страницы — чтобы не принять ячейку за место
+    подписи. «ФИО руководителя | Колотовкин Илья Валерьевич» в анкете стоит
+    ровно в такой ячейке (поймано на заявлении в ГНС)."""
+    out = []
+    for d in page.get_drawings():
+        for item in d["items"]:
+            if item[0] == "re":
+                r = item[1]
+                if r.width > 60 and 8 < r.height < 60:
+                    out.append(r)
+    return out
+
+
+def _busy_above(lines, box, gap=(4, 16)):
+    """Есть ли текст прямо над строкой — там, куда лёг бы росчерк.
+
+    В анкете над «Колотовкин Илья Валерьевич» вплотную стоит значение
+    соседней строки таблицы; в блоке подписи над фамилией пусто, для того
+    место и оставлено.
+    """
+    lo, hi = box["y0"] - gap[1] * PT_MM, box["y0"] - gap[0] * PT_MM
+    for ln in lines:
+        if ln["y1"] <= lo or ln["y0"] >= hi:
+            continue
+        if ln["x1"] > box["x0"] - 5 and ln["x0"] < box["x1"] + 5:
+            return True
+    return False
+
+
+def _name_slots(lines, surnames, width, cells=(), all_lines=None):
+    """Места, где подпись ставится ПРОСТО НАД ФАМИЛИЕЙ — ни линии, ни «М.П.».
+
+    Так свёрстаны приложения к договорам («Генеральный директор Ярославцев А.В.»
+    слева, «Колотовкин И. В.» справа, между ними пусто) — поймано на заявлении
+    в ГНС 07.09.2026, где страницы 5 и 6 не нашлись вовсе.
+
+    Условие жёсткое: фамилия должна стоять в КОРОТКОЙ отдельной строке. Та же
+    фамилия в теле договора («в лице Колотовкина Ильи Валерьевича, действующего
+    на основании…») сидит в длинном абзаце — туда подпись не ставится.
+    """
+    out = []
+    for ln in lines:
+        text = ln["text"].strip()
+        if len(text) > 45:
+            continue
+        low = text.lower()
+        if not any(s in low for s in surnames):
+            continue
+        # «Колотовкин И. В.», «Генеральный директор Колотовкин И.В.» — да;
+        # обрывок фразы с предлогом — нет.
+        if any(w in low for w in (" в лице", "действующ", "именуем")):
+            continue
+        # фамилия в ячейке таблицы — это анкета, а не место подписи
+        if any(c.x0 - 2 <= ln["x0"] and ln["x1"] <= c.x1 + 2
+               and c.y0 - 2 <= ln["y0"] and ln["y1"] <= c.y1 + 2 for c in cells):
+            continue
+        # над местом подписи должно быть пусто — иначе росчерк ляжет на текст
+        if _busy_above(all_lines if all_lines is not None else lines, ln):
+            continue
+        out.append(ln)
+    return out
 
 
 def _column(x, width):
@@ -250,7 +347,7 @@ def _mp_box(marks, x0, x1, y, width):
     return best[1] if best else None
 
 
-def find_slots(pdf_path, hints=None, min_score=3.0, max_slots=12):
+def find_slots(pdf_path, hints=None, surnames=None, min_score=3.0, max_slots=12):
     """Места, куда просится наша подпись.
 
     Каждое — dict: page (с нуля), x0/x1/y линии в пунктах, label для меню,
@@ -296,10 +393,27 @@ def find_slots(pdf_path, hints=None, min_score=3.0, max_slots=12):
                               and RE_POST.search(ln["text"])), "")
                 slots.append({
                     "page": pno, "x0": x0, "x1": x1, "y": y,
-                    "col": col, "cx0": cx0, "cx1": cx1,
+                    "col": col, "cx0": cx0, "cx1": cx1, "anchor": "rule",
                     "mp": _mp_box(marks, x0, x1, y, width),
                     "score": round(score, 1), "our": our,
                     "label": f"стр. {pno + 1}" + (f" · {title[:40]}" if title else ""),
+                })
+
+            # ── Места без линии: подпись над фамилией ──────────────────
+            for ln in _name_slots(lines, surnames or [], width,
+                                  cells=_cells(page), all_lines=lines):
+                # Уже нашли линию рядом с этой фамилией — второй раз не надо.
+                if any(s["page"] == pno and abs(s["y"] - ln["y0"]) < 40
+                       for s in slots):
+                    continue
+                y = ln["y0"] - NAME_ABOVE_MM * PT_MM
+                slots.append({
+                    "page": pno, "x0": ln["x0"], "x1": ln["x1"], "y": y,
+                    "col": _column((ln["x0"] + ln["x1"]) / 2, width),
+                    "cx0": ln["x0"], "cx1": ln["x1"], "anchor": "name",
+                    "mp": _mp_box(marks, ln["x0"], ln["x1"], y, width),
+                    "score": 6.0, "our": True,
+                    "label": f"стр. {pno + 1} · над «{ln['text'].strip()[:30]}»",
                 })
 
     # два кандидата на одну линию (нарисованная + подчёркивание) → лучший
@@ -408,6 +522,7 @@ def sign(pdf_path, out_path, slots, doc_key, spec=None,
                 int(hashlib.md5(key.encode("utf-8")).hexdigest()[:12], 16))
             page = doc[slot["page"]]
             drawn = {}
+            put = []          # что и куда класть; порядок слоёв — ниже
 
             kinds = []
             if with_signature:
@@ -443,6 +558,12 @@ def sign(pdf_path, out_path, slots, doc_key, spec=None,
                         + (STAMP_MP_DX_MM + float(d["dx"])) * PT_MM
                     cy = (mp["y0"] + mp["y1"]) / 2 \
                         + (STAMP_MP_DY_MM + float(d["dy"])) * PT_MM
+                elif slot.get("anchor") == "name":
+                    # Ни линии, ни метки: печать идёт ПОВЕРХ росчерка, то есть
+                    # выше фамилии. Вниз её пускать нельзя — там сама фамилия
+                    # и всё, что под ней.
+                    cx = mid + (float(d["dx"]) - 6.0) * PT_MM
+                    cy = slot["y"] - (STAMP_OVER_NAME_MM - float(d["dy"])) * PT_MM
                 else:
                     # Метки нет — от линии подписи, на четверти её длины.
                     cx = slot["x0"] + (slot["x1"] - slot["x0"]) * STAMP_AT_LINE \
@@ -476,6 +597,18 @@ def sign(pdf_path, out_path, slots, doc_key, spec=None,
                 cx = max(edge + half_w, min(cx, page.rect.width - edge - half_w))
                 cy = max(half_h, min(cy, page.rect.height - half_h))
 
+                put.append((kind, png, w_mm, h_mm, cx, cy))
+
+            # ПОРЯДОК СЛОЁВ: сначала печать, росчерк поверх неё. Замечание
+            # Ильи 07.09.2026 на готовом PDF: когда синий оттиск ложится
+            # сверху, он перекрывает линии подписи и сразу видно, что это
+            # картинка на картинке. На бумаге сначала расписываются, а
+            # штампуют поверх, но краска печати не кроет чернила ручки
+            # полностью — на глаз выигрывает обратный порядок.
+            # Розыгрыш при этом идёт в прежнем порядке (подпись, потом
+            # печать), иначе сместится вся последовательность seed.
+            put.sort(key=lambda p: 0 if p[0] == "stamp" else 1)
+            for _kind, png, w_mm, h_mm, cx, cy in put:
                 _put(page, png, w_mm, h_mm, cx, cy)
 
             if drawn:

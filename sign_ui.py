@@ -58,6 +58,20 @@ def _hints(getter):
     return [s.strip() for s in out if s and len(s.strip()) > 3]
 
 
+def _surnames(getter):
+    """Фамилия директора в нижнем регистре — по ней находятся места, где
+    подпись ставится просто над фамилией, без линии и без «М.П.»."""
+    c = company.card(getter)
+    out = set()
+    for key in ("director_name", "director_initials", "director_name_gen"):
+        parts = (c.get(key) or "").split()
+        if parts and len(parts[0]) > 3:
+            # родительный падеж («Колотовкина») к именительному не приводим:
+            # ищем вхождением, поэтому достаточно общего начала
+            out.add(parts[0][:-1].lower() if key.endswith("_gen") else parts[0].lower())
+    return sorted(out)
+
+
 # ─── Шаг 1: приняли файл ────────────────────────────────────────────────
 
 async def start(message, context, filepath: str, filename: str,
@@ -88,7 +102,8 @@ async def start(message, context, filepath: str, filename: str,
         return
 
     try:
-        slots = sign_pdf.find_slots(pdf, hints=_hints(getter))
+        slots = sign_pdf.find_slots(pdf, hints=_hints(getter),
+                                    surnames=_surnames(getter))
     except Exception as e:
         logger.error(f"sign_ui: поиск мест не удался: {e}", exc_info=True)
         await message.reply_text(f"❌ Не смогла разобрать документ: {e}")
@@ -171,7 +186,9 @@ def _overview_text(st):
                  f"{_plural(len(sel), 'месте', 'местах', 'местах')}:")
     for i in sorted(st["on"]):
         s = st["slots"][i]
-        mark = "по М.П." if s.get("mp") else "по линии подписи"
+        mark = ("по М.П." if s.get("mp")
+                else "над фамилией" if s.get("anchor") == "name"
+                else "по линии подписи")
         lines.append(f"• {_label(st, i)} — {mark}")
     if len(sel) < len(st["slots"]):
         rest = len(st["slots"]) - len(sel)
@@ -230,7 +247,7 @@ async def _show_place(message, context, i):
     png, _ = _preview(st, page_no=s["page"])
     text = (f"*{_label(st, i)}*\n"
             f"{'подписываю' if i in st['on'] else 'пропускаю'} · "
-            f"{'печать по М.П.' if s.get('mp') else 'печать по линии'}\n\n"
+            f"{'печать по М.П.' if s.get('mp') else 'печать над фамилией' if s.get('anchor') == 'name' else 'печать по линии'}\n\n"
             f"Стрелки двигают на {STEP_MM:.0f} мм.")
     await message.edit_media(
         InputMediaPhoto(png, caption=text, parse_mode="Markdown"),
