@@ -222,6 +222,30 @@ class MissingDataError(Exception):
         super().__init__(f"{doc_name} — " + "; ".join(parts))
 
 
+def _words_rub_plain(value) -> str:
+    """Пропись рублёвой суммы БЕЗ слова «рублей», но С копейками.
+
+    В шаблонах «руб.» стоит перед скобками, а в журнале car_price_words
+    хранится тоже без валюты — иначе вышло бы «4 531 683,17 руб.
+    (Четыре миллиона … рублей 17 копеек)». А вот копейки терять нельзя:
+    на неполной оплате база их имеет, и пропись обязана сойтись с цифрами.
+    Ровно та же форма, что у валютных сумм: «… восемьдесят три 17 копеек».
+
+    У целых сумм хвост «00 копеек» отбрасывается — как было до появления
+    этой функции, чтобы документы по полностью оплаченным сделкам не
+    изменились ни на знак.
+    """
+    try:
+        value = float(value)
+        words = amount_to_words_rub(value)
+    except (TypeError, ValueError):
+        return ""
+    if round(value * 100) % 100 == 0:
+        cut = re.search(r"\s+рубл(ь|я|ей)\b", words)
+        return words[:cut.start()] if cut else words
+    return re.sub(r"\s+рубл(ь|я|ей)\b", "", words, count=1)
+
+
 def _fmt_num(v) -> str:
     """Форматирует число для документа: 3997500 → «3 997 500», 1234.5 → «1 234,50»."""
     try:
@@ -950,7 +974,8 @@ class DocumentBuilder:
 
     async def build_act(self, data: dict, contract_number: str, contract_date: str,
                         act_date: str, commission_pct: float = 1.0,
-                        jitter_spec: str | None = None) -> str:
+                        jitter_spec: str | None = None,
+                        settlement_price: float | None = None) -> str:
         """
         Формирует акт об оказании услуг по агентскому договору.
 
@@ -987,6 +1012,7 @@ class DocumentBuilder:
             extra_replacements=extra,
             jitter_signature=True,
             jitter_spec=jitter_spec,
+            settlement_price=settlement_price,
         )
 
     # ─── ОТЧЁТ АГЕНТА ─────────────────────────────────────────────────────
@@ -994,7 +1020,8 @@ class DocumentBuilder:
     async def build_report(self, data: dict, contract_number: str, contract_date: str,
                            report_date: str, received_date: str, settlement_date: str,
                            commission_pct: float = 1.0,
-                           jitter_spec: str | None = None) -> str:
+                           jitter_spec: str | None = None,
+                           settlement_price: float | None = None) -> str:
         """
         Формирует отчёт агента по агентскому договору.
 
@@ -1035,13 +1062,15 @@ class DocumentBuilder:
             extra_replacements=extra,
             jitter_signature=True,
             jitter_spec=jitter_spec,
+            settlement_price=settlement_price,
         )
 
     # ─── РАСПИСКА О ПОЛУЧЕНИИ ДЕНЕЖНЫХ СРЕДСТВ ───────────────────────────
 
     async def build_receipt(self, data: dict, contract_number: str, contract_date: str,
                             receipt_date: str, commission_pct: float = 1.0,
-                            jitter_spec: str | None = None) -> str:
+                            jitter_spec: str | None = None,
+                            settlement_price: float | None = None) -> str:
         """
         Формирует расписку продавца о получении наличных денежных средств
         (Приложение № 1 к акту об оказании услуг).
@@ -1094,18 +1123,18 @@ class DocumentBuilder:
         # ── Сумма в рублях прописью ───────────────────────────────────────
         # В журнале поле может быть пустым — считаем сами, чтобы в расписке
         # никогда не оставалось незамещённого плейсхолдера.
+        # База расписки — сумма, фактически выданная Получателю (settlement_price).
+        # При полной оплате она равна цене ДКП, и расписка выходит прежней.
+        # Когда база отличается от цены ДКП, готовая пропись из журнала
+        # (car_price_words) относится к цене договора и не подходит — считаем.
+        price_base = _to_float(settlement_price) or _to_float(data.get("car_price"))
         price_words = (data.get("car_price_words", "") or "").strip()
+        if abs(price_base - _to_float(data.get("car_price"))) > 0.01:
+            price_words = ""
         if not price_words:
-            price_str = str(data.get("car_price", "0")).replace(" ", "").replace(",", ".")
-            try:
-                price_words = amount_to_words_rub(float(price_str))
-            except (TypeError, ValueError):
-                price_words = ""
-            # В шаблоне слово «рублей» стоит уже после скобок, поэтому отбрасываем
-            # хвост «рублей NN копеек» — иначе получится «... рублей 00 копеек) рублей РФ».
-            cut = re.search(r"\s+рубл(ь|я|ей)\b", price_words)
-            if cut:
-                price_words = price_words[:cut.start()]
+            # _words_rub_plain уже отбрасывает хвост «рублей NN копеек»:
+            # в шаблоне слово «рублей» стоит после скобок.
+            price_words = _words_rub_plain(price_base)
 
         extra = {
             # Дата расписки = дата акта (дата закрывающего платежа)
@@ -1130,6 +1159,7 @@ class DocumentBuilder:
             extra_replacements=extra,
             jitter_signature=True,
             jitter_spec=jitter_spec,
+            settlement_price=settlement_price,
         )
 
     # ─── ВОССТАНОВЛЕНИЕ КАРТИНОК ИЗ ШАБЛОНА xlsx ─────────────────────────
@@ -1471,7 +1501,8 @@ class DocumentBuilder:
                               commission_pct: float = 1.0,
                               extra_replacements: dict | None = None,
                               jitter_signature: bool = False,
-                              jitter_spec: str | None = None) -> str:
+                              jitter_spec: str | None = None,
+                              settlement_price: float | None = None) -> str:
         from lxml import etree
         from copy import deepcopy
 
@@ -1488,10 +1519,22 @@ class DocumentBuilder:
         price_str = data.get("car_price", "0").replace(" ", "").replace(",", ".")
         try:
             price_val = float(price_str)
-            price_fmt = f"{price_val:,.0f}".replace(",", " ")
         except Exception:
-            price_fmt = price_str
             price_val = 0
+
+        # ── База документа ─────────────────────────────────────────────────
+        # price_val — цена ДКП: она зафиксирована договором и остаётся базой
+        # для Поручения, счёта и агентского договора.
+        # base_val — то, что реально прошло через Агента. Для закрывающих
+        # документов (расписка, акт, отчёт) agent.py передаёт её в
+        # settlement_price: при полной оплате она равна цене ДКП, при неполной
+        # считается от поступивших средств. Все суммы этих документов —
+        # наличные, комиссия, итог — считаются от неё, чтобы сходиться с
+        # банковской выпиской.
+        base_val = _to_float(settlement_price) or price_val
+        # _fmt_num, а не округление до рубля: на неполной оплате у базы есть
+        # копейки, и без них «основная сумма + комиссия» не сойдётся с итогом.
+        price_fmt = _fmt_num(base_val) if base_val else price_str
 
         # ── Два курса и две суммы в валюте ─────────────────────────────────
         # Рублёвая сумма зафиксирована договором купли-продажи и не меняется.
@@ -1521,7 +1564,7 @@ class DocumentBuilder:
         cash_val = _to_float(data.get("Сумма выдана (USD)")
                              or data.get("cash_paid_amount"))
         if not cash_val:
-            cash_val = order_amount(price_val, rate_fact)
+            cash_val = order_amount(base_val, rate_fact)
 
         cash_fmt  = _fmt_num(cash_val) if cash_val else ""
         order_fmt = _fmt_num(order_val) if order_val else ""
@@ -1535,15 +1578,20 @@ class DocumentBuilder:
         # Комиссия = ЦЕНА_ЦИФРАМИ × КОМИССИЯ% / 100, база — сумма Поручения
         # (car_price). Считаем здесь, а не в каждом build_*, чтобы акт, отчёт
         # и счёт никогда не разошлись в арифметике.
-        commission_val = round(price_val * commission_pct / 100, 2)
-        total_val      = round(price_val + commission_val, 2)
+        commission_val = round(base_val * commission_pct / 100, 2)
+        total_val      = round(base_val + commission_val, 2)
 
         # ── Проверка арифметики сделки ─────────────────────────────────────
         # Комиссия и итог считаются здесь же, поэтому сойтись обязаны всегда.
         # А вот каждая пара «сумма в валюте — курс» проверяется отдельно:
         # обе обязаны сходиться к одной и той же рублёвой цене.
+        # Пары сверяются с РАЗНЫМИ базами: Поручение посчитано по цене ДКП и
+        # к ней же обязано сходиться, а наличные — к базе документа. При полной
+        # оплате обе базы совпадают, и проверка остаётся прежней.
         _check_amounts(price_val, [
             (order_val, rate_order, "поручение"),
+        ], output_name)
+        _check_amounts(base_val, [
             (cash_val,  rate_fact,  "расчёт наличными"),
         ], output_name)
 
@@ -1605,7 +1653,12 @@ class DocumentBuilder:
 
             # Цена и оплата
             "{{ЦЕНА_ЦИФРАМИ}}":            price_fmt,
-            "{{ЦЕНА_ПРОПИСЬЮ}}":           data.get("car_price_words", ""),
+            # Пропись базы: журнальная car_price_words относится к цене ДКП,
+            # поэтому годится только когда база равна ей. В остальных случаях
+            # (и когда колонка пуста) считаем по числу.
+            "{{ЦЕНА_ПРОПИСЬЮ}}":           ((data.get("car_price_words", "") or "").strip()
+                                            if abs(base_val - price_val) <= 0.01
+                                            else "") or _words_rub_plain(base_val),
             "{{ВАЛЮТА}}":                  data.get("currency", "рублей"),
             # Фактические — расписка, акт, отчёт (документы дня расчёта)
             "{{СУММА_НАЛИЧНЫМИ}}":          cash_fmt,
