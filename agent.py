@@ -3448,6 +3448,146 @@ VIN: ...
         return {"checked": len(statuses), "updated": updated,
                 "skipped": skipped, "statuses": statuses}
 
+    # ══ РАЗОВАЯ ПЕРЕСБОРКА КОМПЛЕКТОВ ПО СТАРЫМ СДЕЛКАМ ═══════════════════
+    # Добавлено 10.09.2026: после замены шаблонов (формат A4, счёт v2,
+    # seller_inn, база расчёта закрывающих по факту — см. память проекта,
+    # bot-documents-rules / closing-docs-partial-payment) Илья вручную убрал
+    # старые файлы из папок сделок в архивную папку на Drive. Кандидат на
+    # пересборку — сделка, в чьей папке Drive нет ни одного файла (кроме
+    # подпапки «Сканы», которую не трогаем): значит, старые документы уже
+    # унесены и место свободно. Заливка всегда создаёт новый файл (Drive не
+    # заменяет по имени, см. drive_service.upload_file), поэтому пересборка
+    # не рискует ничего перезаписать — только добавляет комплект в пустую
+    # папку.
+
+    async def find_deals_missing_docs(self) -> dict:
+        """Кандидаты на пересборку: у кого папка Drive пуста (без «Сканы»).
+
+        Один проход по Drive (list_docs_bulk) вместо запроса на каждую
+        сделку — как refresh_scans_bulk для сканов. Отменённые сделки в
+        candidates не попадают (пересобирать для них документы незачем),
+        но перечислены отдельно на случай, если Илья всё же попросит.
+        """
+        deals = await self.sheets.get_all_deals()
+
+        folder_of  = {}
+        no_folder  = []
+        cancelled  = []
+        for d in deals:
+            num = (d.get("Номер договора") or "").strip()
+            if not num:
+                continue
+            if (d.get("Статус") or "").strip() == "отменена":
+                cancelled.append(num)
+                continue
+            link = str(d.get("Папка Drive") or "")
+            folder_id = (link.split("/folders/")[-1].split("?")[0]
+                         if "/folders/" in link else "")
+            if folder_id:
+                folder_of[num] = folder_id
+            else:
+                no_folder.append(num)
+
+        by_folder = await self.drive.list_docs_bulk(list(folder_of.values()))
+
+        FOLDER_MIME = "application/vnd.google-apps.folder"
+        candidates, has_docs = [], []
+        for num, folder_id in folder_of.items():
+            entries    = by_folder.get(folder_id, [])
+            real_files = [e for e in entries if e.get("mimeType") != FOLDER_MIME]
+            (candidates if not real_files else has_docs).append(num)
+
+        return {
+            "candidates": candidates,
+            "has_docs":   has_docs,
+            "no_folder":  no_folder,
+            "cancelled":  cancelled,
+        }
+
+    async def regenerate_missing_docs_impl(self, numbers: list, do_closing: bool = True,
+                                           progress_cb=None) -> dict:
+        """Пересобирает базовый пакет (+ закрывающие) по списку сделок.
+
+        Вызывает те же точки входа, что и кнопки в чате — тул `generate_docs`
+        (напрямую через _execute_tool, без LLM: только он умеет собрать
+        АГ+ДКП+Счёт по номеру) и build_receipt_impl/build_act_impl/
+        build_report_impl — но без интерактивных вопросов run_doc_impl:
+        прогон не в чате, спрашивать недостающее «Дата расчёта»/«Фактический
+        курс» некого. Такой сделке закрывающие просто не делаются, причина
+        уходит в отчёт вместо вопроса.
+
+        progress_cb(номер, i, total) — опциональный async-колбэк для отчёта
+        о ходе долгого прогона (сотни сделок — это докx+pdf+заливка на Drive
+        по 3-6 документов на каждую, быстро не бывает).
+        """
+        self._pending_check = None  # не унаследовать чужой кэш чужой сделки
+
+        base_ok, base_error = [], {}
+        closing_ok, closing_skipped, closing_error = {}, {}, {}
+
+        CLOSING_STEPS = [
+            (self.build_receipt_impl, "расписка"),
+            (self.build_act_impl,     "акт"),
+            (self.build_report_impl,  "отчёт агента"),
+        ]
+
+        total = len(numbers)
+        for i, num in enumerate(numbers, 1):
+            if progress_cb:
+                try:
+                    await progress_cb(num, i, total)
+                except Exception:
+                    pass
+
+            try:
+                result = await self._execute_tool("generate_docs", {
+                    "contract_number": num, "doc_type": "all",
+                })
+                if result.get("file"):
+                    base_ok.append(num)
+                else:
+                    base_error[num] = result.get("message", "неизвестная ошибка")
+                    continue  # без базового пакета закрывающие тоже смысла не имеют
+            except Exception as e:
+                logger.error(f"Пересборка {num}: ошибка базового пакета — {e}", exc_info=True)
+                base_error[num] = str(e)
+                continue
+
+            if not do_closing:
+                continue
+
+            done = []
+            for impl, label in CLOSING_STEPS:
+                try:
+                    result = await impl(num)
+                except Exception as e:
+                    logger.error(f"Пересборка {num}: ошибка {label} — {e}", exc_info=True)
+                    closing_error[num] = f"{label}: {e}"
+                    break
+                if result.get("error"):
+                    # needs (нет даты расчёта/курса) или платежей вообще нет —
+                    # нормальный статус старой сделки, а не сбой кода.
+                    reason = str(result["error"]).strip().splitlines()[0]
+                    closing_skipped[num] = f"{label}: {reason}"
+                    break
+                done.append(label)
+            if done:
+                closing_ok[num] = done
+
+            # Мягкая пауза между сделками: за один прогон это Drive-заливки и
+            # LibreOffice-конвертации по 3-6 файлов на сделку, не хочется
+            # упереться в квоту Google в первые же минуты.
+            await asyncio.sleep(1)
+
+        return {
+            "total":           total,
+            "base_ok":         base_ok,
+            "base_error":      base_error,
+            "closing_ok":      closing_ok,
+            "closing_skipped": closing_skipped,
+            "closing_error":   closing_error,
+        }
+
     async def build_act_impl(self, contract_number: str) -> dict:
         """Формирует акт выполненных услуг по сделке.
 

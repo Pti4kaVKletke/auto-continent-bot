@@ -362,6 +362,55 @@ class GoogleDriveService:
             logger.error(f"Ошибка чтения файлов папки {folder_id}: {e}", exc_info=True)
             return []
 
+    async def list_docs_bulk(self, deal_folder_ids: list) -> dict:
+        """{id папки сделки: [{"name":.., "mimeType":..}]} — прямое содержимое
+        папки сделки (файлы И подпапки, например «Сканы»), одним проходом.
+
+        Добавлено 10.09.2026 для разовой пересборки комплектов документов по
+        старым сделкам новыми шаблонами: нужно быстро отличить папку с уже
+        убранными в архив документами (пустую, не считая «Сканы») от папки,
+        где документы ещё лежат — не делая запрос на Drive по каждой сделке.
+        Как list_scans_bulk — пачками по 50 родителей вместо одного запроса
+        на сделку. Подпапки в ответе ЕСТЬ (по mimeType их отсеивает вызывающий
+        код) — здесь, в отличие от list_scans_bulk, важно само их наличие,
+        чтобы не путать «папки нет» и «папка пуста».
+        """
+        ids = [i for i in dict.fromkeys(deal_folder_ids) if i]
+        if not ids:
+            return {}
+
+        def _do():
+            svc = self.service
+            by_folder = {i: [] for i in ids}
+            BATCH = 50   # длина q ограничена, 50 родителей влезают с запасом
+            for i in range(0, len(ids), BATCH):
+                chunk = ids[i:i + BATCH]
+                q = ("(" + " or ".join(f"'{fid}' in parents" for fid in chunk) +
+                     ") and trashed=false")
+                token = None
+                while True:
+                    res = svc.files().list(
+                        q=q, fields="nextPageToken, files(name,mimeType,parents)",
+                        pageSize=1000, pageToken=token,
+                        supportsAllDrives=True, includeItemsFromAllDrives=True,
+                    ).execute()
+                    for f in res.get("files", []):
+                        for parent in f.get("parents", []) or []:
+                            if parent in by_folder:
+                                by_folder[parent].append(
+                                    {"name": f.get("name", ""),
+                                     "mimeType": f.get("mimeType", "")})
+                    token = res.get("nextPageToken")
+                    if not token:
+                        break
+            return by_folder
+
+        try:
+            return await asyncio.to_thread(_do)
+        except Exception as e:
+            logger.error(f"Ошибка массового чтения папок сделок с Drive: {e}", exc_info=True)
+            return {}
+
     async def download_file_bytes(self, file_id: str) -> bytes:
         """Скачивает содержимое файла с Drive в память (без сохранения на диск)."""
         def _do():

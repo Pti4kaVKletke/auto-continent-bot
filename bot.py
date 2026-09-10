@@ -337,6 +337,151 @@ async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ── Пересборка комплектов по старым сделкам (разовая миграция, 10.09.2026) ──
+
+def _format_regen_report(summary: dict) -> str:
+    """Текстовый отчёт по итогам agent.regenerate_missing_docs_impl."""
+    total           = summary["total"]
+    base_ok         = summary["base_ok"]
+    base_error      = summary["base_error"]
+    closing_ok      = summary["closing_ok"]
+    closing_skipped = summary["closing_skipped"]
+    closing_error   = summary["closing_error"]
+
+    closing_full    = sum(1 for v in closing_ok.values() if len(v) == 3)
+    closing_partial = sum(1 for v in closing_ok.values() if 0 < len(v) < 3)
+
+    lines = [
+        f"🧾 *Пересборка завершена* — сделок в прогоне: {total}\n",
+        f"✅ Базовый пакет (АГ + ДКП + Счёт): {len(base_ok)}",
+    ]
+    if base_error:
+        lines.append(f"❌ Ошибка базового пакета: {len(base_error)}")
+    lines.append(f"✅ Закрывающие полностью (расписка+акт+отчёт): {closing_full}")
+    if closing_partial:
+        lines.append(f"◐ Закрывающие частично (упёрлись на середине): {closing_partial}")
+    if closing_skipped:
+        lines.append(f"⏭ Закрывающие не делали — не хватает данных: {len(closing_skipped)}")
+    if closing_error:
+        lines.append(f"❌ Ошибка при сборке закрывающих: {len(closing_error)}")
+
+    def _dump(title, d, limit=15):
+        out = [f"\n*{title}:*"]
+        for num, msg in list(d.items())[:limit]:
+            out.append(f"  {num}: {str(msg)[:150]}")
+        if len(d) > limit:
+            out.append(f"  …и ещё {len(d) - limit}")
+        return out
+
+    if base_error:
+        lines += _dump("Ошибки базового пакета", base_error)
+    if closing_skipped:
+        lines += _dump("Закрывающие пропущены", closing_skipped)
+    if closing_error:
+        lines += _dump("Ошибки закрывающих", closing_error)
+
+    text = "\n".join(lines)
+    if len(text) > 3900:
+        text = text[:3800] + "\n\n_(отчёт обрезан — подробности в логах Railway)_"
+    return text
+
+
+_REGEN_DEFAULT_BATCH = 10  # безопасный размер прогона по умолчанию, см. /regen_docs
+
+
+async def cmd_regen_docs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /regen_docs [N|все] — пересборка комплекта документов по
+    сделкам, у которых папка на Drive пуста (старые файлы Илья убрал в архив
+    вручную после замены шаблонов). Сначала — сухой прогон со списком
+    кандидатов и подтверждением, сама пересборка запускается только по кнопке.
+
+    Без аргумента берёт первые _REGEN_DEFAULT_BATCH кандидатов, а не всё
+    сразу — при сбое посреди прогона (сеть, квота Drive, рестарт на Railway)
+    проще понять, что уже сделано, и не гнать сотни сделок одним махом.
+    /regen_docs 30 — первые 30. /regen_docs все — без ограничения.
+
+    Упавший на середине прогон не теряет прогресс: то, что уже собрано,
+    лежит в Drive и в журнале, а следующий /regen_docs сам не увидит эти
+    сделки среди кандидатов (их папка уже не пустая) — можно просто
+    запустить снова, лишнего не пересоберёт.
+    """
+    if not await check_access(update):
+        await update.message.reply_text("⛔ Доступ запрещён.")
+        return
+
+    if context.bot_data.get("regen_docs_running"):
+        await update.message.reply_text("⏳ Пересборка уже идёт, дождитесь отчёта.")
+        return
+
+    limit = _REGEN_DEFAULT_BATCH
+    if context.args:
+        raw = context.args[0].strip().lower()
+        if raw in ("все", "всё", "all"):
+            limit = None
+        else:
+            try:
+                limit = max(1, int(raw))
+            except ValueError:
+                await update.message.reply_text(
+                    "Не понял число. Примеры: /regen_docs, /regen_docs 30, /regen_docs все"
+                )
+                return
+
+    await update.message.reply_text("🔍 Проверяю папки сделок на Drive...")
+    info = await typing_while(update.effective_chat.id, context,
+                              agent.find_deals_missing_docs())
+
+    all_candidates = info["candidates"]
+    if not all_candidates:
+        extra = ""
+        if info["no_folder"]:
+            extra = f"\nБез ссылки на папку Drive: {len(info['no_folder'])}"
+        await update.message.reply_text(
+            "✅ Пустых папок не найдено — пересобирать нечего.\n"
+            f"Сделок с документами: {len(info['has_docs'])}{extra}"
+        )
+        return
+
+    run_candidates = all_candidates if limit is None else all_candidates[:limit]
+    remaining = len(all_candidates) - len(run_candidates)
+
+    lines = [
+        "🧾 *Пересборка документов*\n",
+        f"Пустых папок всего (кандидаты): *{len(all_candidates)}*",
+    ]
+    if remaining > 0:
+        lines.append(
+            f"В этом прогоне: *{len(run_candidates)}* — лимит по умолчанию "
+            f"{_REGEN_DEFAULT_BATCH}. Чтобы обработать сразу все — /regen_docs все, "
+            "другое число — /regen_docs <число>."
+        )
+    lines.append(f"С документами — не тронем: {len(info['has_docs'])}")
+    if info["no_folder"]:
+        sample = ", ".join(info["no_folder"][:10])
+        more = "…" if len(info["no_folder"]) > 10 else ""
+        lines.append(f"⚠️ Без ссылки на папку Drive (пропущены): {len(info['no_folder'])} — {sample}{more}")
+    if info["cancelled"]:
+        lines.append(f"Отменённые сделки — не трогаем: {len(info['cancelled'])}")
+
+    sample = ", ".join(run_candidates[:15])
+    more = "…" if len(run_candidates) > 15 else ""
+    lines.append(f"\nНомера в этом прогоне: {sample}{more}")
+    lines.append(
+        "\nПо каждой: агентский договор + ДКП + счёт, затем расписка/акт/отчёт "
+        "— если хватает данных (дата расчёта, фактический курс). Чего не хватит "
+        "— попадёт в отчёт, ничего спрашивать не будет."
+    )
+    if remaining > 0:
+        lines.append(f"\nПосле этого прогона останется ещё {remaining} — обработаете следующим /regen_docs.")
+
+    context.user_data["regen_docs_candidates"] = run_candidates
+    kb = [
+        [InlineKeyboardButton(f"▶️ Запустить по {len(run_candidates)}", callback_data="regendocs:run")],
+        [InlineKeyboardButton("❌ Отмена", callback_data="regendocs:cancel")],
+    ]
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown",
+                                    reply_markup=InlineKeyboardMarkup(kb))
+
 async def daily_backup_job(context: ContextTypes.DEFAULT_TYPE):
     """Ежедневный автобэкап + ротация. Успех — тихо в логи, ошибка — алерт в чат."""
     logger.info("Запуск ежедневного бэкапа")
@@ -1309,6 +1454,55 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             await query.message.reply_text(text, parse_mode="Markdown")
             return
+        return
+
+    # ── Пересборка документов по старым сделкам ─────────────────────────────
+    if data.startswith("regendocs:"):
+        action = data.split(":", 1)[1]
+        await query.edit_message_reply_markup(reply_markup=None)
+
+        if action == "cancel":
+            await query.message.reply_text("Отменено.")
+            return
+
+        if action != "run":
+            return
+
+        candidates = context.user_data.get("regen_docs_candidates") or []
+        if not candidates:
+            await query.message.reply_text(
+                "Список кандидатов устарел (или бот перезапускался) — "
+                "запустите /regen_docs заново."
+            )
+            return
+        if context.bot_data.get("regen_docs_running"):
+            await query.message.reply_text("⏳ Пересборка уже идёт.")
+            return
+
+        context.bot_data["regen_docs_running"] = True
+        total = len(candidates)
+        await query.message.reply_text(
+            f"🚀 Начинаю пересборку по {total} сделкам. Буду отчитываться каждые 10."
+        )
+
+        progress = {"last": 0}
+
+        async def _progress(num, i, tot):
+            if i == 1 or i == tot or i - progress["last"] >= 10:
+                progress["last"] = i
+                await query.message.reply_text(f"⏳ {i}/{tot} — сделка {num}...")
+
+        try:
+            summary = await agent.regenerate_missing_docs_impl(candidates, progress_cb=_progress)
+        except Exception as e:
+            logger.error(f"Пересборка документов упала: {e}", exc_info=True)
+            await query.message.reply_text(f"⚠️ Прогон прерван ошибкой: {e}")
+            context.bot_data["regen_docs_running"] = False
+            return
+
+        context.bot_data["regen_docs_running"] = False
+        context.user_data.pop("regen_docs_candidates", None)
+        await query.message.reply_text(_format_regen_report(summary), parse_mode="Markdown")
         return
 
     # ── Статистика: выбор периода ────────────────────────────────────────────
@@ -2894,6 +3088,7 @@ def main():
     app.add_handler(CommandHandler("clear",           clear_history))
     app.add_handler(CommandHandler("del_instruction", del_instruction))
     app.add_handler(CommandHandler("backup",          cmd_backup))
+    app.add_handler(CommandHandler("regen_docs",      cmd_regen_docs))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, handle_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
