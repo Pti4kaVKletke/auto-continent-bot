@@ -8,6 +8,7 @@ from pathlib import Path
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+from telegram.error import BadRequest
 
 AGENT_VERSION = os.environ.get("AGENT_VERSION", "v1")
 if AGENT_VERSION == "v2":
@@ -339,6 +340,37 @@ async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── Пересборка комплектов по старым сделкам (разовая миграция, 10.09.2026) ──
 
+def _md_escape(text: str) -> str:
+    """Экранирует спецсимволы старого Markdown (_,*,`,[) в тексте, который
+    может прийти откуда угодно — сообщение исключения, текст ошибки Drive,
+    содержимое ячейки журнала — и попасть в сообщение с parse_mode="Markdown".
+    Непарный спецсимвол в таком тексте роняет отправку целиком ("Can't parse
+    entities") — ловили это на /regen_docs, когда несколько причин пропуска
+    в одном отчёте в сумме давали нечётное число подчёркиваний.
+    """
+    text = str(text)
+    for ch in ("\\", "_", "*", "`", "["):
+        text = text.replace(ch, "\\" + ch)
+    return text
+
+
+async def _safe_reply(message, text, **kwargs):
+    """reply_text с фоллбэком на обычный текст, если Markdown не распарсился.
+
+    Экранирование (_md_escape) закрывает известные места, но не гарантирует
+    вообще все — а уронить итоговый отчёт после долгого прогона на кривой
+    сущности хуже, чем показать его без форматирования.
+    """
+    try:
+        await message.reply_text(text, **kwargs)
+    except BadRequest as e:
+        if "parse" in str(e).lower() or "entit" in str(e).lower():
+            kwargs.pop("parse_mode", None)
+            await message.reply_text(text, **kwargs)
+        else:
+            raise
+
+
 def _format_regen_report(summary: dict) -> str:
     """Текстовый отчёт по итогам agent.regenerate_missing_docs_impl."""
     total           = summary["total"]
@@ -368,7 +400,7 @@ def _format_regen_report(summary: dict) -> str:
     def _dump(title, d, limit=15):
         out = [f"\n*{title}:*"]
         for num, msg in list(d.items())[:limit]:
-            out.append(f"  {num}: {str(msg)[:150]}")
+            out.append(f"  {_md_escape(num)}: {_md_escape(str(msg)[:150])}")
         if len(d) > limit:
             out.append(f"  …и ещё {len(d) - limit}")
         return out
@@ -452,8 +484,8 @@ async def cmd_regen_docs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if remaining > 0:
         lines.append(
             f"В этом прогоне: *{len(run_candidates)}* — лимит по умолчанию "
-            f"{_REGEN_DEFAULT_BATCH}. Чтобы обработать сразу все — /regen_docs все, "
-            "другое число — /regen_docs <число>."
+            f"{_REGEN_DEFAULT_BATCH}. Чтобы обработать сразу все — `/regen_docs все`, "
+            "другое число — `/regen_docs <число>`."
         )
     lines.append(f"С документами — не тронем: {len(info['has_docs'])}")
     if info["no_folder"]:
@@ -472,15 +504,15 @@ async def cmd_regen_docs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "— попадёт в отчёт, ничего спрашивать не будет."
     )
     if remaining > 0:
-        lines.append(f"\nПосле этого прогона останется ещё {remaining} — обработаете следующим /regen_docs.")
+        lines.append(f"\nПосле этого прогона останется ещё {remaining} — обработаете следующим `/regen_docs`.")
 
     context.user_data["regen_docs_candidates"] = run_candidates
     kb = [
         [InlineKeyboardButton(f"▶️ Запустить по {len(run_candidates)}", callback_data="regendocs:run")],
         [InlineKeyboardButton("❌ Отмена", callback_data="regendocs:cancel")],
     ]
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown",
-                                    reply_markup=InlineKeyboardMarkup(kb))
+    await _safe_reply(update.message, "\n".join(lines), parse_mode="Markdown",
+                      reply_markup=InlineKeyboardMarkup(kb))
 
 async def daily_backup_job(context: ContextTypes.DEFAULT_TYPE):
     """Ежедневный автобэкап + ротация. Успех — тихо в логи, ошибка — алерт в чат."""
@@ -1502,7 +1534,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         context.bot_data["regen_docs_running"] = False
         context.user_data.pop("regen_docs_candidates", None)
-        await query.message.reply_text(_format_regen_report(summary), parse_mode="Markdown")
+        await _safe_reply(query.message, _format_regen_report(summary), parse_mode="Markdown")
         return
 
     # ── Статистика: выбор периода ────────────────────────────────────────────
