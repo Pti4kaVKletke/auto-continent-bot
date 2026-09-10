@@ -1,4 +1,5 @@
 import os
+import io
 import json
 import logging
 import asyncio
@@ -9,7 +10,7 @@ from datetime import datetime
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 
 logger = logging.getLogger(__name__)
 
@@ -329,6 +330,54 @@ class GoogleDriveService:
         except Exception as e:
             logger.error(f"Ошибка массового чтения сканов с Drive: {e}", exc_info=True)
             return {}
+
+    async def list_folder_files(self, folder_id: str) -> list:
+        """Плоский список файлов папки (без подпапок): [{id, name, mimeType}].
+
+        Добавлено 10.09.2026 для разового разбора деклараций (см.
+        [[bot-documents-rules]], seller_inn) — list_scans_bulk даёт только
+        имена и оптимизирована под массовый проход по многим сделкам разом,
+        а здесь нужен ещё file id для скачивания, и сделок в разовом проходе
+        немного, так что простой запрос на папку дешевле, чем городить bulk.
+        """
+        def _do():
+            files = []
+            token = None
+            while True:
+                res = self.service.files().list(
+                    q=f"'{folder_id}' in parents and trashed=false",
+                    fields="nextPageToken, files(id,name,mimeType)",
+                    pageSize=1000, pageToken=token,
+                    supportsAllDrives=True, includeItemsFromAllDrives=True,
+                ).execute()
+                files.extend(res.get("files", []))
+                token = res.get("nextPageToken")
+                if not token:
+                    break
+            return files
+
+        try:
+            return await asyncio.to_thread(_do)
+        except Exception as e:
+            logger.error(f"Ошибка чтения файлов папки {folder_id}: {e}", exc_info=True)
+            return []
+
+    async def download_file_bytes(self, file_id: str) -> bytes:
+        """Скачивает содержимое файла с Drive в память (без сохранения на диск)."""
+        def _do():
+            request = self.service.files().get_media(fileId=file_id, supportsAllDrives=True)
+            buf = io.BytesIO()
+            downloader = MediaIoBaseDownload(buf, request)
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+            return buf.getvalue()
+
+        try:
+            return await asyncio.to_thread(_do)
+        except Exception as e:
+            logger.error(f"Ошибка скачивания файла {file_id}: {e}", exc_info=True)
+            return b""
 
     async def _get_or_create_folder(self, name: str, parent_id: str) -> str:
         def _do_find_or_create():

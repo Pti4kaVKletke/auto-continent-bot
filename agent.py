@@ -3250,6 +3250,147 @@ VIN: ...
 
         return await _asyncio.to_thread(_list)
 
+    # ══ РАЗОВЫЙ РАЗБОР ДЕКЛАРАЦИЙ: ИНН продавца для старых сделок ═══════════
+    # Добавлено 10.09.2026 (см. память проекта: bot-documents-rules, колонка
+    # seller_inn). Файл декларации у каждой сделки лежит в «Сканы» под именем
+    # «Декларация_<последние 6 цифр VIN>» (правило Ильи). Бот открывает его,
+    # просит Claude вернуть только строку ИНН из поля «4. Плательщик» ТПО/
+    # декларации, и ПЕРЕСЧИТЫВАЕТ дату рождения по той же формуле, что и при
+    # обычном создании сделки — если она не совпадает с уже сохранённой в
+    # журнале seller_birth_date, ИНН не пишем, а сделку выносим в список на
+    # ручную проверку (файл мог оказаться не тот, OCR мог ошибиться).
+    # Запускается разово из bot.py при старте; повторный проход не трогает
+    # уже заполненные сделки (кандидатами считаются только с пустым seller_inn).
+    _INN_EXTRACT_PROMPT = (
+        "Это скан таможенного документа (ТПО или пассажирская таможенная "
+        "декларация). В поле «4. Плательщик» есть строка вида "
+        "«ИНН:XXXXXXXXXXXXXX» — 14 цифр. Верни ОТВЕТОМ ТОЛЬКО эти 14 цифр, "
+        "без пробелов, без слова ИНН и без какого-либо другого текста. "
+        "Если такой строки нет или документ нечитаем — верни ровно слово "
+        "NOT_FOUND и ничего больше."
+    )
+
+    @staticmethod
+    def _birth_date_from_inn(inn: str) -> str | None:
+        """Дата рождения по формуле ИНН КР — см. системный промпт create_contract."""
+        if not re.fullmatch(r"\d{14}", inn or ""):
+            return None
+        dd, mm, yyyy = inn[1:3], inn[3:5], inn[5:9]
+        try:
+            d, m, y = int(dd), int(mm), int(yyyy)
+        except ValueError:
+            return None
+        if not (1 <= d <= 31 and 1 <= m <= 12 and 1900 <= y <= 2015):
+            return None
+        return f"{dd}.{mm}.{yyyy}"
+
+    async def backfill_seller_inn_impl(self) -> dict:
+        """Разовый проход по журналу: заполняет seller_inn из деклараций на Drive."""
+        deals = await self.sheets.find_deal("")
+        candidates = []
+        for d in deals:
+            number = str(d.get("Номер договора", "")).strip()
+            if not number:
+                continue
+            if str(d.get("seller_inn", "")).strip():
+                continue  # уже заполнено — не трогаем
+            candidates.append(d)
+
+        filled: dict = {}
+        skipped: list = []
+
+        for d in candidates:
+            number = str(d.get("Номер договора", "")).strip()
+            vin = re.sub(r"[^A-Za-z0-9]", "", str(d.get("car_vin") or "")).upper()
+            if len(vin) < 6:
+                skipped.append((number, "нет VIN в таблице"))
+                continue
+            vin6 = vin[-6:]
+
+            try:
+                _, files = await self.list_scan_files(number)
+            except Exception as e:
+                skipped.append((number, f"ошибка чтения папки Drive: {e}"))
+                continue
+
+            match = None
+            for f in files:
+                norm = _normalize_scan_name(f.get("name", ""))
+                if "декларация" in norm and vin6.lower() in norm:
+                    match = f
+                    break
+            if not match:
+                skipped.append((number, "файл декларации не найден в папке «Сканы»"))
+                continue
+
+            data = await self.drive.download_file_bytes(match["id"])
+            if not data:
+                skipped.append((number, "не удалось скачать файл с Drive"))
+                continue
+
+            ext = Path(match.get("name", "")).suffix.lower()
+            content = []
+            if ext in (".jpg", ".jpeg", ".png", ".webp"):
+                media_map = {".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                             ".png": "image/png", ".webp": "image/webp"}
+                content.append({
+                    "type": "image",
+                    "source": {"type": "base64",
+                               "media_type": media_map.get(ext, "image/jpeg"),
+                               "data": base64.standard_b64encode(data).decode("utf-8")},
+                })
+            elif ext == ".pdf":
+                content.append({
+                    "type": "document",
+                    "source": {"type": "base64", "media_type": "application/pdf",
+                               "data": base64.standard_b64encode(data).decode("utf-8")},
+                })
+            else:
+                skipped.append((number, f"неизвестный формат файла ({match.get('name', '')})"))
+                continue
+            content.append({"type": "text", "text": self._INN_EXTRACT_PROMPT})
+
+            try:
+                resp = await self.client.messages.create(
+                    model=self.model,
+                    max_tokens=64,
+                    messages=[{"role": "user", "content": content}],
+                )
+                answer = "".join(
+                    block.text for block in resp.content if getattr(block, "type", "") == "text"
+                ).strip()
+            except Exception as e:
+                skipped.append((number, f"ошибка запроса к Claude: {e}"))
+                continue
+
+            m = re.search(r"\d{14}", answer.replace(" ", ""))
+            if not m:
+                skipped.append((number, f"ИНН не распознан (ответ: {answer[:80]})"))
+                continue
+            inn = m.group(0)
+
+            computed_bd = self._birth_date_from_inn(inn)
+            stored_bd = str(d.get("seller_birth_date", "")).strip()
+            if not computed_bd or computed_bd != stored_bd:
+                skipped.append((
+                    number,
+                    f"дата рождения не совпала (по ИНН {inn} → {computed_bd or '—'}, "
+                    f"в таблице {stored_bd or '—'})"
+                ))
+                continue
+
+            filled[number] = inn
+
+        if filled:
+            await self.sheets.batch_update_column("seller_inn", filled)
+
+        return {
+            "total": len(deals),
+            "candidates": len(candidates),
+            "filled": len(filled),
+            "skipped": skipped,
+        }
+
     async def refresh_scan_status(self, contract_number: str) -> str:
         """
         Пересчитывает статус сканов по папке Drive и пишет его в журнал.

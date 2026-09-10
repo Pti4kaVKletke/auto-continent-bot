@@ -2938,6 +2938,54 @@ def main():
                 logger.error(f"Миграция колонок журнала не удалась: {e}", exc_info=True)
         app.job_queue.run_once(_migrate_requisites_job, when=5, name="migrate_requisites")
 
+    # ── Разовый разбор деклараций: ИНН продавца для старых сделок ────────
+    # Добавлено 10.09.2026. НЕ идемпотентно по себе (каждый вызов заново
+    # обходит журнал и зовёт Claude по нераспознанным сделкам) — поэтому
+    # запуск защищён маркером на персистентном томе /data: реально
+    # отрабатывает только на первом деплое после добавления, дальше молча
+    # выходит. Результат (сколько заполнено, что не разобралось) шлётся
+    # в Telegram, а не только в лог — список пропущенных сделок нужен Илье
+    # для ручной проверки.
+    if app.job_queue is not None:
+        _INN_BACKFILL_MARKER = Path("/data/.seller_inn_backfill_done")
+
+        async def _backfill_seller_inn_job(ctx):
+            from datetime import datetime as _dt
+            if _INN_BACKFILL_MARKER.exists():
+                logger.info("Разбор деклараций (ИНН продавца): уже выполнялся, пропускаю")
+                return
+            try:
+                stats = await agent.backfill_seller_inn_impl()
+                logger.info(f"Разбор деклараций (ИНН продавца): {stats}")
+
+                lines = [
+                    "🔁 Разовый разбор деклараций (ИНН продавца) завершён.",
+                    f"Заполнено: {stats['filled']} из {stats['candidates']} "
+                    f"кандидатов (всего сделок в журнале: {stats['total']}).",
+                ]
+                if stats["skipped"]:
+                    lines.append(f"\nНе удалось определить ИНН для {len(stats['skipped'])} сделок:")
+                    for num, reason in stats["skipped"]:
+                        lines.append(f"  — {num}: {reason}")
+                text = "\n".join(lines)
+
+                for i in range(0, len(text), 3500):
+                    await ctx.bot.send_message(chat_id=ALLOWED_CHAT_ID, text=text[i:i + 3500])
+
+                _INN_BACKFILL_MARKER.parent.mkdir(parents=True, exist_ok=True)
+                _INN_BACKFILL_MARKER.write_text(_dt.now().isoformat())
+            except Exception as e:
+                logger.error(f"Разбор деклараций (ИНН продавца) не удался: {e}", exc_info=True)
+                try:
+                    await ctx.bot.send_message(
+                        chat_id=ALLOWED_CHAT_ID,
+                        text=f"⚠️ Разовый разбор деклараций (ИНН продавца) упал с ошибкой: {e}",
+                    )
+                except Exception:
+                    pass
+
+        app.job_queue.run_once(_backfill_seller_inn_job, when=15, name="backfill_seller_inn")
+
     logger.info("Бот запущен")
     app.run_polling()
 
