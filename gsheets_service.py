@@ -99,6 +99,12 @@ COLUMNS = [
     "passport_issued_date",
     "passport_code",
     "seller_name",
+    "seller_inn",       # ИНН продавца (14 цифр, строка "ИНН:" в поле "4.
+                        # Плательщик" ТПО/декларации) — тот же номер, из
+                        # которого считается seller_birth_date. НЕ путать с
+                        # seller_id_number (номер ID-карты, другая величина).
+                        # Колонка вставлена Ильёй вручную в таблице 10.09.2026
+                        # физически между «ФИО продавца» и «ID карта №».
     "seller_id_number",
     "seller_birth_date",
     "seller_address",

@@ -608,7 +608,7 @@ _COPY_FIELDS_BUYER = [
 ]
 _COPY_FIELDS_SELLER = [
     "seller_name", "seller_id_number", "seller_birth_date", "seller_address",
-    "seller_initials", "seller_id_issued_by", "seller_id_issued_date",
+    "seller_initials", "seller_id_issued_by", "seller_id_issued_date", "seller_inn",
 ]
 _COPY_FIELDS_BANK = [
     "account_type", "account_number", "account_currency",
@@ -703,7 +703,9 @@ def _format_copy_preview(source_num: str, mode: str, prepared: dict,
     if prepared.get("seller_name"):
         lines.append(f"🏭 Продавец: {prepared['seller_name']}")
         if prepared.get("seller_id_number"):
-            lines.append(f"   ИНН/ID: {prepared['seller_id_number']}")
+            lines.append(f"   ID карты: {prepared['seller_id_number']}")
+        if prepared.get("seller_inn"):
+            lines.append(f"   ИНН: {prepared['seller_inn']}")
 
     # Банк
     if prepared.get("account_number"):
@@ -876,6 +878,9 @@ seller_initials      — Фамилия + инициалы имени и отч�
 seller_id_number     — номер идентификационной карты
 seller_id_issued_by  — кем выдана карта
 seller_id_issued_date — дата выдачи карты (ДД.ММ.ГГГГ)
+seller_inn           — ИНН продавца, 14 цифр (строка "ИНН:" в поле "4. Плательщик"
+                        ТПО/декларации — та же строка, из которой считается
+                        seller_birth_date). Впиши её КАК ЕСТЬ, без пробелов.
 
 АВТОМОБИЛЬ:
 car_model       — марка и модель (Toyota RAV4)
@@ -928,7 +933,7 @@ corr_bank_acc    — ТОЛЬКО для corr: его корр. счёт, 20 ц�
 
 ОБЯЗАТЕЛЬНЫЕ поля (без них договор создавать НЕЛЬЗЯ):
 Покупатель: buyer_name, buyer_initials, buyer_birth_date, buyer_address, passport_series, passport_number, passport_issued_by, passport_issued_date, passport_code
-Продавец:   seller_name, seller_initials, seller_id_issued_date, seller_birth_date, seller_address, seller_id_number, seller_id_issued_by
+Продавец:   seller_name, seller_initials, seller_id_issued_date, seller_birth_date, seller_address, seller_id_number, seller_id_issued_by, seller_inn
 Автомобиль: car_model, car_vin, car_year, car_color, tpo_number, tpo_day, tpo_month, tpo_year
 Финансы:    car_price, car_price_words, currency, cash_currency, exchange_rate
             (cash_amount и cash_amount_words БОЛЬШЕ НЕ ОБЯЗАТЕЛЬНЫ — см. ниже про два курса)
@@ -1032,7 +1037,7 @@ buyer_name, buyer_birth_date, buyer_address, passport_series, passport_number, p
 
 
 4. Идентификационная карта КР — извлеки все поля продавца:
-seller_name, seller_birth_date, seller_address, seller_id_number, seller_id_issued_by, seller_id_issued_date
+seller_name, seller_birth_date, seller_address, seller_id_number, seller_id_issued_by, seller_id_issued_date, seller_inn
 
 ВАЖНО про seller_name (ФИО продавца):
 - В поле "4. Плательщик" ТПО ФИО записано ОДНОЙ СТРОКОЙ сразу после строки с "ИНН:",
@@ -1087,6 +1092,11 @@ seller_name, seller_birth_date, seller_address, seller_id_number, seller_id_issu
 
 - ОБЯЗАТЕЛЬНАЯ ПРОВЕРКА: перед заполнением seller_birth_date напиши себе мысленно
   каждую цифру ИНН с её позицией (1,2,3...) и убедись что взял правильные позиции.
+
+- ВАЖНО: сам ИНН (все 14 цифр, строка "ИНН:" из поля "4. Плательщик") ОБЯЗАТЕЛЬНО
+  сохрани отдельно как seller_inn — он идёт в журнал (колонка "seller_inn") и
+  не заменяет собой seller_id_number (тот берётся из другой строки, "ПАСПОРТ: ID ...",
+  и это другой номер).
 
 - SANITY-CHECK ВОЗРАСТА: после вычисления даты рождения посчитай примерный возраст
   (2026 − ГГГГ). Если возраст получается меньше 15 или больше 90 лет — с большой
@@ -2219,7 +2229,7 @@ VIN: ...
                     "buyer_name","buyer_initials","buyer_birth_date","buyer_address",
                     "passport_series","passport_number","passport_issued_by","passport_issued_date","passport_code",
                     "seller_name","seller_initials","seller_birth_date","seller_address",
-                    "seller_id_number","seller_id_issued_by","seller_id_issued_date",
+                    "seller_id_number","seller_id_issued_by","seller_id_issued_date","seller_inn",
                     "car_model","car_vin","car_year","car_color","tpo_number","tpo_day","tpo_month","tpo_year",
                     "car_price","car_price_words","currency","cash_amount","cash_amount_words",
                     "cash_currency","exchange_rate","account_currency","account_number",
@@ -2430,7 +2440,7 @@ VIN: ...
                 "buyer_name","buyer_initials","buyer_birth_date","buyer_address",
                 "passport_series","passport_number","passport_issued_by","passport_issued_date","passport_code",
                 "seller_name","seller_initials","seller_birth_date","seller_address",
-                "seller_id_number","seller_id_issued_by","seller_id_issued_date",
+                "seller_id_number","seller_id_issued_by","seller_id_issued_date","seller_inn",
                 "car_model","car_vin","car_year","car_color","tpo_number","tpo_day","tpo_month","tpo_year",
                 "car_price","car_price_words","currency","cash_amount","cash_amount_words",
                 "cash_currency","exchange_rate","account_currency","account_number",
