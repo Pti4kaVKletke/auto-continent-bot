@@ -381,20 +381,30 @@ def amount_to_words_plain(amount) -> str:
     return f"{words} {frac:02d} {_plural(frac, 'цент', 'цента', 'центов')}"
 
 
-# ─── Варианты шаблона счёта ────────────────────────────────────────────────
-# Вёрстку счёта правят в Excel, и держать несколько бланков рядом безопаснее,
-# чем перезаписывать боевой файл. Вариант — это суффикс в имени шаблона:
+# ─── Единый вариант шаблонов (счёт + АГ/акт/отчёт/расписка) ───────────────
+# Вёрстку правят руками (Excel/Word), и держать новый бланк рядом со старым
+# безопаснее, чем перезаписывать боевой файл. Раньше у счёта и у
+# докс-комплекта были свои переключатели (INVOICE_TEMPLATE, DOC_TEMPLATE) —
+# объединены в один (11.09.2026): вариант один на все документы сделки,
+# «пол-комплекта на v1, пол-комплекта на v2» быть не может.
 #   invoice_template.xlsx     / invoice_template_direct.xlsx     → v1
 #   invoice_template_v2.xlsx  / invoice_template_direct_v2.xlsx  → v2
-# Какой печатать, решает настройка INVOICE_TEMPLATE (меню «⚙️ Настройки»).
+#   act_template.docx  и т.д. (без суффикса)                     → v1
+#   "act_template v2.docx"    и т.д. (пробел перед суффиксом)    → v2
+# Какой печатать, решает настройка TEMPLATE_VARIANT (меню «⚙️ Настройки»).
 
 # Поле внутри ячейки и разумные пределы стороны QR (в пикселях).
 QR_CELL_PADDING_PX = 6
 QR_MIN_PX          = 60
 QR_MAX_PX          = 300
 
-INVOICE_VARIANT_KEY     = "INVOICE_TEMPLATE"
-INVOICE_VARIANT_DEFAULT = "v1"
+TEMPLATE_VARIANT_KEY     = "TEMPLATE_VARIANT"
+TEMPLATE_VARIANT_DEFAULT = "v1"
+# contract_template(_direct) не входит в «обязательные» для докс-комплекта —
+# для него есть запасной вариант без шаблона (_generate_contract), поэтому
+# полнота комплекта не должна зависеть от его наличия.
+DOCX_REQUIRED_BASES = ("act_template", "otchet_agenta_template", "raspiska_template")
+DOCX_ALL_BASES      = ("contract_template", "contract_template_direct") + DOCX_REQUIRED_BASES
 
 
 def templates_dir() -> Path:
@@ -407,17 +417,21 @@ def invoice_template_name(variant: str, is_direct: bool) -> str:
     return f"{base}{suffix}.xlsx"
 
 
+def docx_template_name(base: str, variant: str) -> str:
+    suffix = "" if variant in ("", "v1", None) else f" {variant}"
+    return f"{base}{suffix}.docx"
+
+
 def invoice_variants() -> list:
-    """Варианты бланка, реально лежащие в templates/. Вариант считается
-    пригодным, только если есть оба шаблона — прямой и корреспондентский:
-    выбрать в настройках половину комплекта нельзя."""
+    """Варианты бланка счёта, реально лежащие в templates/. Вариант годится,
+    только если есть оба шаблона — прямой и корреспондентский."""
     tpl = templates_dir()
     found = set()
     for f in tpl.glob("invoice_template*.xlsx"):
         stem = f.stem
         for base in ("invoice_template_direct", "invoice_template"):
             if stem == base:
-                found.add(INVOICE_VARIANT_DEFAULT)
+                found.add(TEMPLATE_VARIANT_DEFAULT)
                 break
             if stem.startswith(base + "_"):
                 found.add(stem[len(base) + 1:])
@@ -426,24 +440,57 @@ def invoice_variants() -> list:
         v for v in sorted(found)
         if all((tpl / invoice_template_name(v, d)).exists() for d in (True, False))
     ]
-    return complete or [INVOICE_VARIANT_DEFAULT]
+    return complete or [TEMPLATE_VARIANT_DEFAULT]
 
 
-def invoice_variant() -> str:
-    """Текущий вариант: настройка в БД бота → env → v1.
-    Если выбранного комплекта в папке нет, берём первый доступный и пишем
-    предупреждение — счёт нужен здесь и сейчас, падать из-за настройки нельзя."""
+def docx_variants() -> list:
+    """Варианты докс-комплекта (АГ/акт/отчёт/расписка), реально лежащие в
+    templates/. Вариант годится, только если есть все три обязательных файла
+    (акт, отчёт, расписка) — АГ договор, в отличие от них, при отсутствии
+    шаблона всё равно соберётся (упрощённым генератором), поэтому его не
+    требуем."""
+    tpl = templates_dir()
+    anchor = "act_template"
+    found = set()
+    for f in tpl.glob(f"{anchor}*.docx"):
+        stem = f.stem
+        if stem == anchor:
+            found.add(TEMPLATE_VARIANT_DEFAULT)
+        elif stem.startswith(anchor + " "):
+            found.add(stem[len(anchor) + 1:])
+    complete = [
+        v for v in sorted(found)
+        if all((tpl / docx_template_name(b, v)).exists() for b in DOCX_REQUIRED_BASES)
+    ]
+    return complete or [TEMPLATE_VARIANT_DEFAULT]
+
+
+def template_variants() -> list:
+    """Варианты, полные СРАЗУ для обеих групп документов — только такие
+    можно предложить в единой настройке. Если v2 собран наполовину (скажем,
+    появился только докс-комплект, а счёт ещё нет), в меню он не всплывёт,
+    пока не будет готов целиком — чтобы не переключить часть сделки на
+    несуществующий бланк."""
+    common = sorted(set(invoice_variants()) & set(docx_variants()))
+    return common or [TEMPLATE_VARIANT_DEFAULT]
+
+
+def template_variant() -> str:
+    """Текущий единый вариант: настройка в БД бота → env → v1.
+    Если выбранного варианта нет в наличии целиком — берём первый доступный
+    и пишем предупреждение: документ нужен здесь и сейчас, падать из-за
+    настройки нельзя."""
     val = ""
     if _setting:
         try:
-            val = (_setting(INVOICE_VARIANT_KEY) or "").strip()
+            val = (_setting(TEMPLATE_VARIANT_KEY) or "").strip()
         except Exception as e:  # pragma: no cover
-            logger.warning(f"Не прочитать настройку {INVOICE_VARIANT_KEY}: {e}")
-    val = val or os.environ.get(INVOICE_VARIANT_KEY, "").strip() or INVOICE_VARIANT_DEFAULT
-    available = invoice_variants()
+            logger.warning(f"Не прочитать настройку {TEMPLATE_VARIANT_KEY}: {e}")
+    val = val or os.environ.get(TEMPLATE_VARIANT_KEY, "").strip() or TEMPLATE_VARIANT_DEFAULT
+    available = template_variants()
     if val not in available:
         logger.warning(
-            f"Вариант шаблона счёта {val!r} не найден в {templates_dir()}; "
+            f"Вариант шаблонов {val!r} не найден в {templates_dir()} целиком; "
             f"беру {available[0]!r} (доступны: {available})"
         )
         val = available[0]
@@ -527,17 +574,19 @@ class DocumentBuilder:
         acc_type = br.resolve_account_type(data)
         is_direct = acc_type == br.DIRECT_RF
 
+        variant = template_variant()
+
         if is_direct:
-            template = self.templates_dir / "contract_template_direct.docx"
+            template = self.templates_dir / docx_template_name("contract_template_direct", variant)
             if not template.exists():
                 raise MissingTemplateError(
-                    "Не найден contract_template_direct.docx — шаблон агентского "
-                    "договора для прямого счёта в РФ. Договор не собран."
+                    f"Не найден {template.name} — шаблон агентского "
+                    f"договора для прямого счёта в РФ (вариант «{variant}»). Договор не собран."
                 )
         else:
-            template = self.templates_dir / "contract_template.docx"
+            template = self.templates_dir / docx_template_name("contract_template", variant)
 
-        logger.info(f"Шаблон АГ договора: {template.name} (тип счёта: {acc_type})")
+        logger.info(f"Шаблон АГ договора: {template.name} (тип счёта: {acc_type}, вариант: {variant})")
 
         if template.exists():
             return await self._fill_template(template, data, number, date,
@@ -683,7 +732,7 @@ class DocumentBuilder:
 
         Шаблон выбирается по двум признакам: тип счёта (прямой РФ или через
         банк-корреспондент — у них разная шапка и разный ИНН) и вариант
-        вёрстки из настройки INVOICE_TEMPLATE.
+        вёрстки из единой настройки TEMPLATE_VARIANT.
 
         Заполнение идёт ТОЛЬКО по плейсхолдерам {{...}}, без привязки к
         координатам ячеек: вёрстку счёта правят в Excel, и любой сдвиг строк
@@ -694,7 +743,7 @@ class DocumentBuilder:
         acc_type = bank["account_type"]
         is_direct = acc_type == br.DIRECT_RF
         comp = company.card(_setting)
-        variant = invoice_variant()
+        variant = template_variant()
 
         logger.info(f"build_invoice: number={number}, тип счёта={acc_type}, "
                     f"вариант шаблона={variant}, "
@@ -987,11 +1036,12 @@ class DocumentBuilder:
 
         act_date — дата самого акта (дата закрывающего платежа).
         """
-        template = self.templates_dir / "act_template.docx"
+        variant = template_variant()
+        template = self.templates_dir / docx_template_name("act_template", variant)
         if not template.exists():
             raise FileNotFoundError(
                 f"Шаблон акта не найден: {template}. "
-                "Положите act_template.docx в папку templates/."
+                f"Положите {template.name} в папку templates/."
             )
 
         a_day, a_month, a_year = self._date_parts(act_date)
@@ -1034,11 +1084,12 @@ class DocumentBuilder:
         (см. build_report_impl в agent.py) — отчёт, акт и расчёт обычно
         оформляются одним днём.
         """
-        template = self.templates_dir / "otchet_agenta_template.docx"
+        variant = template_variant()
+        template = self.templates_dir / docx_template_name("otchet_agenta_template", variant)
         if not template.exists():
             raise FileNotFoundError(
                 f"Шаблон отчёта агента не найден: {template}. "
-                "Положите otchet_agenta_template.docx в папку templates/."
+                f"Положите {template.name} в папку templates/."
             )
 
         r_day, r_month, r_year = self._date_parts(report_date)
@@ -1081,11 +1132,12 @@ class DocumentBuilder:
         receipt_date — дата самой расписки. Совпадает с датой акта, то есть с датой
         хронологически последнего платежа по сделке.
         """
-        template = self.templates_dir / "raspiska_template.docx"
+        variant = template_variant()
+        template = self.templates_dir / docx_template_name("raspiska_template", variant)
         if not template.exists():
             raise FileNotFoundError(
                 f"Шаблон расписки не найден: {template}. "
-                "Положите raspiska_template.docx в папку templates/."
+                f"Положите {template.name} в папку templates/."
             )
 
         n = self._normalize

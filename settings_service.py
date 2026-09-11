@@ -64,24 +64,26 @@ SETTINGS: list = [
         ],
     },
     {
-        "key":      "INVOICE_TEMPLATE",
-        "label":    "🧾 Бланк счёта",
+        "key":      "TEMPLATE_VARIANT",
+        "label":    "🧾 Бланк документов (счёт + АГ/акт/отчёт/расписка)",
         "default":  "v1",
         "storage":  "db",          # применяется сразу, без передеплоя
-        "options_fn": lambda: _invoice_template_options(),
+        "options_fn": lambda: _template_variant_options(),
     },
 ]
 
 
-def _invoice_template_options() -> list:
-    """Варианты бланка счёта = комплекты шаблонов, лежащие в templates/.
-    Список собирается на лету, поэтому добавленный в папку invoice_template_v3
-    появляется в меню сам, без правки кода."""
+def _template_variant_options() -> list:
+    """Варианты бланков = комплекты шаблонов, реально лежащие в templates/.
+    Один вариант — на ВСЕ документы сделки разом (счёт, АГ, акт, отчёт,
+    расписка); в списке остаются только варианты, полные для обеих групп
+    (см. doc_builder.template_variants). Список собирается на лету, поэтому
+    добавленный в папку комплект v3 появляется в меню сам, без правки кода."""
     try:
         import doc_builder
-        variants = doc_builder.invoice_variants()
+        variants = doc_builder.template_variants()
     except Exception as e:  # pragma: no cover
-        logger.warning(f"settings: не удалось прочитать варианты счёта: {e}")
+        logger.warning(f"settings: не удалось прочитать варианты шаблонов: {e}")
         return [{"label": "v1 · основной бланк", "value": "v1"}]
 
     opts = []
@@ -89,7 +91,7 @@ def _invoice_template_options() -> list:
         if v == "v1":
             opts.append({"label": "v1 · основной бланк", "value": v})
         else:
-            opts.append({"label": f"{v} · invoice_template_{v}.xlsx", "value": v})
+            opts.append({"label": f"{v} · новые шаблоны (счёт + АГ/акт/отчёт/расписка)", "value": v})
     return opts
 
 
