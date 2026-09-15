@@ -603,7 +603,8 @@ def _format_stats(stats: dict) -> str:
 # Что копируем при разных режимах — списки ключей полей из COLUMNS Sheets.
 _COPY_FIELDS_BUYER = [
     "buyer_name", "passport_series", "passport_number", "buyer_birth_date",
-    "buyer_address", "buyer_initials",
+    "buyer_address", "buyer_initials", "buyer_type", "buyer_inn",
+    "buyer_bank_details",
     "passport_issued_by", "passport_issued_date", "passport_code",
 ]
 _COPY_FIELDS_SELLER = [
@@ -839,6 +840,8 @@ class DocumentAgent:
 
 ✅ МОЖНО переносить (если пользователь запросил):
 • buyer_name, buyer_initials, buyer_address, buyer_birth_date
+• buyer_type, buyer_inn (тип и ИНН покупателя — если сделка тоже с ИП)
+• buyer_bank_details (банковские реквизиты покупателя-ИП, если есть)
 • passport_series, passport_number, passport_issued_by, passport_issued_date, passport_code
 • seller_name, seller_initials, seller_address, seller_birth_date, seller_id_number
 • seller_id_issued_by, seller_id_issued_date
@@ -859,11 +862,29 @@ __СТАТУСЫ_PLACEHOLDER__
 
 При вызове create_contract ты ОБЯЗАН передать data со СТРОГО ЭТИМИ ключами (используй только эти, никакие другие):
 
-ПОКУПАТЕЛЬ (гражданин РФ):
+ПОКУПАТЕЛЬ (гражданин РФ, или ИП — гражданин РФ, зарегистрированный как индивидуальный предприниматель):
 buyer_name           — ФИО полностью
-buyer_birth_date     — дата рождения (ДД.ММ.ГГГГ)
+buyer_birth_date     — дата рождения (ДД.ММ.ГГГГ). Спрашивай ВСЕГДА, даже если покупатель — ИП:
+                        в тексте документов при buyer_type="ИП" она не печатается в преамбуле,
+                        но остаётся в реквизитах и в журнале.
 buyer_address        — адрес регистрации
 buyer_initials       — Фамилия + инициалы имени и отчества (формат: "Иванов И.И." — фамилия ПОЛНОСТЬЮ, имя и отчество — только первые буквы с точками)
+buyer_type           — НЕОБЯЗАТЕЛЬНОЕ, по умолчанию "физ.лицо". Если пользователь говорит, что
+                        покупатель — индивидуальный предприниматель, поставь "ИП". Только эти
+                        два значения сейчас поддерживаются (ООО — пока нет, скажи пользователю
+                        прямо, если он просит покупателя-ООО).
+buyer_inn            — ОБЯЗАТЕЛЬНОЕ, ТОЛЬКО если buyer_type="ИП" (ИНН предпринимателя, обычно
+                        12 цифр). Для "физ.лицо" не заполняется и не спрашивается.
+buyer_bank_details   — НЕОБЯЗАТЕЛЬНОЕ. Собственные банковские реквизиты покупателя
+                        (р/сч, банк, корр. счёт, БИК) — печатаются отдельным блоком в
+                        договоре (АГ/АГ-прямой) под адресом покупателя, нужны для возврата
+                        средств по п. 5.4 Договора, если расчёт с Получателем окажется
+                        невозможен. ОДНО текстовое поле — впиши реквизиты как их дал
+                        пользователь (можно одной строкой, можно в несколько строк — так
+                        и печатается). Если buyer_type="ИП" — СПРОСИ эти реквизиты вместе
+                        с ИНН; для "физ.лицо" не спрашивай, если пользователь сам не даст
+                        такие данные. Если покупатель-ИП реквизиты не даёт — не блокируй
+                        договор, просто оставь поле пустым (блок в документе не печатается).
 passport_series      — серия паспорта
 passport_number      — номер паспорта
 passport_issued_by   — кем выдан
@@ -931,6 +952,7 @@ corr_bank_acc    — ТОЛЬКО для corr: его корр. счёт, 20 ц�
 
 ОБЯЗАТЕЛЬНЫЕ поля (без них договор создавать НЕЛЬЗЯ):
 Покупатель: buyer_name, buyer_initials, buyer_birth_date, buyer_address, passport_series, passport_number, passport_issued_by, passport_issued_date, passport_code
+            + buyer_inn, ЕСЛИ buyer_type="ИП" (иначе buyer_inn не нужен)
 Продавец:   seller_name, seller_initials, seller_id_issued_date, seller_birth_date, seller_address, seller_id_number, seller_id_issued_by, seller_inn
 Автомобиль: car_model, car_vin, car_year, car_color, tpo_number, tpo_date
 Финансы:    car_price, car_price_words, currency, cash_currency, exchange_rate
@@ -2229,6 +2251,8 @@ VIN: ...
                     return {"message": f"❌ Сделка {contract_number} не найдена в журнале."}
                 REQUIRED_KEYS = [
                     "buyer_name","buyer_initials","buyer_birth_date","buyer_address",
+                    "buyer_type","buyer_inn",
+                    "buyer_bank_details",
                     "passport_series","passport_number","passport_issued_by","passport_issued_date","passport_code",
                     "seller_name","seller_initials","seller_birth_date","seller_address",
                     "seller_id_number","seller_id_issued_by","seller_id_issued_date","seller_inn",
@@ -2426,6 +2450,13 @@ VIN: ...
             for problem in bank_problems:
                 missing.append(f"  — реквизиты: {problem}")
 
+            # buyer_inn обязателен, только если покупатель отмечен как ИП —
+            # флаг лежит в buyer_type, поэтому проверяем его отдельно от
+            # плоского списка REQUIRED выше (список общий для всех сделок).
+            if (deal.get("buyer_type") or "").strip().lower() in ("ип", "индивидуальный предприниматель") \
+                    and not (deal.get("buyer_inn") or "").strip():
+                missing.append("  — ИНН покупателя (buyer_inn) — покупатель отмечен как ИП")
+
             contract_date = deal.get("Дата договора", "")
             commission_pct = _num(deal.get("Комиссия %", "1")) or 1.0
 
@@ -2441,6 +2472,8 @@ VIN: ...
             # Всё заполнено — собираем data из ВСЕХ нужных полей (а не только из REQUIRED)
             ALL_DATA_KEYS = [
                 "buyer_name","buyer_initials","buyer_birth_date","buyer_address",
+                "buyer_type","buyer_inn",
+                "buyer_bank_details",
                 "passport_series","passport_number","passport_issued_by","passport_issued_date","passport_code",
                 "seller_name","seller_initials","seller_birth_date","seller_address",
                 "seller_id_number","seller_id_issued_by","seller_id_issued_date","seller_inn",
