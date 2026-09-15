@@ -2140,10 +2140,9 @@ VIN: ...
                 if dkp_pdf_path:
                     dkp_pdf_link = await self.drive.upload_file(dkp_pdf_path, dkp_pdf, deal_folder_id)
                 if inv_pdf_path:
-                    # Единый "скан"-проход поверх готовой страницы — см. scanify.py
-                    # и [[scanify-pilot]]. Переключатель — настройка бота SCANIFY.
-                    import scanify
-                    await asyncio.to_thread(scanify.scanify_pdf, inv_pdf_path, f"Счёт_{number}")
+                    # scanify сюда намеренно НЕ подключаем — по просьбе Ильи
+                    # 15.09.2026, посмотрел комплект и решил, что на счёте
+                    # эффект скана не нужен. См. [[scanify-pilot]].
                     inv_pdf_link = await self.drive.upload_file(inv_pdf_path, inv_pdf, deal_folder_id)
             else:
                 logger.info("PDF пропущен (SKIP_PDF=1)")
@@ -2316,10 +2315,9 @@ VIN: ...
                 if not skip_pdf:
                     pdf = await self.builder.convert_to_pdf(path)
                     if pdf:
-                        # Единый "скан"-проход поверх готовой страницы — см. scanify.py
-                        # и [[scanify-pilot]]. Переключатель — настройка бота SCANIFY.
-                        import scanify
-                        await asyncio.to_thread(scanify.scanify_pdf, pdf, key)
+                        # scanify сюда намеренно НЕ подключаем — по просьбе Ильи
+                        # 15.09.2026, посмотрел комплект и решил, что на счёте
+                        # эффект скана не нужен. См. [[scanify-pilot]].
                         pname = f"Счёт_{contract_number}.pdf"
                         plink = await self.drive.upload_file(pdf, pname, deal_folder_id)
                         if not first_link:

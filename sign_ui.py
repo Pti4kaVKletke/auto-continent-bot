@@ -322,6 +322,15 @@ async def handle_callback(update, context, data: str, drive=None) -> bool:
             await query.edit_message_caption(f"❌ Не смогла собрать файл: {e}")
             return True
 
+        # Единый "скан"-проход поверх готового файла — см. scanify.py и
+        # [[scanify-pilot]]. Только на ИТОГОВОМ файле, не на предпросмотре
+        # (_preview тоже дергает _build, но через _show_place/nudge — там
+        # это лишняя нагрузка на каждый чих и мешает сверять геометрию по
+        # пикселям). Переключатель — та же настройка бота SCANIFY.
+        import asyncio
+        import scanify
+        await asyncio.to_thread(scanify.scanify_pdf, out, st["key"])
+
         with open(out, "rb") as f:
             await query.message.reply_document(f, filename=name)
 
