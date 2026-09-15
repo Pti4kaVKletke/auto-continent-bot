@@ -2442,11 +2442,19 @@ VIN: ...
             # явного поля, а не выводится из пустоты банка-корреспондента.
             bank_problems = br.validate_profile(deal)
 
+            # Ключи полей — в бэктиках: у Telegram legacy Markdown чётность
+            # `_`/`*`/`` ` ``/`[` считается по ВСЕМУ сообщению, а не по
+            # отдельной вставке (см. feedback-markdown-underscore) — почти
+            # все ключи (buyer_name, passport_issued_by...) содержат "_", и
+            # без бэктиков нечётная сумма по списку иногда рушила парсинг
+            # всего сообщения (падало в фолбэк без форматирования). Бэктики
+            # сами всегда парные (по 2 на поле) и гасят сканирование "_"
+            # внутри себя — независимо от того, сколько полей в списке.
             missing = []
             for key, label in REQUIRED:
                 val = deal.get(key, "").strip()
                 if not val or val == "None":
-                    missing.append(f"  — {label} ({key})")
+                    missing.append(f"  — {label} (`{key}`)")
             for problem in bank_problems:
                 missing.append(f"  — реквизиты: {problem}")
 
@@ -2455,7 +2463,7 @@ VIN: ...
             # плоского списка REQUIRED выше (список общий для всех сделок).
             if (deal.get("buyer_type") or "").strip().lower() in ("ип", "индивидуальный предприниматель") \
                     and not (deal.get("buyer_inn") or "").strip():
-                missing.append("  — ИНН покупателя (buyer_inn) — покупатель отмечен как ИП")
+                missing.append("  — ИНН покупателя (`buyer_inn`) — покупатель отмечен как ИП")
 
             contract_date = deal.get("Дата договора", "")
             commission_pct = _num(deal.get("Комиссия %", "1")) or 1.0

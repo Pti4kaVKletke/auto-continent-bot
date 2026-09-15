@@ -205,6 +205,28 @@ def from_legacy(row: dict) -> dict:
     }
 
 
+def migrate_saved_profiles(mem) -> int:
+    """Переводит сохранённые банковские профили на новую модель.
+
+    Профили лежат в SQLite бота, и миграция журнала их не касается: там свои
+    строки. Без этого прохода профиль, заведённый до 04.09.2026, отдал бы в
+    сделку пустой банк — новый код старых имён полей уже не читает.
+
+    Идемпотентна: профиль с заполненным account_type пропускается.
+    """
+    migrated = 0
+    for name in mem.list_bank_profiles():
+        profile = mem.get_bank_profile(name) or {}
+        if str(profile.get("account_type") or "").strip() in (DIRECT_RF, CORR):
+            continue
+        converted = from_legacy(profile)
+        converted["account_number"]   = str(profile.get("account_number") or "").strip()
+        converted["account_currency"] = str(profile.get("account_currency") or "").strip() or "RUB"
+        mem.save_bank_profile(name, normalize(converted))
+        migrated += 1
+    return migrated
+
+
 # ─── Проверки формата ───────────────────────────────────────────────────────
 # Ловим кривой ввод при заведении реквизитов, а не при сборке документа:
 # ошибка на этапе выдачи счёта приходит поздно и непонятно откуда.
