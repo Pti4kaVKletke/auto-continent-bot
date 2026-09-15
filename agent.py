@@ -623,7 +623,7 @@ _COPY_NEVER = {
     "Комментарий", "Платежи", "Получено", "Остаток", "Сумма Договора",
     # Автомобиль всегда новый: VIN, TПO, цена и всё что вокруг
     "car_model", "car_vin", "car_year", "car_color",
-    "tpo_number", "car_body_number", "tpo_day", "tpo_month", "tpo_year",
+    "tpo_number", "car_body_number", "tpo_date",
     "car_price", "cash_amount", "exchange_rate", "car_price_words",
     "currency", "cash_amount_words", "cash_currency",
 }
@@ -831,7 +831,7 @@ class DocumentAgent:
 • Статус — новая сделка всегда с "черновик"/"активна", НЕ "завершена"
 • Папка Drive — создаётся новая при create_contract
 • car_model, car_vin, car_year, car_color — автомобиль ВСЕГДА новый
-• car_body_number, tpo_number, tpo_day, tpo_month, tpo_year — данные под конкретный авто
+• car_body_number, tpo_number, tpo_date — данные под конкретный авто
 • car_price, cash_amount, car_price_words, cash_amount_words — сумма ВСЕГДА новая
 • exchange_rate — обычно новый, но можно уточнить у пользователя
 • Платежи, Получено, Остаток — в новой сделке всегда пустые
@@ -889,9 +889,7 @@ car_year        — год выпуска
 car_color       — цвет
 car_body_number — номер кузова (если есть, иначе VIN)
 tpo_number      — номер ТПО
-tpo_day         — день выдачи ТПО
-tpo_month       — месяц выдачи ТПО (прописью: января, февраля...)
-tpo_year        — год выдачи ТПО
+tpo_date        — дата ТПО, ДД.ММ.ГГГГ (берётся из самого номера ТПО — см. ниже правило извлечения)
 
 ФИНАНСЫ — ВАЖНО: это ДВЕ РАЗНЫЕ СУММЫ:
 car_price        — цена автомобиля в ДКП цифрами (например: 4200000). Валюта — рубли.
@@ -934,7 +932,7 @@ corr_bank_acc    — ТОЛЬКО для corr: его корр. счёт, 20 ц�
 ОБЯЗАТЕЛЬНЫЕ поля (без них договор создавать НЕЛЬЗЯ):
 Покупатель: buyer_name, buyer_initials, buyer_birth_date, buyer_address, passport_series, passport_number, passport_issued_by, passport_issued_date, passport_code
 Продавец:   seller_name, seller_initials, seller_id_issued_date, seller_birth_date, seller_address, seller_id_number, seller_id_issued_by, seller_inn
-Автомобиль: car_model, car_vin, car_year, car_color, tpo_number, tpo_day, tpo_month, tpo_year
+Автомобиль: car_model, car_vin, car_year, car_color, tpo_number, tpo_date
 Финансы:    car_price, car_price_words, currency, cash_currency, exchange_rate
             (cash_amount и cash_amount_words БОЛЬШЕ НЕ ОБЯЗАТЕЛЬНЫ — см. ниже про два курса)
 Реквизиты:  account_type, account_number, account_currency, bank_name, bank_bic, bank_corr_acc
@@ -961,11 +959,12 @@ dkp_date — дата подписания ДКП в формате ДД.ММ.Г
 
 1. ТПО (Таможенный приходной ордер) — документ называется "Таможенный приходной ордер №":
 - tpo_number: поле "1. Справочный номер" — длинный номер вида 41714106/310526/0000050870/00
-- Дата ТПО берётся из самого номера ТПО — это средняя часть между первым и вторым слэшем:
-  Например: 41714106/310526/0000050870/00 → средняя часть "310526" → ДДММГГ → день=31, месяц=05, год=2026
-  tpo_day: первые 2 цифры (например "31")
-  tpo_month: следующие 2 цифры → ПРОПИСЬЮ в родительном падеже (01=января, 02=февраля, 03=марта, 04=апреля, 05=мая, 06=июня, 07=июля, 08=августа, 09=сентября, 10=октября, 11=ноября, 12=декабря)
-  tpo_year: последние 2 цифры + "20" спереди (26 → "2026")
+- Дата ТПО берётся из самого номера ТПО — это средняя часть между первым и вторым слэшем,
+  в формате ДДММГГ:
+  Например: 41714106/310526/0000050870/00 → средняя часть "310526" → день=31, месяц=05, год=2026
+  Собери tpo_date строкой "ДД.ММ.ГГГГ" (например "31.05.2026"): день и месяц — как есть
+  цифрами, год — две последние цифры с "20" спереди. Месяц оставляй ЦИФРАМИ, словом
+  его подставит бот сам при сборке документа — прописью писать не нужно.
 - Из ТПО также можно взять данные продавца (поле "4. Плательщик"): ФИО, ИНН, адрес,
   номер ID карты, дату выдачи ID карты и орган выдачи (строка "ПАСПОРТ: ID ...")
 
@@ -2233,7 +2232,7 @@ VIN: ...
                     "passport_series","passport_number","passport_issued_by","passport_issued_date","passport_code",
                     "seller_name","seller_initials","seller_birth_date","seller_address",
                     "seller_id_number","seller_id_issued_by","seller_id_issued_date","seller_inn",
-                    "car_model","car_vin","car_year","car_color","tpo_number","tpo_day","tpo_month","tpo_year",
+                    "car_model","car_vin","car_year","car_color","tpo_number","tpo_date",
                     "car_price","car_price_words","currency","cash_amount","cash_amount_words",
                     "cash_currency","exchange_rate","account_currency","account_number",
                     "account_type","bank_name","bank_bic","bank_corr_acc","bank_swift",
@@ -2401,9 +2400,7 @@ VIN: ...
                 ("car_year",             "Год выпуска"),
                 ("car_color",            "Цвет"),
                 ("tpo_number",           "Номер ТПО"),
-                ("tpo_day",              "День ТПО"),
-                ("tpo_month",            "Месяц ТПО"),
-                ("tpo_year",             "Год ТПО"),
+                ("tpo_date",             "Дата ТПО"),
                 ("car_price",            "Цена ДКП (руб.)"),
                 ("car_price_words",      "Цена прописью"),
                 ("currency",             "Валюта ДКП"),
@@ -2447,7 +2444,7 @@ VIN: ...
                 "passport_series","passport_number","passport_issued_by","passport_issued_date","passport_code",
                 "seller_name","seller_initials","seller_birth_date","seller_address",
                 "seller_id_number","seller_id_issued_by","seller_id_issued_date","seller_inn",
-                "car_model","car_vin","car_year","car_color","tpo_number","tpo_day","tpo_month","tpo_year",
+                "car_model","car_vin","car_year","car_color","tpo_number","tpo_date",
                 "car_price","car_price_words","currency","cash_amount","cash_amount_words",
                 "cash_currency","exchange_rate","account_currency","account_number",
                 "account_type","bank_name","bank_bic","bank_corr_acc","bank_swift",
@@ -2561,7 +2558,7 @@ VIN: ...
                     f"  VIN: {_val(r, 'car_vin')}",
                     f"  Год: {_val(r, 'car_year')}",
                     f"  Цвет: {_val(r, 'car_color')}",
-                    f"  ТПО №: {_val(r, 'tpo_number')} от {_val(r, 'tpo_day')} {_val(r, 'tpo_month')} {_val(r, 'tpo_year')}",
+                    f"  ТПО №: {_val(r, 'tpo_number')} от {_val(r, 'tpo_date')}",
                 ]
 
             def _section_finances(r):

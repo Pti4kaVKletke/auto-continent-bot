@@ -117,9 +117,10 @@ COLUMNS = [
     "car_color",
     "tpo_number",
     "car_body_number",
-    "tpo_day",
-    "tpo_month",
-    "tpo_year",
+    "tpo_date",  # дата ТПО одной колонкой «ДД.ММ.ГГГГ» (объединены tpo_day/
+                 # tpo_month/tpo_year 15.09.2026) — день/месяц-словом/год для
+                 # шаблонов собираются из неё в doc_builder через _date_parts(),
+                 # как и остальные даты в системе.
     "car_price",
     "cash_amount",
     "exchange_rate",

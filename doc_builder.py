@@ -1652,6 +1652,12 @@ class DocumentBuilder:
         bank = br.normalize(data)
         comp = company.placeholders(_setting)
 
+        # Дата ТПО хранится одной колонкой (tpo_date, «ДД.ММ.ГГГГ») — день,
+        # месяц словом и год для плейсхолдеров разбираются тем же _date_parts,
+        # что и остальные даты в системе (объединено из tpo_day/tpo_month/
+        # tpo_year 15.09.2026).
+        tpo_day, tpo_month, tpo_year = self._date_parts(data.get("tpo_date", ""))
+
         replacements = {
             "{{НОМЕР}}":   number,
             "{{ДЕНЬ}}":    day,
@@ -1699,9 +1705,9 @@ class DocumentBuilder:
             "{{ЦВЕТ}}":         data.get("car_color", ""),
             "{{НОМ_КУЗОВА}}":   data.get("car_body_number", data.get("car_vin", "")),
             "{{НОМ_ТПО}}":      data.get("tpo_number", ""),
-            "{{ДЕНЬ_ТПО}}":     data.get("tpo_day", ""),
-            "{{МЕС_ТПО}}":      data.get("tpo_month", ""),
-            "{{ГОД_ТПО}}":      data.get("tpo_year", ""),
+            "{{ДЕНЬ_ТПО}}":     tpo_day,
+            "{{МЕС_ТПО}}":      tpo_month,
+            "{{ГОД_ТПО}}":      tpo_year,
 
             # Цена и оплата
             "{{ЦЕНА_ЦИФРАМИ}}":            price_fmt,
