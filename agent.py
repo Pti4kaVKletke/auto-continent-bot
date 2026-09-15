@@ -3467,12 +3467,28 @@ VIN: ...
         сделку — как refresh_scans_bulk для сканов. Отменённые сделки в
         candidates не попадают (пересобирать для них документы незачем),
         но перечислены отдельно на случай, если Илья всё же попросит.
+
+        Колонка «Папка Drive» — не единственный источник id папки. У части
+        сделок она может быть пустой или в нераспознанном формате (сделка
+        старее, чем сама колонка, или ссылку когда-то вписали руками не тем
+        видом) — но `generate_docs`/`build_*_impl` в любом случае достают
+        папку через `drive.get_or_create_deal_folder(номер)`, а не через эту
+        колонку: она вычисляется из даты в самом номере договора. Поэтому
+        для таких сделок папку досчитываем тем же способом — иначе они молча
+        выпадали бы из проверки, хотя по факту с ними можно работать. Номер
+        должен быть в формате ДДММГГ+3 цифры (`^\d{9}$`, как у всех сделок в
+        журнале) — get_or_create_deal_folder режет дату по фиксированным
+        позициям номера, и на нестандартном номере вместо ошибки тихо
+        соберёт папку не в том месте. Такие номера остаются в no_folder.
         """
         deals = await self.sheets.get_all_deals()
 
-        folder_of  = {}
-        no_folder  = []
-        cancelled  = []
+        folder_of         = {}
+        no_folder         = []
+        cancelled         = []
+        resolved_by_lookup = {}   # номер → id папки, восстановленный по номеру
+        NUM_RE = re.compile(r"^\d{9}$")
+
         for d in deals:
             num = (d.get("Номер договора") or "").strip()
             if not num:
@@ -3485,8 +3501,20 @@ VIN: ...
                          if "/folders/" in link else "")
             if folder_id:
                 folder_of[num] = folder_id
-            else:
-                no_folder.append(num)
+                continue
+
+            if NUM_RE.match(num):
+                try:
+                    folder_id = await self.drive.get_or_create_deal_folder(num)
+                except Exception as e:
+                    logger.error(f"Не удалось восстановить папку для {num}: {e}", exc_info=True)
+                    folder_id = ""
+                if folder_id:
+                    folder_of[num] = folder_id
+                    resolved_by_lookup[num] = folder_id
+                    continue
+
+            no_folder.append(num)
 
         by_folder = await self.drive.list_docs_bulk(list(folder_of.values()))
 
@@ -3498,10 +3526,11 @@ VIN: ...
             (candidates if not real_files else has_docs).append(num)
 
         return {
-            "candidates": candidates,
-            "has_docs":   has_docs,
-            "no_folder":  no_folder,
-            "cancelled":  cancelled,
+            "candidates":         candidates,
+            "has_docs":           has_docs,
+            "no_folder":          no_folder,
+            "cancelled":          cancelled,
+            "resolved_by_lookup": resolved_by_lookup,
         }
 
     async def regenerate_missing_docs_impl(self, numbers: list, do_closing: bool = True,
@@ -3682,6 +3711,15 @@ VIN: ...
             if not skip_pdf:
                 pdf_path = await self.builder.convert_to_pdf(docx_path)
                 if pdf_path:
+                    # Пилот (15.09.2026): единый "скан"-проход поверх уже
+                    # готовой страницы (текст + вклеенные sign_jitter подпись
+                    # и печать), чтобы весь лист читался одной фактурой, а не
+                    # текстом с приклеенной картинкой. Пока только на акте —
+                    # до проверки на реальном документе; SCANIFY=0 выключает.
+                    import scanify
+                    await asyncio.to_thread(
+                        scanify.scanify_pdf, pdf_path, f"Акт_{contract_number}"
+                    )
                     pdf_name = f"Акт_{contract_number}.pdf"
                     pdf_link = await self.drive.upload_file(pdf_path, pdf_name, deal_folder_id)
                     extra_files.append(pdf_path)
