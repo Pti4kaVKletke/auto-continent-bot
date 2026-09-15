@@ -70,6 +70,16 @@ SETTINGS: list = [
         "storage":  "db",          # применяется сразу, без передеплоя
         "options_fn": lambda: _template_variant_options(),
     },
+    {
+        "key":     "SCANIFY",
+        "label":   "🖨️ Эффект скана на PDF (акт/расписка/отчёт/счёт)",
+        "default": "1",
+        "storage": "db",          # применяется сразу, без передеплоя
+        "options": [
+            {"label": "Включён (текст и печать — как один скан)", "value": "1"},
+            {"label": "Отключён (обычный PDF)",                    "value": "0"},
+        ],
+    },
 ]
 
 

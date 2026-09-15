@@ -24,7 +24,9 @@ doc_key (`md5(doc_key) → random.Random`), поэтому пересборка 
 числа, и они не "заканчиваются" и не меняются при правках кода — в
 отличие от sign_jitter, спек в журнале тут не нужен для воспроизводимости.
 
-Выключатель: SCANIFY=0.
+Выключатель — настройка в меню бота «⚙️ Настройки» → «🖨️ Эффект скана на
+PDF» (`SCANIFY`, storage=db, применяется сразу без передеплоя — по образцу
+TEMPLATE_VARIANT), либо env-переменная SCANIFY=0 как fallback.
 """
 
 from __future__ import annotations
@@ -35,7 +37,28 @@ import logging
 import os
 import random
 
+try:  # настройка живёт в SQLite бота; без неё — просто env/default
+    from memory import get_setting as _setting
+except Exception:  # pragma: no cover
+    _setting = None
+
+SCANIFY_KEY     = "SCANIFY"
+SCANIFY_DEFAULT = "1"
+
 logger = logging.getLogger(__name__)
+
+
+def enabled() -> bool:
+    """Текущее состояние переключателя: БД настроек бота → env → default.
+    Та же схема разрешения, что у doc_builder.template_variant()."""
+    val = ""
+    if _setting:
+        try:
+            val = (_setting(SCANIFY_KEY) or "").strip()
+        except Exception as e:  # pragma: no cover
+            logger.warning(f"scanify: не прочитать настройку {SCANIFY_KEY}: {e}")
+    val = val or os.environ.get(SCANIFY_KEY, "").strip() or SCANIFY_DEFAULT
+    return val != "0"
 
 # ─── Параметры скан-эффекта ────────────────────────────────────────────
 # Числа сознательно скромные: цель не "состарить" документ до неразборчивости,
@@ -125,9 +148,10 @@ def scanify_pdf(pdf_path: str, doc_key: str, out_path: str | None = None) -> str
     размеров, что у оригинала (важно для печати "в реальном размере").
 
     Возвращает путь к новому PDF (по умолчанию исходный путь — файл
-    перезаписывается) или None при ошибке / если выключено SCANIFY=0.
+    перезаписывается) или None при ошибке / если переключатель выключен
+    (см. enabled()).
     """
-    if os.environ.get("SCANIFY", "1") == "0":
+    if not enabled():
         return None
 
     try:

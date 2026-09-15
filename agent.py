@@ -2140,6 +2140,10 @@ VIN: ...
                 if dkp_pdf_path:
                     dkp_pdf_link = await self.drive.upload_file(dkp_pdf_path, dkp_pdf, deal_folder_id)
                 if inv_pdf_path:
+                    # Единый "скан"-проход поверх готовой страницы — см. scanify.py
+                    # и [[scanify-pilot]]. Переключатель — настройка бота SCANIFY.
+                    import scanify
+                    await asyncio.to_thread(scanify.scanify_pdf, inv_pdf_path, f"Счёт_{number}")
                     inv_pdf_link = await self.drive.upload_file(inv_pdf_path, inv_pdf, deal_folder_id)
             else:
                 logger.info("PDF пропущен (SKIP_PDF=1)")
@@ -2312,6 +2316,10 @@ VIN: ...
                 if not skip_pdf:
                     pdf = await self.builder.convert_to_pdf(path)
                     if pdf:
+                        # Единый "скан"-проход поверх готовой страницы — см. scanify.py
+                        # и [[scanify-pilot]]. Переключатель — настройка бота SCANIFY.
+                        import scanify
+                        await asyncio.to_thread(scanify.scanify_pdf, pdf, key)
                         pname = f"Счёт_{contract_number}.pdf"
                         plink = await self.drive.upload_file(pdf, pname, deal_folder_id)
                         if not first_link:
@@ -3711,15 +3719,6 @@ VIN: ...
             if not skip_pdf:
                 pdf_path = await self.builder.convert_to_pdf(docx_path)
                 if pdf_path:
-                    # Пилот (15.09.2026): единый "скан"-проход поверх уже
-                    # готовой страницы (текст + вклеенные sign_jitter подпись
-                    # и печать), чтобы весь лист читался одной фактурой, а не
-                    # текстом с приклеенной картинкой. Пока только на акте —
-                    # до проверки на реальном документе; SCANIFY=0 выключает.
-                    import scanify
-                    await asyncio.to_thread(
-                        scanify.scanify_pdf, pdf_path, f"Акт_{contract_number}"
-                    )
                     pdf_name = f"Акт_{contract_number}.pdf"
                     pdf_link = await self.drive.upload_file(pdf_path, pdf_name, deal_folder_id)
                     extra_files.append(pdf_path)
@@ -3854,6 +3853,10 @@ VIN: ...
             if not skip_pdf:
                 pdf_path = await self.builder.convert_to_pdf(docx_path)
                 if pdf_path:
+                    # Единый "скан"-проход поверх готовой страницы — см. scanify.py
+                    # и [[scanify-pilot]]. Переключатель — настройка бота SCANIFY.
+                    import scanify
+                    await asyncio.to_thread(scanify.scanify_pdf, pdf_path, key)
                     pdf_name = f"Отчёт_агента_{contract_number}.pdf"
                     pdf_link = await self.drive.upload_file(pdf_path, pdf_name, deal_folder_id)
                     extra_files.append(pdf_path)
@@ -3975,6 +3978,10 @@ VIN: ...
             if not skip_pdf:
                 pdf_path = await self.builder.convert_to_pdf(docx_path)
                 if pdf_path:
+                    # Единый "скан"-проход поверх готовой страницы — см. scanify.py
+                    # и [[scanify-pilot]]. Переключатель — настройка бота SCANIFY.
+                    import scanify
+                    await asyncio.to_thread(scanify.scanify_pdf, pdf_path, key)
                     pdf_name = f"Расписка_{contract_number}.pdf"
                     pdf_link = await self.drive.upload_file(pdf_path, pdf_name, deal_folder_id)
                     extra_files.append(pdf_path)
