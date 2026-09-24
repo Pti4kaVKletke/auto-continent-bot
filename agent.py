@@ -2187,7 +2187,7 @@ VIN: ...
                     await self.sheets.save_deal(
                         contract_number=number,
                         contract_date=date,
-                        data=tool_input["data"],
+                        deal_data=tool_input["data"],
                         commission_pct=commission_pct,
                         drive_folder_link=drive_folder_link,
                     )
@@ -2742,7 +2742,7 @@ VIN: ...
             ok = await self.sheets.save_deal(
                 contract_number=contract_number,
                 contract_date=contract_date,
-                data=data,
+                deal_data=data,
                 commission_pct=commission_pct,
                 drive_folder_link=drive_folder_link,
             )
