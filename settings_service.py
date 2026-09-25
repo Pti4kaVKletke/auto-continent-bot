@@ -44,15 +44,6 @@ SETTINGS: list = [
         ],
     },
     {
-        "key":     "SKIP_DRIVE",
-        "label":   "📁 Загрузка на Google Drive",
-        "default": "0",
-        "options": [
-            {"label": "Включена (загружать в Drive)",    "value": "0"},
-            {"label": "Отключена (только локально)",     "value": "1"},
-        ],
-    },
-    {
         "key":     "BACKUP_KEEP_DAYS",
         "label":   "💾 Хранить бэкапы, дней",
         "default": "30",

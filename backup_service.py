@@ -1,5 +1,5 @@
 """
-Ежедневный бэкап журнала сделок в Google Drive.
+Ежедневный бэкап журнала сделок и базы бота (agent.db) в Google Drive.
 
 Экспортирует Google Sheet в xlsx через Drive API и загружает в подпапку
 `Бэкапы журнала` внутри корневой рабочей папки Drive. Ротация: удаляет
@@ -13,6 +13,8 @@ import io
 import json
 import logging
 import os
+import sqlite3
+import tempfile
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
@@ -28,6 +30,8 @@ ROOT_FOLDER_ID     = os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "1GbMLXVtAyh4fsfy1
 BACKUP_FOLDER_NAME = os.environ.get("BACKUP_FOLDER_NAME",     "Бэкапы журнала")
 BACKUP_KEEP_DAYS   = int(os.environ.get("BACKUP_KEEP_DAYS",   "30"))
 BACKUP_FILE_PREFIX = "journal_backup_"
+DB_BACKUP_PREFIX   = "agentdb_backup_"
+DB_PATH            = os.environ.get("DB_PATH", "/data/agent.db")
 
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
@@ -214,6 +218,61 @@ class BackupService:
             self._reset()
             return {"success": False, "error": str(e)}
 
+    # ── Бэкап SQLite (agent.db) ──────────────────────────────────────────
+
+    def create_db_backup(self) -> dict:
+        """Консистентная копия agent.db (sqlite3 backup API) → загрузка в ту же папку.
+
+        В базе: карточки компаний, банковские профили, сохранённые инструкции,
+        настройки. Журнал сделок сюда не входит — он бэкапится create_backup.
+        Возвращает: {success, file_id, file_name, size_kb} или {success: False, error}.
+        """
+        if not os.path.exists(DB_PATH):
+            return {"success": False, "error": f"файл базы не найден: {DB_PATH}"}
+        tmp_path = None
+        try:
+            fd, tmp_path = tempfile.mkstemp(suffix=".db")
+            os.close(fd)
+            src = sqlite3.connect(DB_PATH)
+            dst = sqlite3.connect(tmp_path)
+            try:
+                src.backup(dst)   # безопасно даже при параллельной записи
+            finally:
+                dst.close()
+                src.close()
+            with open(tmp_path, "rb") as f:
+                db_bytes = f.read()
+            size_kb = round(len(db_bytes) / 1024, 1)
+
+            drive     = self._get_drive()
+            folder_id = self._get_or_create_backup_folder()
+            ts        = datetime.now().strftime("%Y%m%d_%H%M%S")
+            file_name = f"{DB_BACKUP_PREFIX}{ts}.db"
+            media = MediaIoBaseUpload(
+                io.BytesIO(db_bytes),
+                mimetype="application/x-sqlite3",
+                resumable=False,
+            )
+            uploaded = drive.files().create(
+                body={"name": file_name, "parents": [folder_id]},
+                media_body=media,
+                fields="id, name",
+                supportsAllDrives=True,
+            ).execute()
+            logger.info(f"Бэкап БД создан: {file_name} ({size_kb} KB, id={uploaded['id']})")
+            return {"success": True, "file_id": uploaded["id"],
+                    "file_name": file_name, "size_kb": size_kb}
+        except Exception as e:
+            logger.error(f"Ошибка бэкапа agent.db: {e}", exc_info=True)
+            self._reset()
+            return {"success": False, "error": str(e)}
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+
     # ── Очистка старых ───────────────────────────────────────────────────
 
     def cleanup_old_backups(self, keep_days: int | None = None) -> dict:
@@ -227,20 +286,23 @@ class BackupService:
             # Drive API ждёт RFC 3339 UTC
             cutoff_str = cutoff.strftime("%Y-%m-%dT%H:%M:%S")
 
-            q = (
-                f"'{folder_id}' in parents and "
-                f"name contains '{BACKUP_FILE_PREFIX}' and "
-                f"createdTime < '{cutoff_str}' and "
-                "trashed = false"
-            )
-            res = drive.files().list(
-                q=q,
-                fields="files(id, name, createdTime)",
-                pageSize=1000,
-                supportsAllDrives=True,
-                includeItemsFromAllDrives=True,
-            ).execute()
-            files = res.get("files", [])
+            files = []
+            # Ротация и журнала (xlsx), и копий базы бота (.db)
+            for prefix in (BACKUP_FILE_PREFIX, DB_BACKUP_PREFIX):
+                q = (
+                    f"'{folder_id}' in parents and "
+                    f"name contains '{prefix}' and "
+                    f"createdTime < '{cutoff_str}' and "
+                    "trashed = false"
+                )
+                res = drive.files().list(
+                    q=q,
+                    fields="files(id, name, createdTime)",
+                    pageSize=1000,
+                    supportsAllDrives=True,
+                    includeItemsFromAllDrives=True,
+                ).execute()
+                files.extend(res.get("files", []))
 
             deleted, failed = 0, 0
             for f in files:

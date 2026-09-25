@@ -1,9 +1,19 @@
 import os
+import time
+
+# ── Часовой пояс процесса: Бишкек (UTC+6, без перехода на летнее время) ──
+# Контейнер Railway живёт в UTC, а datetime.now() по всему коду даёт «сегодня»
+# для документов и промпта. Без этого с 00:00 до 06:00 по Бишкеку ставилась
+# вчерашняя дата. POSIX-строка "<+06>-6" не требует tzdata в образе.
+# Переопределить можно переменной BOT_TZ (например, "Asia/Bishkek" при наличии tzdata).
+os.environ["TZ"] = os.environ.get("BOT_TZ", "<+06>-6")
+if hasattr(time, "tzset"):
+    time.tzset()
+
 import logging
 import asyncio
 import random
 import re
-import time
 from pathlib import Path
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.constants import ChatAction
@@ -549,6 +559,23 @@ async def daily_backup_job(context: ContextTypes.DEFAULT_TYPE):
     """Ежедневный автобэкап + ротация. Успех — тихо в логи, ошибка — алерт в чат."""
     logger.info("Запуск ежедневного бэкапа")
     result = await asyncio.to_thread(backup.create_backup)
+
+    # Копия SQLite (компании, банковские профили, инструкции, настройки).
+    # Отдельно от журнала: ошибка здесь не должна глушить бэкап таблицы.
+    db_result = await asyncio.to_thread(backup.create_db_backup)
+    if not db_result.get("success"):
+        db_err = db_result.get("error", "неизвестно")
+        logger.error(f"Бэкап agent.db FAILED: {db_err}")
+        for chat_id in _get_allowed_chat_ids():
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"⚠️ Не удалось сделать бэкап базы бота (agent.db): {db_err}",
+                )
+            except Exception as e:
+                logger.warning(f"Не удалось уведомить {chat_id} об ошибке бэкапа БД: {e}")
+    else:
+        logger.info(f"Бэкап БД OK: {db_result['file_name']} ({db_result['size_kb']} KB)")
 
     if result.get("success"):
         cleanup = await asyncio.to_thread(backup.cleanup_old_backups)
@@ -1329,6 +1356,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     text += f"🔗 [Открыть в Drive]({result['web_link']})"
             else:
                 text = f"❌ *Ошибка бэкапа*\n\n`{result.get('error', 'неизвестно')}`"
+
+            # Вместе с журналом — копия базы бота (компании, реквизиты, инструкции)
+            db_result = await asyncio.to_thread(backup.create_db_backup)
+            if db_result.get("success"):
+                text += f"\n\n🗄 База бота: `{db_result['file_name']}` · {db_result['size_kb']} KB"
+            else:
+                db_err = str(db_result.get("error", "неизвестно")).replace("`", "'")
+                text += f"\n\n⚠️ База бота не сохранена: `{db_err}`"
             await query.edit_message_text(text, parse_mode="Markdown",
                                           disable_web_page_preview=True,
                                           reply_markup=back_kb)
