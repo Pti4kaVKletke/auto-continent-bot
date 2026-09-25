@@ -2311,6 +2311,20 @@ VIN: ...
                 # _num умеет читать значения с запятой (русская локаль Sheets: "1,0" → 1.0)
                 commission_pct = _num(deal.get("Комиссия %", "1")) or 1.0
 
+            # Пропись суммы в долларах: кнопка «Документы» идёт сюда, а не в
+            # create_contract, поэтому дописываем её в журнал и здесь.
+            # Пишем, только если в журнале пусто или пропись не совпадает с
+            # числом, — лишних записей в таблицу не делаем.
+            _cash = _dkp_float(data.get("cash_amount"))
+            if _cash:
+                _words = amount_to_words_plain(_cash)
+                if str(data.get("cash_amount_words") or "").strip() != _words:
+                    data["cash_amount_words"] = _words
+                    try:
+                        await self.sheets.update_deal(contract_number, {"cash_amount_words": _words})
+                    except Exception as e:
+                        logger.warning(f"Сделка {contract_number}: не удалось записать пропись суммы: {e}")
+
             deal_folder_id = await self.drive.get_or_create_deal_folder(contract_number)
             skip_pdf = os.environ.get("SKIP_PDF", "0") == "1"
 
