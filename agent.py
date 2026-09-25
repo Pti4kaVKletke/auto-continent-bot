@@ -18,7 +18,8 @@ import bank_requisites as br
 import company
 from drive_service import GoogleDriveService
 from doc_builder import (DocumentBuilder, MissingDataError, AmountMismatchError,
-                         order_amount)
+                         order_amount, AMOUNT_TOLERANCE_RUB,
+                         _to_float as _dkp_float)
 from gsheets_service import GoogleSheetsService
 
 
@@ -920,9 +921,13 @@ cash_currency    — валюта наличных (долларов / сом)
 exchange_rate    — курс доллара к рублю на дату составления Поручения (например: 81,40).
                    Это РАСЧЁТНЫЙ курс: сумма к передаче Получателю в Поручении
                    считается как car_price / exchange_rate.
-cash_amount      — НЕОБЯЗАТЕЛЬНОЕ. Расчётная сумма Поручения в долларах
-                   (колонка «Сумма нал. (USD)»). Если не заполнить — бот посчитает
-                   сам: car_price / exchange_rate с округлением до цента.
+cash_amount      — ОБЯЗАТЕЛЬНОЕ. Сумма Поручения в долларах (колонка
+                   «Сумма нал. (USD)»). Спрашивай её при создании сделки вместе
+                   с ценой ДКП и курсом. Обязана сходиться: car_price / exchange_rate
+                   = cash_amount (до копеек в рублях). Перед сводкой проверь это
+                   сама; если не сходится — покажи пользователю, какое число
+                   получается делением, и попроси исправить одно из трёх.
+                   Бот проверит то же самое и не создаст сделку при расхождении.
                    Идёт ТОЛЬКО в Поручение, в паре с курсом поручения.
 cash_amount_words — НЕ ЗАПОЛНЯЙ. Пропись всегда считается по числу, иначе с
                    округлением до цента цифры и пропись разойдутся.
@@ -955,8 +960,8 @@ corr_bank_acc    — ТОЛЬКО для corr: его корр. счёт, 20 ц�
             + buyer_inn, ЕСЛИ buyer_type="ИП" (иначе buyer_inn не нужен)
 Продавец:   seller_name, seller_initials, seller_id_issued_date, seller_birth_date, seller_address, seller_id_number, seller_id_issued_by, seller_inn
 Автомобиль: car_model, car_vin, car_year, car_color, tpo_number, tpo_date
-Финансы:    car_price, car_price_words, currency, cash_currency, exchange_rate
-            (cash_amount и cash_amount_words БОЛЬШЕ НЕ ОБЯЗАТЕЛЬНЫ — см. ниже про два курса)
+Финансы:    car_price, car_price_words, currency, cash_currency, exchange_rate, cash_amount
+            (cash_amount_words НЕ заполняй — пропись считается по числу)
 Реквизиты:  account_type, account_number, account_currency, bank_name, bank_bic, bank_corr_acc
             для account_type = "corr" дополнительно: corr_bank_name, corr_bank_bic, corr_bank_acc
             Проще всего взять их целиком из сохранённого профиля реквизитов, не собирая по полю.
@@ -1162,7 +1167,8 @@ seller_name, seller_birth_date, seller_address, seller_id_number, seller_id_issu
 
 1a. ДВА КУРСА И ДВЕ СУММЫ В ВАЛЮТЕ — не путай их:
    - exchange_rate («Курс USD/RUB») — курс на дату составления Поручения. Спрашивается
-     при создании сделки. Сумма в Поручении считается сама: car_price / exchange_rate.
+     при создании сделки вместе с cash_amount (суммой Поручения в долларах).
+     Проверка: car_price / exchange_rate = cash_amount.
    - «Фактический курс» — курс, по которому банк реально конвертировал деньги.
      Известен только через несколько дней, после поступления средств. При создании
      сделки его НЕ спрашивай. Заполняется вручную.
@@ -1176,8 +1182,9 @@ seller_name, seller_birth_date, seller_address, seller_id_number, seller_id_issu
    акта, отчёта и примечании к Поручению. Скрывать и подгонять его не нужно.
 
 2. Если пользователь не назвал цвет автомобиля — обязательно спроси.
-3. Сумму наличных (cash_amount) при создании сделки НЕ спрашивай — на этот момент
-   конвертации ещё не было. Её и «Фактический курс» бот запросит перед распиской.
+3. Сумму Поручения в долларах (cash_amount) при создании сделки СПРАШИВАЙ и проверяй
+   делением car_price / exchange_rate. «Фактический курс» и «Сумму выдана» при
+   создании НЕ спрашивай — конвертации ещё не было, их бот запросит перед распиской.
 4. Собери все недостающие поля в ОДНОМ вопросе, не задавай по одному.
 5. Когда все обязательные поля собраны — ПЕРЕД вызовом create_contract выведи сводку всех данных в чат в таком формате и жди подтверждения:
 
@@ -2069,6 +2076,33 @@ VIN: ...
             # бы и в журнал ушла дата договора.
             if tool_input.get("dkp_date") and not data.get("dkp_date"):
                 data["dkp_date"] = tool_input["dkp_date"]
+
+            # «Сумма нал. (USD)» — сумма Поручения в долларах. Агент спрашивает
+            # её при создании сделки и передаёт сам. Здесь, ДО создания папки,
+            # сборки документов и записи в журнал, проверяем её делением:
+            # цена ДКП / курс поручения. Допуск тот же, что у doc_builder
+            # (AMOUNT_TOLERANCE_RUB), иначе сделка создалась бы, а Поручение
+            # потом упало бы на той же проверке.
+            # Если агент всё же не передал сумму — считаем её сами той же
+            # order_amount(), чтобы колонка в журнале не оставалась пустой.
+            _price = _dkp_float(data.get("car_price"))
+            _rate  = _dkp_float(data.get("exchange_rate"))
+            _cash  = _dkp_float(data.get("cash_amount"))
+            if _cash and _price and _rate:
+                if abs(_cash * _rate - _price) > AMOUNT_TOLERANCE_RUB:
+                    _calc = order_amount(_price, _rate)
+                    _n = lambda v: f"{v:,.2f}".replace(",", " ")
+                    return {"error": (
+                        "⚠️ Сумма Поручения не сходится с ценой ДКП и курсом:\n"
+                        f"{_n(_price)} / {_rate:.2f} = {_n(_calc)} USD, "
+                        f"а указано {_n(_cash)} USD.\n"
+                        "Сделка не создана. Исправьте цену ДКП, курс или сумму "
+                        "в долларах — и я создам её заново."
+                    )}
+            elif not _cash:
+                _order = order_amount(_price, _rate)
+                if _order:
+                    data["cash_amount"] = f"{_order:.2f}".replace(".", ",")
 
             date           = tool_input.get("contract_date") or datetime.now().strftime("%d.%m.%Y")
             commission_pct = float(tool_input.get("commission_pct", 1.0))
