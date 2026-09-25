@@ -2280,9 +2280,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.error(f"Ошибка check_deal для {num}: {e}", exc_info=True)
                 result = {"message": f"⚠️ Не удалось загрузить сделку {num}: {e}"}
 
+            # Если сделка не готова (не хватает полей, не найдена, ошибка) —
+            # у ответа нет своих кнопок. Без них из этого сообщения некуда
+            # вернуться, и сделку приходилось вызывать заново через поиск.
+            buttons = result.get("buttons") or [
+                {"text": "🔄 Проверить снова", "callback_data": f"dealaction:{num}:docs"},
+                {"text": "◀️ К сделке",        "callback_data": f"dealaction:{num}:menu"},
+            ]
             await send_result(query.message, {
                 "text":    result.get("message") or result.get("error", ""),
-                "buttons": result.get("buttons"),
+                "buttons": buttons,
             }, context=context)
 
         elif action in ("build_act", "build_receipt", "build_report"):

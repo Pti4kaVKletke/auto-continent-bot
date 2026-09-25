@@ -18,7 +18,7 @@ import bank_requisites as br
 import company
 from drive_service import GoogleDriveService
 from doc_builder import (DocumentBuilder, MissingDataError, AmountMismatchError,
-                         order_amount, AMOUNT_TOLERANCE_RUB,
+                         order_amount, amount_to_words_plain, AMOUNT_TOLERANCE_RUB,
                          _to_float as _dkp_float)
 from gsheets_service import GoogleSheetsService
 
@@ -2104,6 +2104,13 @@ VIN: ...
                 if _order:
                     data["cash_amount"] = f"{_order:.2f}".replace(".", ",")
 
+            # Пропись суммы в долларах агент не заполняет — пишем её сами,
+            # той же функцией, что и doc_builder для Поручения. Перезаписываем
+            # всегда: пропись обязана совпадать с числом в журнале.
+            _cash_final = _dkp_float(data.get("cash_amount"))
+            if _cash_final:
+                data["cash_amount_words"] = amount_to_words_plain(_cash_final)
+
             date           = tool_input.get("contract_date") or datetime.now().strftime("%d.%m.%Y")
             commission_pct = float(tool_input.get("commission_pct", 1.0))
             deal_folder_id = await self.drive.get_or_create_deal_folder(number)
@@ -2463,7 +2470,8 @@ VIN: ...
                 ("car_price_words",      "Цена прописью"),
                 ("currency",             "Валюта ДКП"),
                 ("cash_amount",          "Сумма наличных (USD)"),
-                ("cash_amount_words",    "Сумма наличных прописью"),
+                # cash_amount_words НЕ обязательна: пропись doc_builder всегда
+                # считает сам по числу cash_amount, колонка в журнале не нужна.
                 ("cash_currency",        "Валюта наличных"),
                 ("exchange_rate",        "Курс USD/RUB"),
                 ("account_currency",     "Валюта счёта"),
@@ -2507,7 +2515,7 @@ VIN: ...
                     f"📋 Сделка {contract_number} от {contract_date}\n",
                     f"❌ Не заполнено {len(missing)} обязательных полей:\n",
                 ] + missing + [
-                    f"\nЗаполни эти поля в таблице и снова напиши «проверь {contract_number}»."
+                    f"\nЗаполни эти поля в таблице и проверь сделку снова."
                 ]
                 return {"message": "\n".join(lines)}
 
