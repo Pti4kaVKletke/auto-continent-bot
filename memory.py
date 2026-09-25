@@ -63,7 +63,23 @@ def init_db():
         );
     """)
     conn.commit()
+    _migrate_history_chat_id(conn)
     conn.close()
+
+
+def _migrate_history_chat_id(conn):
+    """Разовая миграция: история диалога становится отдельной для каждого чата.
+
+    Добавляет колонку chat_id. Старая общая история удаляется (решение Ильи
+    25.09.2026): её не к кому отнести, а хранится она всё равно только 7 дней.
+    Идемпотентна — на уже мигрированной базе ничего не делает.
+    """
+    cols = [r["name"] for r in conn.execute("PRAGMA table_info(history)").fetchall()]
+    if "chat_id" not in cols:
+        conn.execute("ALTER TABLE history ADD COLUMN chat_id TEXT NOT NULL DEFAULT ''")
+        conn.execute("DELETE FROM history")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_history_chat ON history(chat_id, id)")
+    conn.commit()
 
 
 # --- Настройки ---
@@ -179,15 +195,22 @@ def delete_instruction(instruction_id: int):
 
 # --- История диалога ---
 
-def add_to_history(role: str, content: str):
+# История хранится отдельно для каждого Telegram-чата (chat_id): у каждого
+# пользователя бота свой контекст, чужие сообщения (паспорта, ИНН) модель не видит.
+
+def add_to_history(role: str, content: str, chat_id: str = ""):
+    chat_id = str(chat_id or "")
     conn = get_conn()
-    conn.execute("INSERT INTO history (role, content) VALUES (?, ?)", (role, content))
-    # Оставляем только последние 50 сообщений
+    conn.execute(
+        "INSERT INTO history (role, content, chat_id) VALUES (?, ?, ?)",
+        (role, content, chat_id),
+    )
+    # Оставляем только последние 50 сообщений этого чата
     conn.execute("""
-        DELETE FROM history WHERE id NOT IN (
-            SELECT id FROM history ORDER BY id DESC LIMIT 50
+        DELETE FROM history WHERE chat_id = ? AND id NOT IN (
+            SELECT id FROM history WHERE chat_id = ? ORDER BY id DESC LIMIT 50
         )
-    """)
+    """, (chat_id, chat_id))
     # Удаляем записи старше HISTORY_RETENTION_DAYS (могут содержать паспортные данные, ИНН и т.п.)
     conn.execute(
         "DELETE FROM history WHERE created_at < datetime('now', ?)",
@@ -197,18 +220,19 @@ def add_to_history(role: str, content: str):
     conn.close()
 
 
-def get_history(limit: int = 20) -> list:
+def get_history(limit: int = 20, chat_id: str = "") -> list:
     conn = get_conn()
     rows = conn.execute(
-        "SELECT role, content FROM history ORDER BY id DESC LIMIT ?", (limit,)
+        "SELECT role, content FROM history WHERE chat_id = ? ORDER BY id DESC LIMIT ?",
+        (str(chat_id or ""), limit),
     ).fetchall()
     conn.close()
     return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
 
 
-def clear_history():
+def clear_history(chat_id: str = ""):
     conn = get_conn()
-    conn.execute("DELETE FROM history")
+    conn.execute("DELETE FROM history WHERE chat_id = ?", (str(chat_id or ""),))
     conn.commit()
     conn.close()
 

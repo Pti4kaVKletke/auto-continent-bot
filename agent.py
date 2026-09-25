@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 import memory
 import bank_requisites as br
+import money
 import company
 from drive_service import GoogleDriveService
 from doc_builder import (DocumentBuilder, MissingDataError, AmountMismatchError,
@@ -114,12 +115,13 @@ def _settlement_base(deal: dict) -> float:
     Разница между базой и ценой ДКП — дело Покупателя и Продавца; Агент
     отвечает только за сумму, которую сам принял и выдал.
     """
-    price = _num(deal.get("car_price", 0))
+    price  = _num(deal.get("car_price", 0))
+    legacy = money.is_legacy(deal.get("Номер договора", ""))   # см. money.py
 
     paid_currency = _num(deal.get("Сумма выдана (USD)"))
     rate_fact     = _num(deal.get("Фактический курс"))
     if paid_currency and rate_fact:
-        restored = round(paid_currency * rate_fact, 2)
+        restored = money.mul(paid_currency, rate_fact, legacy)
         # Валютная сумма округлена до цента, поэтому обратный пересчёт даёт
         # не ровно цену ДКП, а её ±копейки. В пределах рубля — той же
         # точности, с какой сверяет _check_amounts, — считаем базой саму цену,
@@ -135,7 +137,7 @@ def _settlement_base(deal: dict) -> float:
         return price
 
     pct = _num(deal.get("Комиссия %", 0))
-    return round(received / (1 + pct / 100.0), 2)
+    return money.base_from_received(received, pct, legacy)
 
 
 def _num(v) -> float:
@@ -792,6 +794,8 @@ class DocumentAgent:
 Когда пользователь просит создать сделку на основе существующей ("как в NNN", "используй данные покупателя/продавца из NNN", "скопируй NNN", "новая сделка как NNN") — ВСЕГДА вызывай copy_deal. Не пытайся сам вытаскивать данные через find_deal и потом создавать через create_contract — это делает copy_deal одним шагом с предпросмотром и подтверждением. Если пользователь в том же сообщении назвал новое авто/цену — передай их в overrides. После того как пользователь подтвердил копирование ("подтверждено", "давай", "ок") и назвал недостающие поля (обычно VIN, модель, цена) — вызывай create_contract, объединив данные из предпросмотра copy_deal (они есть в истории диалога) с новыми полями от пользователя.
 Когда пользователь просит создать новую сделку "как в NNN", "используй данные покупателя/продавца/реквизиты из NNN", "тот же покупатель что и в NNN", "скопируй данные из сделки NNN" — сначала вызови find_deal(query="NNN") и возьми оттуда нужные поля. Дальше см. секцию КОПИРОВАНИЕ ДАННЫХ ИЗ СУЩЕСТВУЮЩЕЙ СДЕЛКИ.
 
+ЖУРНАЛ ДЕЙСТВИЙ В ИСТОРИИ: после твоих прошлых ответов в истории диалога может стоять служебная строка «[действия: …]» — это журнал инструментов, которые реально были вызваны на том ходе, с номерами сделок и изменёнными полями. Используй её, чтобы понять, о какой сделке идёт речь («поменяй там курс», «а теперь акт»). Сама такую строку НИКОГДА не пиши: действие считается выполненным только если ты вызвала инструмент. Персональные данные в журнале не хранятся — если они нужны, заново вызови find_deal.
+
 === ПРОВЕРКА И СОЗДАНИЕ ДОКУМЕНТОВ ИЗ ТАБЛИЦЫ ===
 
 Когда пользователь просит проверить сделку или создать документы на основе данных из таблицы:
@@ -1411,9 +1415,10 @@ VIN: ...
         # force_tool игнорируется в v1 — параметр есть только для совместимости
         # сигнатуры с v2; в v2 он форсирует конкретный tool_choice на первой итерации.
         self._current_chat_id = chat_id
-        memory.add_to_history("user", user_text if not filepath else f"[файл: {filename}] {user_text}")
+        memory.add_to_history("user", user_text if not filepath else f"[файл: {filename}] {user_text}",
+                              chat_id=chat_id)
 
-        history  = memory.get_history(limit=15)
+        history  = memory.get_history(limit=15, chat_id=chat_id)
         messages = []
 
         # Санитизация: убираем consecutive same-role сообщения (Anthropic API вернёт 400)
@@ -1459,7 +1464,7 @@ VIN: ...
                 "files": [],
                 "success": False,
             }
-        memory.add_to_history("assistant", result.get("text", ""))
+        memory.add_to_history("assistant", result.get("text", ""), chat_id=chat_id)
         result = self._maybe_inject_bank_choice(result)
         return result
 
@@ -2032,7 +2037,21 @@ VIN: ...
 
         return result
 
+    # Инструменты, которые не пишут в журнал — работают и при заблокированной записи.
+    JOURNAL_READONLY_TOOLS = {
+        "find_deal", "get_statistics", "copy_deal",
+        "save_company", "save_instruction", "save_bank_profile", "delete_bank_profile",
+        "request_bank_choice", "request_date_choice",
+    }
+
     async def _execute_tool(self, tool_name: str, tool_input: dict) -> dict:
+
+        # Колонки журнала разошлись с кодом → не пишем и не выпускаем документы:
+        # иначе комплект уйдёт клиенту, а строка в журнале запишется криво.
+        if tool_name not in self.JOURNAL_READONLY_TOOLS:
+            block_reason = await self.sheets.journal_block_reason()
+            if block_reason:
+                return {"error": block_reason}
 
         if tool_name == "create_contract":
             contract_date = tool_input.get("contract_date") or None
@@ -2105,7 +2124,7 @@ VIN: ...
             _cash  = _dkp_float(data.get("cash_amount"))
             if _cash and _price and _rate:
                 if abs(_cash * _rate - _price) > AMOUNT_TOLERANCE_RUB:
-                    _calc = order_amount(_price, _rate)
+                    _calc = order_amount(_price, _rate, number)
                     _n = lambda v: f"{v:,.2f}".replace(",", " ")
                     return {"error": (
                         "⚠️ Сумма Поручения не сходится с ценой ДКП и курсом:\n"
@@ -2115,7 +2134,7 @@ VIN: ...
                         "в долларах — и я создам её заново."
                     )}
             elif not _cash:
-                _order = order_amount(_price, _rate)
+                _order = order_amount(_price, _rate, number)
                 if _order:
                     data["cash_amount"] = f"{_order:.2f}".replace(".", ",")
 
@@ -3315,7 +3334,8 @@ VIN: ...
         if str(deal.get("Сумма выдана (USD)") or "").strip():
             return deal
 
-        paid = order_amount(_settlement_base(deal), deal.get("Фактический курс"))
+        paid = order_amount(_settlement_base(deal), deal.get("Фактический курс"),
+                            deal.get("Номер договора", ""))
         if not paid:
             return deal
 

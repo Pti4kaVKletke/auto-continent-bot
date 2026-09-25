@@ -15,6 +15,7 @@ from openpyxl.utils import get_column_letter
 from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
 
 import bank_requisites as br
+import money
 import company
 
 try:  # настройки компании лежат в SQLite бота; без неё работают значения по умолчанию
@@ -143,7 +144,7 @@ def _to_float(v):
         return None
 
 
-def order_amount(price_val, rate) -> float | None:
+def order_amount(price_val, rate, contract_number: str = "") -> float | None:
     """
     Сумма в валюте = цена в рублях / курс, округлённая ДО ЦЕНТА.
 
@@ -160,7 +161,8 @@ def order_amount(price_val, rate) -> float | None:
     rate  = _to_float(rate)
     if not price or not rate:
         return None
-    return round(price / rate, 2)
+    # Правило округления зависит от даты сделки — см. money.py
+    return money.div(price, rate, money.is_legacy(contract_number))
 
 
 def _check_amounts(price_val: float, pairs: list, doc_name: str) -> None:
@@ -788,8 +790,9 @@ class DocumentBuilder:
         except Exception:
             price_val = 0.0
 
-        commission = round(price_val * commission_pct / 100, 2)
-        total       = round(price_val + commission, 2)
+        _legacy     = money.is_legacy(number)
+        commission  = money.commission(price_val, commission_pct, _legacy)
+        total       = money.add(price_val, commission, _legacy)
         currency    = data.get("currency", "RUB")
         acc_cur     = bank["account_currency"] or currency
         buyer       = data.get("buyer_name", data.get("company_name", ""))
@@ -1766,7 +1769,7 @@ class DocumentBuilder:
         # Колонка журнала «Сумма нал. (USD)» (cash_amount) — это она и есть.
         order_val = _to_float(data.get("cash_amount"))
         if not order_val:
-            order_val = order_amount(price_val, rate_order)
+            order_val = order_amount(price_val, rate_order, number)
 
         # ФАКТИЧЕСКАЯ сумма — в расписку, акт и отчёт, в паре с фактическим
         # курсом. Считается заново от фактического курса, а не берётся из
@@ -1779,7 +1782,7 @@ class DocumentBuilder:
         cash_val = _to_float(data.get("Сумма выдана (USD)")
                              or data.get("cash_paid_amount"))
         if not cash_val:
-            cash_val = order_amount(base_val, rate_fact)
+            cash_val = order_amount(base_val, rate_fact, number)
 
         cash_fmt  = _fmt_num(cash_val) if cash_val else ""
         order_fmt = _fmt_num(order_val) if order_val else ""
@@ -1793,8 +1796,9 @@ class DocumentBuilder:
         # Комиссия = ЦЕНА_ЦИФРАМИ × КОМИССИЯ% / 100, база — сумма Поручения
         # (car_price). Считаем здесь, а не в каждом build_*, чтобы акт, отчёт
         # и счёт никогда не разошлись в арифметике.
-        commission_val = round(base_val * commission_pct / 100, 2)
-        total_val      = round(base_val + commission_val, 2)
+        _legacy        = money.is_legacy(number)
+        commission_val = money.commission(base_val, commission_pct, _legacy)
+        total_val      = money.add(base_val, commission_val, _legacy)
 
         # ── Проверка арифметики сделки ─────────────────────────────────────
         # Комиссия и итог считаются здесь же, поэтому сойтись обязаны всегда.

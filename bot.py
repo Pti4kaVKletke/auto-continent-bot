@@ -603,7 +603,7 @@ async def daily_backup_job(context: ContextTypes.DEFAULT_TYPE):
 
 async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
-    memory.clear_history()
+    memory.clear_history(chat_id)
     memory.clear_pending_scans(chat_id)
     context.user_data.clear()
     await update.message.reply_text(
@@ -763,7 +763,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Сценарий Г: файл без контекста — спрашиваем что делать ──
     caption = message.caption or ""
 
-    has_history = len(memory.get_history(limit=3)) > 0
+    has_history = len(memory.get_history(limit=3, chat_id=chat_id)) > 0
     buttons = [
         [InlineKeyboardButton("📄 Читать и начать новую сделку", callback_data="scan_route:new")],
     ]
@@ -3277,6 +3277,27 @@ def main():
             except Exception as e:
                 logger.error(f"Миграция колонок журнала не удалась: {e}", exc_info=True)
         app.job_queue.run_once(_migrate_requisites_job, when=5, name="migrate_requisites")
+
+        # ── Сверка колонок журнала с кодом ───────────────────────────────
+        # После миграции (when=5), чтобы читать уже итоговую раскладку.
+        # При расхождении запись в журнал блокируется (gsheets_service),
+        # а всем разрешённым чатам уходит сообщение со списком колонок.
+        async def _verify_headers_job(ctx):
+            res = await agent.sheets.verify_headers()
+            if res.get("ok") is False:
+                text = (
+                    "🔒 Колонки журнала не совпадают с кодом бота — запись в журнал "
+                    "и выпуск документов заблокированы.\n\n"
+                    + agent.sheets.format_header_diffs(res["diffs"])
+                    + "\n\nПоиск и просмотр сделок работают. Поправьте заголовки в строке 2 "
+                      "таблицы (или обновите код) — блокировка снимется сама в течение минуты."
+                )
+                for chat_id in _get_allowed_chat_ids():
+                    try:
+                        await ctx.bot.send_message(chat_id=chat_id, text=text)
+                    except Exception as e:
+                        logger.warning(f"Не удалось уведомить {chat_id} о колонках журнала: {e}")
+        app.job_queue.run_once(_verify_headers_job, when=20, name="verify_headers")
 
     # Разовый разбор деклараций (ИНН продавца, seller_inn) отработал
     # 10.09.2026 и здесь больше не запускается — код планировщика убран,

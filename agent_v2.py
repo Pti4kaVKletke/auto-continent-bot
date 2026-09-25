@@ -18,6 +18,7 @@ import asyncio
 import contextvars
 import logging
 import random
+import re
 from pathlib import Path
 
 import anthropic
@@ -94,6 +95,97 @@ def _retry_after_seconds(e: BaseException):
         return None
 
 
+# ── Журнал действий в истории диалога ────────────────────────────────────
+# В историю (SQLite) сохраняется только текст ответа. Чтобы на следующем
+# сообщении модель знала, какую сделку она нашла/изменила, к сохранённому
+# ответу дописывается служебная строка «[действия: …]». Пользователь её не
+# видит. Персональные данные сюда НЕ попадают: берутся только номера сделок,
+# названия полей, суммы/даты платежей и статус. Результаты инструментов
+# (там паспорта, адреса) целиком не сохраняются.
+ACTIONS_MARK      = "[действия:"
+MAX_LOGGED_TOOLS  = 5
+_CONTRACT_NUM_RE  = re.compile(r"(?<!\d)\d{9}(?!\d)")
+_VIN_RE           = re.compile(r"^[A-HJ-NPR-Z0-9]{17}$", re.IGNORECASE)
+_ACTIONS_STRIP_RE = re.compile(r"\s*\[действия:[^\]]*\]\s*$")
+# Длинные цифровые последовательности (паспорт, ИНН, счета) — маскируем.
+_LONG_DIGITS_RE   = re.compile(r"\d[\d ]{8,}\d")
+
+
+def _mask_digits(text: str) -> str:
+    """Оставляет 9-значные номера сделок, остальные длинные числа — ***."""
+    def _sub(m):
+        raw = m.group(0)
+        return raw if _CONTRACT_NUM_RE.fullmatch(raw) else "***"
+    return _LONG_DIGITS_RE.sub(_sub, text)
+
+
+def _summarize_tool(name: str, tool_input: dict, tool_result: dict) -> str:
+    """Одна строка журнала: инструмент(ключевые параметры) → итог."""
+    tool_input  = tool_input or {}
+    tool_result = tool_result or {}
+    args = []
+
+    num = tool_input.get("contract_number") or tool_input.get("existing_contract_number")
+    if num:
+        args.append(str(num))
+    if name == "find_deal":
+        q = str(tool_input.get("query", "")).strip()
+        if _CONTRACT_NUM_RE.fullmatch(q):
+            args.append(q)
+        elif _VIN_RE.match(q):
+            args.append(f"VIN …{q[-6:].upper()}")
+        elif q:
+            args.append("поиск по тексту")
+    if name == "update_deal" and isinstance(tool_input.get("updates"), dict):
+        fields = list(tool_input["updates"].keys())
+        args.append("поля: " + ", ".join(fields[:8]) + ("…" if len(fields) > 8 else ""))
+    if name == "add_payment":
+        args.append(f"{tool_input.get('amount', '')} от {tool_input.get('date', '')}".strip())
+    if name == "remove_payment" and tool_input.get("index") is not None:
+        args.append(f"№{tool_input.get('index')}")
+    if tool_input.get("doc_type"):
+        args.append(f"тип {tool_input['doc_type']}")
+    if name == "get_statistics" and tool_input.get("period"):
+        args.append(str(tool_input["period"]))
+
+    err = tool_result.get("error")
+    msg = str(tool_result.get("message") or "")
+    first_line = (str(err) if err else msg).strip().splitlines()[0] if (err or msg.strip()) else ""
+    failed = bool(err) or first_line.startswith(("❌", "🚫", "⚠️"))
+
+    if failed:
+        # Текст в «ёлочках» — обычно эхо запроса (может быть ФИО) — не храним.
+        safe = re.sub(r"«[^»]*»", "«…»", first_line)
+        outcome = "ошибка: " + _mask_digits(safe)[:120]
+    else:
+        # Номера сделок из результата (find_deal, create_contract, copy_deal)
+        found = []
+        for n in _CONTRACT_NUM_RE.findall(msg):
+            if n not in found and n not in args:
+                found.append(n)
+        outcome = "OK" + (f", сделки: {', '.join(found[:3])}" if found else "")
+        if tool_result.get("file") or tool_result.get("extra_files"):
+            outcome += ", файлы выданы"
+
+    return f"{name}({'; '.join(a for a in args if a)}) → {outcome}"
+
+
+def _strip_actions(text: str) -> str:
+    """Страховка: модель не должна сама писать «[действия: …]» пользователю."""
+    return _ACTIONS_STRIP_RE.sub("", text or "")
+
+
+def _with_actions(text: str, actions: list) -> str:
+    """Текст для истории: ответ + служебная строка журнала действий."""
+    if not actions:
+        return text
+    # Важнее последние действия — они и определяют, «о какой сделке речь».
+    shown = actions[-MAX_LOGGED_TOOLS:]
+    extra = len(actions) - len(shown)
+    line = (f"ранее ещё {extra}; " if extra > 0 else "") + "; ".join(shown)
+    return f"{text}\n\n{ACTIONS_MARK} {line}]".strip()
+
+
 class DocumentAgent(_AgentV1):
     """
     Переопределяет только process_message — всё остальное наследуется из agent.py:
@@ -142,6 +234,7 @@ class DocumentAgent(_AgentV1):
         memory.add_to_history(
             "user",
             user_text if not filepath else f"[файл: {filename}] {user_text}",
+            chat_id=chat_id,
         )
 
         # ── Кэшируем промпт и tools один раз на весь цикл ─────────────────
@@ -151,7 +244,7 @@ class DocumentAgent(_AgentV1):
         tools = self._get_tools()
 
         # ── История + санитизация consecutive same-role ───────────────────
-        history = memory.get_history(limit=15)
+        history = memory.get_history(limit=15, chat_id=chat_id)
         sanitized = []
         for h in history[:-1]:
             if sanitized and sanitized[-1]["role"] == h["role"]:
@@ -180,6 +273,7 @@ class DocumentAgent(_AgentV1):
         # ── Agentic loop ──────────────────────────────────────────────────
         result = {"text": "", "files": [], "success": True, "buttons": None}
         tools_called = []         # для логирования при превышении лимита
+        actions_log  = []         # журнал действий для истории (без ПДн)
         force_text_only = False   # если был terminal/button tool — следующий ход без tools
 
         for iteration in range(MAX_ITERATIONS):
@@ -209,7 +303,9 @@ class DocumentAgent(_AgentV1):
                         result["text"] + "\n\n⚠️ Соединение прервалось — часть операций могла не завершиться."
                     ).strip()
                     result["success"] = False
-                    memory.add_to_history("assistant", result["text"])
+                    result["text"] = _strip_actions(result["text"])
+                    memory.add_to_history("assistant", _with_actions(result["text"], actions_log),
+                                          chat_id=chat_id)
                     return result
                 return {
                     "text": "⚠️ Ошибка соединения с AI. Попробуйте ещё раз.",
@@ -256,6 +352,11 @@ class DocumentAgent(_AgentV1):
 
                 self._collect_files(tool_result, result)
 
+                try:
+                    actions_log.append(_summarize_tool(tool_block.name, tool_block.input, tool_result))
+                except Exception as e:  # журнал — вспомогательный, не роняем ход
+                    logger.warning(f"[v2] Не удалось записать действие {tool_block.name}: {e}")
+
                 if tool_result.get("buttons"):
                     result["buttons"] = tool_result["buttons"]
                     needs_user_input = True
@@ -301,7 +402,9 @@ class DocumentAgent(_AgentV1):
         # Дедуп файлов на случай если LLM повторила tool-call с теми же артефактами
         result["files"] = self._dedup_files(result["files"])
 
-        memory.add_to_history("assistant", result.get("text", ""))
+        result["text"] = _strip_actions(result.get("text", ""))
+        memory.add_to_history("assistant", _with_actions(result["text"], actions_log),
+                              chat_id=chat_id)
         result = self._maybe_inject_bank_choice(result)
         return result
 

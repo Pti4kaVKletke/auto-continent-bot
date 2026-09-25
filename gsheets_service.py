@@ -12,6 +12,7 @@ from googleapiclient.discovery import build
 
 import bank_requisites as br
 import memory
+import money
 
 logger = logging.getLogger(__name__)
 
@@ -203,6 +204,79 @@ COLUMNS = [
 ]
 
 
+# ── Проверка заголовков журнала (строка 2) ──────────────────────────────
+# Запись идёт по индексу COLUMNS, поэтому если колонки в таблице и в коде
+# разъедутся, бот начнёт писать данные в чужие колонки. При старте и перед
+# записью бот сверяет строку 2 с этим списком; при расхождении ЗАПИСЬ
+# БЛОКИРУЕТСЯ (решение Ильи 25.09.2026, «вариант А»), чтение работает.
+#
+# Список — подписи колонок ровно как в таблице, в том же порядке, что COLUMNS.
+# Кортеж = допустимые варианты подписи. Добавляя колонку в COLUMNS, добавь
+# сюда её подпись В ТО ЖЕ МЕСТО.
+EXPECTED_HEADERS = [
+    "Номер договора", "Дата договора", "Номер ДКП", "Дата ДКП",
+    "Сумма Договора", "Сумма Комиссии", "Дата поступления", "Дата расчёта",
+    "Статус",
+    "Тип Покупателя", "ФИО покупателя", "Паспорт серия", "Паспорт номер",
+    "Дата рождения", "ИНН Покупателя", "Адрес регистрации", "Инициалы",
+    "Кем выдан", "Дата выдачи", "Код подразд.",
+    "ФИО продавца", "ИНН", "ID карта №", "Дата рождения", "Адрес", "Инициалы",
+    "Кем выдана", "Дата выдачи",
+    "Марка/модель", "VIN", "Год", "Цвет", "№ ТПО", "№ кузова", "Дата ТПО",
+    "Цена ДКП (руб.)", "Сумма нал. (USD)", "Курс USD/RUB поручения",
+    "Курс USD/RUB фактический", "Сумма выдана (USD)", "Комиссия %",
+    "Цена прописью", "Валюта ДКП", "Сумма прописью", "Валюта нал.",
+    "Валюта счёта", "Номер счёта", "account_type", "Банк", "БИК банка",
+    "Корр. счёт банка", "SWIFT банка", "Банк-корреспондент",
+    "БИК корреспондента", "Корр. счёт корреспондента",
+    "Банковские реквизиты покупателя",
+    "Комментарий",
+    "Платежи", "Получено", "Остаток",
+    "Папка Drive", "Сканы",
+    ("Штамп и подпись", "Штам и подпись"),   # в таблице сейчас с опечаткой
+]
+assert len(EXPECTED_HEADERS) == len(COLUMNS), (
+    f"EXPECTED_HEADERS ({len(EXPECTED_HEADERS)}) не совпадает с COLUMNS ({len(COLUMNS)})"
+)
+
+HEADER_ROW = 2
+HEADER_RECHECK_SEC = 60   # как часто перечитывать заголовок, пока запись заблокирована
+
+
+class JournalLockedError(Exception):
+    """Запись в журнал заблокирована: колонки таблицы не совпадают с кодом."""
+
+
+def _norm_header(v) -> str:
+    return re.sub(r"\s+", " ", str(v or "").strip().lower().replace("ё", "е"))
+
+
+def compare_headers(actual: list) -> list:
+    """Сравнивает фактическую строку заголовков с EXPECTED_HEADERS.
+
+    Возвращает список расхождений (пустой — всё совпало):
+    [(буква колонки, ожидается, в таблице), ...]
+    """
+    def letter(idx):
+        out, idx = "", idx + 1
+        while idx:
+            idx, rem = divmod(idx - 1, 26)
+            out = chr(65 + rem) + out
+        return out
+
+    actual = list(actual or [])
+    diffs = []
+    for i, exp in enumerate(EXPECTED_HEADERS):
+        variants = exp if isinstance(exp, tuple) else (exp,)
+        got = actual[i] if i < len(actual) else ""
+        if _norm_header(got) not in {_norm_header(v) for v in variants}:
+            diffs.append((letter(i), variants[0], str(got).strip() or "— пусто —"))
+    for i in range(len(EXPECTED_HEADERS), len(actual)):
+        if str(actual[i]).strip():
+            diffs.append((letter(i), "— колонки нет в коде —", str(actual[i]).strip()))
+    return diffs
+
+
 def _dkp_number(data: dict) -> str:
     """
     Номер ДКП = последние 6 знаков VIN.
@@ -245,6 +319,11 @@ class GoogleSheetsService:
 
     def __init__(self):
         self._service = None
+        # Состояние проверки заголовков: None — ещё не проверяли (или не
+        # смогли прочитать), True — совпадают, False — расхождение.
+        self._header_ok = None
+        self._header_checked_at = 0.0
+        self._header_diffs: list = []
 
     def _get_service(self):
         if self._service is None:
@@ -277,10 +356,85 @@ class GoogleSheetsService:
                     raise
         return None
 
+    # ── Проверка колонок ─────────────────────────────────────────────────
+
+    async def verify_headers(self) -> dict:
+        """Читает строку заголовков и сверяет с кодом.
+
+        Возвращает {"ok": True/False/None, "diffs": [...], "error": "..."}.
+        ok=None — прочитать не удалось (сеть/токен); запись это не блокирует,
+        проверка повторится перед следующей записью.
+        """
+        import time as _time
+
+        def _do():
+            svc = self._get_service()
+            res = svc.spreadsheets().values().get(
+                spreadsheetId=SPREADSHEET_ID,
+                range=f"A{HEADER_ROW}:ZZ{HEADER_ROW}",
+            ).execute()
+            vals = res.get("values", [[]])
+            return vals[0] if vals else []
+
+        try:
+            header = await self._sheets_retry(_do) or []
+        except Exception as e:
+            logger.warning(f"Проверка заголовков журнала: не удалось прочитать — {e}")
+            self._header_checked_at = _time.monotonic()
+            return {"ok": None, "diffs": [], "error": str(e)}
+
+        diffs = compare_headers(header)
+        self._header_ok = not diffs
+        self._header_diffs = diffs
+        self._header_checked_at = _time.monotonic()
+        if diffs:
+            logger.error(f"Колонки журнала не совпадают с кодом — запись заблокирована: {len(diffs)} расх., первые: {diffs[:5]}")
+        else:
+            logger.info(f"Колонки журнала совпадают с кодом ({len(COLUMNS)} шт.)")
+        return {"ok": self._header_ok, "diffs": diffs, "error": ""}
+
+    @staticmethod
+    def format_header_diffs(diffs: list, limit: int = 8) -> str:
+        lines = [f"• {col}: ожидается «{exp}», в таблице «{got}»" for col, exp, got in diffs[:limit]]
+        if len(diffs) > limit:
+            lines.append(f"• …и ещё {len(diffs) - limit}")
+        return "\n".join(lines)
+
+    async def journal_block_reason(self) -> str:
+        """Пустая строка — писать можно. Иначе — текст причины блокировки.
+
+        Пока запись заблокирована, заголовок перечитывается не чаще раза в
+        HEADER_RECHECK_SEC: как только таблицу поправили, блокировка снимается
+        сама, без перезапуска бота.
+        """
+        import time as _time
+        stale = _time.monotonic() - self._header_checked_at > HEADER_RECHECK_SEC
+        if self._header_ok is None or (self._header_ok is False and stale):
+            await self.verify_headers()
+        if self._header_ok is False:
+            return (
+                "🔒 Запись в журнал заблокирована: колонки таблицы не совпадают с кодом бота.\n"
+                + self.format_header_diffs(self._header_diffs)
+                + "\nПоиск и просмотр работают. Поправьте заголовки в строке 2 таблицы "
+                  "(или обновите код бота) — блокировка снимется сама в течение минуты."
+            )
+        return ""
+
+    async def _guard_write(self, what: str) -> bool:
+        """True — можно писать. False — заблокировано (причина уже в логе)."""
+        reason = await self.journal_block_reason()
+        if reason:
+            logger.error(f"{what}: запись в журнал отклонена — колонки не совпадают")
+            return False
+        return True
+
     async def save_deal(self, contract_number: str, contract_date: str,
                         deal_data: dict, commission_pct: float,
                         drive_folder_link: str = "") -> bool:
         """Добавляет строку сделки начиная с DATA_START_ROW."""
+        if not await self._guard_write(f"save_deal {contract_number}"):
+            return False
+
         def _do():
             svc = self._get_service()
             sheet = svc.spreadsheets()
@@ -294,8 +448,9 @@ class GoogleSheetsService:
                 price_val = float(str(data.get("car_price", "0")).replace(" ", "").replace(",", "."))
             except Exception:
                 price_val = 0.0
-            commission_sum = round(price_val * commission_pct / 100, 2)
-            total_sum = round(price_val + commission_sum, 2)
+            _legacy = money.is_legacy(contract_number)
+            commission_sum = money.commission(price_val, commission_pct, _legacy)
+            total_sum = money.add(price_val, commission_sum, _legacy)
 
             for col in COLUMNS:
                 if col == "Номер договора":
@@ -388,6 +543,9 @@ class GoogleSheetsService:
 
     async def update_deal(self, contract_number: str, updates: dict) -> bool:
         """Обновляет поля существующей сделки по номеру договора."""
+        if not await self._guard_write(f"update_deal {contract_number}"):
+            return False
+
         def _do():
             svc = self._get_service()
             sheet = svc.spreadsheets()
@@ -443,8 +601,9 @@ class GoogleSheetsService:
                     sum_idx   = COLUMNS.index("Сумма Договора")
                     price_val = float(str(current_row[price_idx]).replace(" ", "").replace(",", "."))
                     comm_pct  = float(str(current_row[comm_idx] or "1").replace(",", "."))
-                    comm_sum  = round(price_val * comm_pct / 100, 2)
-                    total_sum = round(price_val + comm_sum, 2)
+                    _legacy   = money.is_legacy(contract_number)
+                    comm_sum  = money.commission(price_val, comm_pct, _legacy)
+                    total_sum = money.add(price_val, comm_sum, _legacy)
                     current_row[comm_sum_idx] = f"{comm_sum:.2f}".replace(".", ",") if comm_sum > 0 else ""
                     current_row[sum_idx] = f"{total_sum:.2f}".replace(".", ",") if total_sum > 0 else ""
                 except Exception as e:
@@ -483,6 +642,8 @@ class GoogleSheetsService:
         пишет строку целиком). Возвращает число записанных ячеек.
         """
         if col_name not in COLUMNS or not values:
+            return 0
+        if not await self._guard_write(f"batch_update_column {col_name}"):
             return 0
         col = self._col_letter(COLUMNS.index(col_name))
 
