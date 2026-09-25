@@ -1557,6 +1557,32 @@ class DocumentBuilder:
                 result.append(word.capitalize())
         return " ".join(result)
 
+    @staticmethod
+    def _strip_ip_prefix(value) -> str:
+        """Убирает ведущие «ИП» / «Индивидуальный предприниматель» из ФИО или
+        инициалов (регистр не важен): «ИП Иванов И.И.» → «Иванов И.И.»."""
+        s = str(value or "").strip()
+        return re.sub(r"^(?:ип|индивидуальный\s+предприниматель)\b[\s.,:]*",
+                      "", s, flags=re.IGNORECASE).strip()
+
+    @staticmethod
+    def _split_inn_ogrnip(raw) -> tuple:
+        """Колонка «ИНН Покупателя»: ИНН, и (необязательно) ОГРНИП второй строкой
+        через Alt+Enter — или в одной строке через запятую/пробел, с подписями
+        «ИНН»/«ОГРНИП» или без. Узнаём по длине: 15 цифр — ОГРНИП, 12 (или 10)
+        — ИНН. Если распознать не удалось — первая строка целиком считается ИНН,
+        как было раньше."""
+        text = str(raw or "").strip()
+        if not text:
+            return "", ""
+        runs = re.findall(r"\d{10,15}", text)
+        ogrnip = next((r for r in runs if len(r) == 15), "")
+        inn = next((r for r in runs if len(r) in (12, 10)), "")
+        if not inn:
+            first = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+            inn = "" if (ogrnip and ogrnip in first) else first
+        return inn, ogrnip
+
     def _resolve_buyer_legal_fields(self, data: dict) -> dict:
         """Собирает {{ПОКУПАТЕЛЬ_ПОЛНЫЕ_ДАННЫЕ}} (преамбула во всех документах),
         {{ПОКУПАТЕЛЬ_БАНК_СТРОКА1..3}} (реквизиты собственного счёта покупателя
@@ -1580,6 +1606,14 @@ class DocumentBuilder:
         data = dict(data)
         n = self._normalize
         btype = (data.get("buyer_type") or "физ.лицо").strip().lower()
+        is_ip = btype in ("ип", "индивидуальный предприниматель")
+        if is_ip:
+            # В журнале ФИО/инициалы ИП могут быть уже записаны с «ИП» впереди
+            # («ИП Муллагалимов Расил Фанзилевич» в сделке 240726001). Префикс
+            # бот ставит сам ниже — чтобы не вышло «ИП ИП ...» / «Индивидуальный
+            # предприниматель ИП ...», убираем его из исходных полей (25.09.2026).
+            data["buyer_name"] = self._strip_ip_prefix(data.get("buyer_name", ""))
+            data["buyer_initials"] = self._strip_ip_prefix(data.get("buyer_initials", ""))
         name          = n(data.get("buyer_name", ""))
         passp_series  = data.get("passport_series", "")
         passp_number  = data.get("passport_number", "")
@@ -1597,11 +1631,14 @@ class DocumentBuilder:
 
         birth_date = data.get("buyer_birth_date", "")
 
-        if btype in ("ип", "индивидуальный предприниматель"):
-            inn = data.get("buyer_inn", "")
+        if is_ip:
+            # Колонка «ИНН Покупателя» может содержать и ОГРНИП второй строкой
+            # (Alt+Enter) — разбираем в _split_inn_ogrnip (25.09.2026).
+            inn, ogrnip = self._split_inn_ogrnip(data.get("buyer_inn", ""))
+            ogrnip_part = f", ОГРНИП {ogrnip}" if ogrnip else ""
             data["buyer_full_details"] = (
                 f"Индивидуальный предприниматель {name}, "
-                f"действующего на основании Свидетельства ИНН {inn}, "
+                f"действующего на основании Свидетельства ИНН {inn}{ogrnip_part}, "
                 f"{passport_part}"
             )
             # short_initials — «Фамилия И.И.» уже посчитаны выше по цепочке
@@ -1614,7 +1651,9 @@ class DocumentBuilder:
             # "в конце где стоят подписи ты не исправил блоки"). Образец — сделка
             # 240726001: "ИП Муллагалимов Расил Фанзилевич" / "ИНН 180804663178".
             data["buyer_signature_name_line"] = f"ИП {name}".strip()
-            data["buyer_signature_inn_line"] = f"ИНН {inn}" if str(inn).strip() else ""
+            data["buyer_signature_inn_line"] = (
+                f"ИНН {inn}{ogrnip_part}" if str(inn).strip() else ""
+            )
         else:
             data["buyer_full_details"] = (
                 f"Гражданин(ка) Российской Федерации {name}, "
@@ -1664,7 +1703,7 @@ class DocumentBuilder:
         # ДКП, Акт, Отчёт). См. buyer-legal-form-support в проектной памяти.
         data = self._resolve_buyer_legal_fields(data)
         if (data.get("buyer_type") or "").strip().lower() in ("ип", "индивидуальный предприниматель") \
-                and not str(data.get("buyer_inn") or "").strip():
+                and not self._split_inn_ogrnip(data.get("buyer_inn"))[0]:
             raise MissingDataError(output_name, ["ИНН покупателя (для ИП)"], [])
 
         # Нормализуем регистр текстовых полей — данные из КР-документов часто приходят КАПСОМ
