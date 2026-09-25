@@ -5,7 +5,7 @@ import random
 import re
 import time
 from pathlib import Path
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.constants import ChatAction
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from telegram.error import BadRequest
@@ -56,6 +56,11 @@ AWAITING_FLAGS = (
     "awaiting_edit_deal",
     "awaiting_payment_for_deal",
     "awaiting_doc_to_sign",
+    # После «📄 Новая сделка» файлы сразу читаются как документы сделки, без
+    # вопроса «что с ним делать». Значение — сколько файлов уже принято:
+    # первый читается «с нуля», следующие дополняют собранные данные.
+    # Сбрасывается любым кликом по кнопке (как и прочие awaiting-флаги).
+    "awaiting_new_deal_docs",
 )
 
 # Дополнительные "хвосты" — временные данные, привязанные к awaiting-состояниям
@@ -464,14 +469,31 @@ async def cmd_regen_docs(update: Update, context: ContextTypes.DEFAULT_TYPE):
                               agent.find_deals_missing_docs())
 
     all_candidates = info["candidates"]
+    resolved       = info.get("resolved_by_lookup") or {}
+    total_deals    = (len(all_candidates) + len(info["has_docs"])
+                      + len(info["no_folder"]) + len(info["cancelled"]))
+
     if not all_candidates:
-        extra = ""
+        lines = [
+            "✅ Пустых папок не найдено — пересобирать нечего.",
+            f"Всего сделок в журнале: {total_deals}",
+            f"Сделок с документами: {len(info['has_docs'])}",
+        ]
+        if info["cancelled"]:
+            lines.append(f"Отменённые — не проверяли: {len(info['cancelled'])}")
+        if resolved:
+            lines.append(
+                f"Папку пришлось восстановить по номеру (в журнале не было "
+                f"ссылки): {len(resolved)} — проверены наравне с остальными."
+            )
         if info["no_folder"]:
-            extra = f"\nБез ссылки на папку Drive: {len(info['no_folder'])}"
-        await update.message.reply_text(
-            "✅ Пустых папок не найдено — пересобирать нечего.\n"
-            f"Сделок с документами: {len(info['has_docs'])}{extra}"
-        )
+            sample = ", ".join(info["no_folder"][:10])
+            more = "…" if len(info["no_folder"]) > 10 else ""
+            lines.append(
+                f"⚠️ Папку не нашли и не восстановили (не проверяли вообще): "
+                f"{len(info['no_folder'])} — {sample}{more}"
+            )
+        await update.message.reply_text("\n".join(lines))
         return
 
     run_candidates = all_candidates if limit is None else all_candidates[:limit]
@@ -479,6 +501,7 @@ async def cmd_regen_docs(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines = [
         "🧾 *Пересборка документов*\n",
+        f"Всего сделок в журнале: {total_deals}",
         f"Пустых папок всего (кандидаты): *{len(all_candidates)}*",
     ]
     if remaining > 0:
@@ -488,12 +511,20 @@ async def cmd_regen_docs(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "другое число — `/regen_docs <число>`."
         )
     lines.append(f"С документами — не тронем: {len(info['has_docs'])}")
+    if info["cancelled"]:
+        lines.append(f"Отменённые сделки — не трогаем: {len(info['cancelled'])}")
+    if resolved:
+        lines.append(
+            f"Папку восстановили по номеру (в журнале не было ссылки): "
+            f"{len(resolved)} — проверены наравне с остальными."
+        )
     if info["no_folder"]:
         sample = ", ".join(info["no_folder"][:10])
         more = "…" if len(info["no_folder"]) > 10 else ""
-        lines.append(f"⚠️ Без ссылки на папку Drive (пропущены): {len(info['no_folder'])} — {sample}{more}")
-    if info["cancelled"]:
-        lines.append(f"Отменённые сделки — не трогаем: {len(info['cancelled'])}")
+        lines.append(
+            f"⚠️ Папку не нашли и не восстановили (не проверяли вообще): "
+            f"{len(info['no_folder'])} — {sample}{more}"
+        )
 
     sample = ", ".join(run_candidates[:15])
     more = "…" if len(run_candidates) > 15 else ""
@@ -680,6 +711,26 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(kb),
         )
+        return
+
+    # ── Сценарий Н: ждём документы новой сделки (кнопка "📄 Новая сделка") ──
+    intake = context.user_data.get("awaiting_new_deal_docs")
+    if intake:
+        caption = message.caption or ""
+        if intake > 1:
+            caption = caption or "Извлеки данные из документа и дополни уже собранные данные для сделки."
+        context.user_data["awaiting_new_deal_docs"] = intake + 1
+        status = await message.reply_text(
+            "📥 Читаю документ..." if intake == 1 else "📥 Читаю документ и добавляю данные...")
+        result = await typing_while(
+            update.effective_chat.id, context,
+            agent.process_file(filepath, filename, caption, chat_id=chat_id)
+        )
+        try:
+            await status.delete()
+        except Exception:
+            pass
+        await send_result(message, result, context=context, chat_id=chat_id)
         return
 
     # ── Сценарий Г: файл без контекста — спрашиваем что делать ──
@@ -1094,6 +1145,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if action == "new_deal":
+            context.user_data["awaiting_new_deal_docs"] = 1
             await query.edit_message_text(
                 "📄 *Новая сделка*\n\n"
                 "Отправь документы клиента:\n"
@@ -3088,6 +3140,24 @@ async def error_handler(update, context):
 
 # ─── ЗАПУСК ──────────────────────────────────────────────────────────────────
 
+# Список команд для меню Telegram («/» в чате) — раньше не регистрировался,
+# поэтому единственным способом узнать список была просьба к разработчику
+# или чтение bot.py. set_my_commands переносит его в сам Telegram.
+async def _post_init(app):
+    try:
+        await app.bot.set_my_commands([
+            BotCommand("start",           "Начать / перезапустить бота"),
+            BotCommand("menu",            "Главное меню"),
+            BotCommand("memory",          "Память бота — компании и инструкции"),
+            BotCommand("clear",           "Очистить историю диалога"),
+            BotCommand("del_instruction", "Удалить инструкцию по номеру"),
+            BotCommand("backup",          "Бэкапы журнала сделок"),
+            BotCommand("regen_docs",      "Пересобрать документы по старым сделкам"),
+        ])
+    except Exception as e:
+        logger.error(f"Не удалось зарегистрировать список команд: {e}", exc_info=True)
+
+
 def main():
     memory.init_db()
     # Банковские профили в памяти бота переводим на новую модель сразу при
@@ -3111,6 +3181,7 @@ def main():
         .write_timeout(60)
         .connect_timeout(20)
         .pool_timeout(20)
+        .post_init(_post_init)
         .build()
     )
 
