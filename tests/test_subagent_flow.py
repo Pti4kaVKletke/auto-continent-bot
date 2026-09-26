@@ -150,3 +150,11 @@ def test_ui_screens_render():
     assert salon.get("7702222222")["name_short"] == "ООО «Автомир»"
     assert salon.get_pending("chat-ui")["inn"] == "7702222222"
     salon.clear_pending("chat-ui")
+
+
+def test_new_deal_starts_with_clean_history():
+    import memory, salon_ui
+    memory.add_to_history("user", "старая сделка: Toyota RAV4, продавец Бакытбек", chat_id="chat-ui")
+    upd, ctx = _Upd(), _Ctx()
+    asyncio.run(salon_ui.handle_callback(upd, ctx, "nd:direct"))
+    assert memory.get_history(limit=10, chat_id="chat-ui") == []

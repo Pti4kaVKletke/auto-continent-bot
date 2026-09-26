@@ -18,6 +18,7 @@ import logging
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
+import memory
 import salon
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,15 @@ NEW_DEAL_DIRECT_TEXT = (
     "• ТПО и/или таможенную декларацию продавца\n\n"
     "Или напиши данные текстом — я извлеку всё нужное."
 )
+
+
+def start_fresh_deal(chat_id: str) -> None:
+    """Новая сделка начинается с чистого листа: история диалога и
+    неотправленные сканы прошлой сделки забываются. Иначе LLM дополняет
+    новую сделку продавцом, машиной и суммами из прошлой переписки
+    (26.09.2026: прислан только паспорт — в сводке оказалась чужая Toyota)."""
+    memory.clear_history(chat_id)
+    memory.clear_pending_scans(chat_id)
 
 
 def _kb(rows):
@@ -159,6 +169,7 @@ async def handle_callback(update, context, data: str) -> bool:
     # ── Новая сделка ──
     if data == "nd:direct":
         salon.clear_pending(chat_id)
+        start_fresh_deal(chat_id)
         context.user_data["awaiting_new_deal_docs"] = 1
         await show((NEW_DEAL_DIRECT_TEXT, _kb([[_menu_btn()]])))
         return True
@@ -176,6 +187,7 @@ async def handle_callback(update, context, data: str) -> bool:
                              [InlineKeyboardButton("◀️ Назад", callback_data="nd:sub")]])))
             return True
         salon.set_pending(chat_id, inn)
+        start_fresh_deal(chat_id)
         context.user_data["awaiting_new_deal_docs"] = 1
         await show((subagent_docs_text(card), _kb([[_menu_btn()]])))
         return True
@@ -242,6 +254,7 @@ async def handle_callback(update, context, data: str) -> bool:
                                  [InlineKeyboardButton("◀️ К выбору салона", callback_data="nd:sub")]])))
                 return True
             salon.set_pending(chat_id, card["inn"])
+            start_fresh_deal(chat_id)
             context.user_data["awaiting_new_deal_docs"] = 1
             await show((subagent_docs_text(card), _kb([[_menu_btn()]])))
         else:
