@@ -33,6 +33,9 @@ ORG_IP  = "ИП"
 
 # (ключ, подпись в меню, только для ООО)
 FIELDS = [
+    # Торговое название («Казах Авто») — для списков в боте и журнала. В
+    # документы не идёт: там только юридическое наименование.
+    ("brand",               "Название салона",                  False),
     ("org_form",            "Форма (ООО / ИП)",                 False),
     ("name_short",          "Краткое наименование",             False),
     ("name_full",           "Полное наименование",              True),
@@ -131,7 +134,7 @@ def problems(card: dict) -> list:
     c = normalize(card)
     out = []
     for k in KEYS:
-        if k == "org_form":
+        if k in ("org_form", "brand"):
             continue
         if c["org_form"] == ORG_IP and k in OOO_ONLY:
             continue
@@ -145,7 +148,17 @@ def problems(card: dict) -> list:
 def journal_value(card: dict) -> str:
     """Что пишется в колонку журнала «Салон (Агент РФ)»."""
     c = normalize(card)
+    if c["brand"]:
+        return f"{c['brand']} ({c['name_short']}), ИНН {c['inn']}"
     return f"{c['name_short']}, ИНН {c['inn']}"
+
+
+def title(card: dict) -> str:
+    """Как салон называется в кнопках и сообщениях бота."""
+    c = normalize(card)
+    if c["brand"] and c["name_short"]:
+        return f"{c['brand']} ({c['name_short']})"
+    return c["brand"] or c["name_short"] or c["inn"]
 
 
 def inn_from_journal(value) -> str:

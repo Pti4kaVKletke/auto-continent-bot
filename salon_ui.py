@@ -54,7 +54,7 @@ def new_deal_choice_screen():
 
 
 def pick_salon_screen():
-    rows = [[InlineKeyboardButton(f"🏬 {c['name_short'] or inn}", callback_data=f"nd:s:{inn}")]
+    rows = [[InlineKeyboardButton(f"🏬 {salon.title(c)}", callback_data=f"nd:s:{inn}")]
             for inn, c in salon.list_all()]
     rows.append([InlineKeyboardButton("➕ Новый салон", callback_data="sl:new:deal")])
     rows.append([InlineKeyboardButton("◀️ Назад", callback_data="menu:new_deal")])
@@ -75,7 +75,7 @@ def subagent_docs_text(card: dict) -> str:
 
 
 def list_screen():
-    rows = [[InlineKeyboardButton(f"🏬 {c['name_short'] or inn}", callback_data=f"sl:v:{inn}")]
+    rows = [[InlineKeyboardButton(f"🏬 {salon.title(c)}", callback_data=f"sl:v:{inn}")]
             for inn, c in salon.list_all()]
     rows.append([InlineKeyboardButton("➕ Добавить салон", callback_data="sl:new")])
     rows.append([_menu_btn()])
@@ -200,7 +200,7 @@ async def handle_callback(update, context, data: str) -> bool:
             parse_mode="Markdown")
     elif action == "del":
         inn = parts[2]
-        await show((f"Удалить салон {salon.get(inn).get('name_short') or inn}? "
+        await show((f"Удалить салон {salon.title(salon.get(inn)) if salon.get(inn) else inn}? "
                     "Сделки в журнале не изменятся, но документы по ним без карточки "
                     "не соберутся.",
                     _kb([[InlineKeyboardButton("🗑 Да, удалить", callback_data=f"sl:delok:{inn}")],

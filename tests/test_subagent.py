@@ -184,3 +184,12 @@ def test_pending_choice():
 def test_subagent_variants():
     assert doc_builder.subagent_variants() == ["v1"]
     assert doc_builder.subagent_variant() == "v1"
+
+
+def test_brand_name():
+    c = dict(IP, brand="Казах Авто")
+    assert salon.title(c) == "Казах Авто (ИП Петров Пётр Петрович)"
+    assert salon.journal_value(c) == "Казах Авто (ИП Петров Пётр Петрович), ИНН 770112345678"
+    assert salon.inn_from_journal(salon.journal_value(c)) == "770112345678"
+    assert "Казах Авто" not in salon.full_details(c)       # в документы не идёт
+    assert salon.problems(c) == []
