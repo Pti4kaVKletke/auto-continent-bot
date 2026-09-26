@@ -265,6 +265,17 @@ def _words_rub_plain(value) -> str:
     return re.sub(r"\s+рубл(ь|я|ей)\b", "", words, count=1)
 
 
+def _fmt_pct(v) -> str:
+    """Процент для текста документа: 1.0 → «1», 2.5 → «2,5» (было «1.0», «2.5»)."""
+    try:
+        v = float(str(v).replace(",", "."))
+    except (TypeError, ValueError):
+        return str(v)
+    if v == int(v):
+        return str(int(v))
+    return f"{v:g}".replace(".", ",")
+
+
 def _fmt_num(v) -> str:
     """Форматирует число для документа: 3997500 → «3 997 500», 1234.5 → «1 234,50»."""
     try:
@@ -804,7 +815,8 @@ class DocumentBuilder:
         year_n = date[6:10]
         date_str = f"{day_n} {self._month_name(mon_n)} {year_n}"
 
-        total_fmt   = f"{total:,.2f}".replace(",", " ")
+        # Русский формат: пробел между разрядами, запятая перед копейками.
+        total_fmt   = f"{total:,.2f}".replace(",", " ").replace(".", ",")
         total_words = amount_to_words_rub(total) if acc_cur == "RUB" else ""
 
         # Шапка счёта: данные компании из карточки, данные счёта из профиля.
@@ -1569,6 +1581,38 @@ class DocumentBuilder:
                 result.append(word.capitalize())
         return " ".join(result)
 
+    # Марки и обозначения моделей, которые пишутся заглавными целиком.
+    CAR_UPPER_WORDS = {
+        "BMW", "BYD", "GAC", "JAC", "JMC", "GWM", "FAW", "BAIC", "SAIC", "NIO",
+        "AITO", "GMC", "KGM", "RAV", "SUV", "AWD", "PHEV", "DHT",
+    }
+
+    @classmethod
+    def _car_model_case(cls, value) -> str:
+        """Регистр марки/модели авто для документов (26.09.2026).
+
+        Раньше модель шла через _normalize (он для ФИО и адресов) и КАПС
+        превращался в «Bmw X3», «Audi Q5l». Теперь:
+          • строка уже в смешанном регистре («Toyota Rav4») — не трогаем;
+          • КАПС («VOLKSWAGEN TERAMONT PRO») — слова с заглавной буквы,
+            но аббревиатуры марок (BMW, BYD, GAC…), слова с цифрами (X3, Q5L,
+            RAV4, L9) и короткие части в 1–2 буквы (EV, GT, CR-V) остаются
+            заглавными: «BMW X3», «Audi Q5L», «Honda CR-V», «Zeekr 001».
+        """
+        s = " ".join(str(value or "").split())
+        if not s or any(c.islower() for c in s):
+            return s
+
+        def part(p: str) -> str:
+            if not p:
+                return p
+            if (p.upper() in cls.CAR_UPPER_WORDS or any(c.isdigit() for c in p)
+                    or len([c for c in p if c.isalpha()]) <= 2):
+                return p.upper()
+            return p.capitalize()
+
+        return " ".join("-".join(part(x) for x in w.split("-")) for w in s.split(" "))
+
     @staticmethod
     def _strip_ip_prefix(value) -> str:
         """Убирает ведущие «ИП» / «Индивидуальный предприниматель» из ФИО или
@@ -1830,7 +1874,7 @@ class DocumentBuilder:
             "{{ДЕНЬ}}":    day,
             "{{МЕСЯЦ}}":   self._month_name(month),
             "{{ГОД}}":     year,
-            "{{КОМИССИЯ}}": str(commission_pct),
+            "{{КОМИССИЯ}}": _fmt_pct(commission_pct),
 
             # Комиссия и итог
             "{{КОМИССИЯ_ЦИФРАМИ}}":     _fmt_num(commission_val),
@@ -1878,7 +1922,7 @@ class DocumentBuilder:
             "{{ПРОДАВЕЦ_ID_ДАТА}}":   data.get("seller_id_issued_date", ""),
 
             # Авто
-            "{{МАРКА_МОДЕЛЬ}}": n(data.get("car_model", "")),
+            "{{МАРКА_МОДЕЛЬ}}": self._car_model_case(data.get("car_model", "")),
             "{{VIN}}":          data.get("car_vin", ""),
             "{{ГОД_ВЫП}}":      data.get("car_year", ""),
             "{{ЦВЕТ}}":         data.get("car_color", ""),

@@ -109,3 +109,26 @@ def test_buyer_bank_details_lines():
     assert d["buyer_bank_line1"] == "р/с 40802810000000000001"
     assert d["buyer_bank_line2"] == "АО «Альфа-Банк»"     # регистр внутри «ёлочек» не ломается
     assert d["buyer_bank_line4"] == "БИК 044525593, лишнее"
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ("BMW X3", "BMW X3"),
+    ("AUDI Q5L", "Audi Q5L"),
+    ("VOLKSWAGEN TERAMONT PRO", "Volkswagen Teramont Pro"),
+    ("TOYOTA RAV 4", "Toyota RAV 4"),
+    ("TOYOTA RAV4", "Toyota RAV4"),
+    ("HONDA CR-V", "Honda CR-V"),
+    ("NISSAN X-TRAIL", "Nissan X-Trail"),
+    ("ZEEKR 001", "Zeekr 001"),
+    ("LI AUTO L9", "LI Auto L9"),
+    ("Toyota Rav4", "Toyota Rav4"),          # смешанный регистр не трогаем
+    ("  BYD   SONG  PLUS ", "BYD Song Plus"),
+    ("", ""),
+])
+def test_car_model_case(raw, expected):
+    assert DocumentBuilder._car_model_case(raw) == expected
+
+
+@pytest.mark.parametrize("v, s", [(1.0, "1"), (2.5, "2,5"), ("1,0", "1"), (1.25, "1,25"), (3, "3")])
+def test_fmt_pct(v, s):
+    assert doc_builder._fmt_pct(v) == s

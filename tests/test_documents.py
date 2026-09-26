@@ -176,24 +176,24 @@ def _as_num(v):
         return None
 
 
-# ── Известные недочёты в документах: тесты помечены xfail и начнут «проходить»,
-#    когда недочёт исправят. Тогда пометку xfail нужно снять.
+# ── Формат текста в документах (исправлено 26.09.2026) ──────────────────
 
-@pytest.mark.xfail(reason="Марка авто нормализуется как ФИО: «BMW X3» → «Bmw X3»")
-def test_known_car_model_case():
+def test_car_model_caps_kept():
+    # Раньше «BMW X3» печаталась как «Bmw X3»
     _, _, t = closing(round(PRICE * 1.01, 2), car_model="BMW X3")
-    assert "BMW X3" in t["act"]
+    assert "BMW X3" in t["act"] and "Bmw" not in t["act"]
 
 
-@pytest.mark.xfail(reason="Процент комиссии в акте печатается с точкой: «комиссия 1.0%»")
-def test_known_commission_pct_format():
+def test_commission_pct_format():
+    # Раньше «комиссия 1.0%»
     _, _, t = closing(round(PRICE * 1.01, 2))
     assert "1.0%" not in t["act"]
+    assert "комиссия 1%" in t["act"]
 
 
-@pytest.mark.xfail(reason="Итог в счёте печатается с точкой: «на сумму 4 679 824.90 RUB»")
-def test_known_invoice_total_decimal_point():
+def test_invoice_total_decimal_comma():
+    # Раньше «на сумму 4 679 824.90 RUB»
     path = asyncio.run(DocumentBuilder().build_invoice(dict(DEAL), NUMBER, "01.07.2026", commission_pct=PCT))
     ws = openpyxl.load_workbook(path).active
     joined = "\n".join(str(c.value) for row in ws.iter_rows() for c in row if c.value is not None)
-    assert "4 679 824,90" in joined
+    assert "на сумму 4 679 824,90 RUB" in joined
