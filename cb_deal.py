@@ -225,19 +225,11 @@ async def on_dealaction(update, context, query, data):
         account_number = deal_bank["account_number"]
         bank_ben       = deal_bank["bank_name"]
 
-        # Название профиля реквизитов — по номеру счёта и типу счёта:
-        # один и тот же счёт может быть заведён двумя профилями.
-        profile_name = "—"
-        for pname in memory.list_bank_profiles():
-            p = memory.get_bank_profile(pname)
-            if not p or not account_number:
-                continue
-            p_bank = br.normalize(p)
-            if p_bank["account_number"] != account_number:
-                continue
-            if p_bank["account_type"] == deal_bank["account_type"]:
-                profile_name = pname
-                break
+        # Название профиля реквизитов.
+        # Номера и типа мало: один счёт заведён несколькими профилями с разными
+        # банками-корреспондентами, поэтому сверяются все поля реквизитов.
+        _profiles = {n: memory.get_bank_profile(n) for n in memory.list_bank_profiles()}
+        profile_name = br.match_profile(deal, _profiles) or "—"
         # Если по паре не нашли — берём первый по номеру счёта (фолбэк)
         if profile_name == "—":
             for pname in memory.list_bank_profiles():

@@ -227,6 +227,44 @@ def migrate_saved_profiles(mem) -> int:
     return migrated
 
 
+# ─── Какой профиль у сделки ────────────────────────────────────────────────
+
+# Поля, по которым профиль сверяется со сделкой. Номера счёта и типа мало:
+# один счёт в Бакай Банке заведён несколькими профилями с разными банками-
+# корреспондентами (Альфа, Газпромбанк…), и первый попавшийся профиль
+# показывался не тот (26.09.2026, сделка 280926001).
+_MATCH_FIELDS = ("account_type", "account_number", "account_currency",
+                 "bank_bic", "bank_corr_acc", "corr_bank_bic",
+                 "corr_bank_acc", "corr_bank_name", "bank_name")
+
+
+def _norm_cmp(v) -> str:
+    return re.sub(r"\s+", " ", str(v or "")).strip().lower()
+
+
+def match_profile(deal: dict, profiles: dict) -> str | None:
+    """Имя профиля, чьи реквизиты совпадают с реквизитами сделки.
+
+    profiles — {имя: сохранённый профиль}. Обязательны совпадение номера
+    счёта и типа; дальше выигрывает профиль, у которого совпало больше
+    остальных полей (корреспондент, БИК, корр. счёт…). Нет подходящего — None.
+    """
+    d = normalize(deal)
+    if not d["account_number"]:
+        return None
+    best, best_score = None, -1
+    for name, p in profiles.items():
+        if not p:
+            continue
+        pb = normalize(p)
+        if pb["account_number"] != d["account_number"] or pb["account_type"] != d["account_type"]:
+            continue
+        score = sum(1 for f in _MATCH_FIELDS if _norm_cmp(pb.get(f)) == _norm_cmp(d.get(f)))
+        if score > best_score:
+            best, best_score = name, score
+    return best
+
+
 # ─── Проверки формата ───────────────────────────────────────────────────────
 # Ловим кривой ввод при заведении реквизитов, а не при сборке документа:
 # ошибка на этапе выдачи счёта приходит поздно и непонятно откуда.
