@@ -73,6 +73,10 @@ DATA_START_ROW = 3
 # Порядок колонок — должен совпадать с format_sheets.py
 # (ключ для data dict, или специальное имя)
 COLUMNS = [
+    # ── Блок «СУБАГЕНТ» (A–C), вставлен Ильёй 26.09.2026 в начало таблицы ──
+    "deal_type",       # «Тип сделки»: «Прямая» / «Субагент»; пусто = прямая
+    "salon",           # «Салон (Агент РФ)»: «ООО «Автомир», ИНН 7701234567»
+    "salon_contract",  # «Договор салона с клиентом»: «№ 45 от 12.09.2026»
     "Номер договора",
     "Дата договора",
     # ── Колонки, добавленные 19.08.2026 ───────────────────────────────────
@@ -214,6 +218,7 @@ COLUMNS = [
 # Кортеж = допустимые варианты подписи. Добавляя колонку в COLUMNS, добавь
 # сюда её подпись В ТО ЖЕ МЕСТО.
 EXPECTED_HEADERS = [
+    "Тип сделки", "Салон (Агент РФ)", "Договор салона с клиентом",
     "Номер договора", "Дата договора", "Номер ДКП", "Дата ДКП",
     "Сумма Договора", "Сумма Комиссии", "Дата поступления", "Дата расчёта",
     "Статус",
@@ -240,6 +245,11 @@ assert len(EXPECTED_HEADERS) == len(COLUMNS), (
 )
 
 HEADER_ROW = 2
+
+# Номер сделки больше не в колонке A (с 26.09.2026 перед ним блок «СУБАГЕНТ»).
+# Искать строку сделки — только по этому индексу, не по row[0].
+NUM_COL_IDX = COLUMNS.index("Номер договора")
+DEFAULT_DEAL_TYPE = "Прямая"
 HEADER_RECHECK_SEC = 60   # как часто перечитывать заголовок, пока запись заблокирована
 
 
@@ -455,6 +465,8 @@ class GoogleSheetsService:
             for col in COLUMNS:
                 if col == "Номер договора":
                     row.append(contract_number)
+                elif col == "deal_type":
+                    row.append(str(data.get("deal_type") or "").strip() or DEFAULT_DEAL_TYPE)
                 elif col == "Дата договора":
                     row.append(contract_date)
                 elif col == "Дата ДКП":
@@ -560,7 +572,7 @@ class GoogleSheetsService:
             target_row = None
             for i, row in enumerate(rows, start=DATA_START_ROW):
                 padded = row + [""] * (len(COLUMNS) - len(row))
-                if padded[0] == contract_number:
+                if padded[NUM_COL_IDX] == contract_number:
                     target_row = i
                     current_row = padded
                     break
@@ -646,13 +658,14 @@ class GoogleSheetsService:
         if not await self._guard_write(f"batch_update_column {col_name}"):
             return 0
         col = self._col_letter(COLUMNS.index(col_name))
+        num_col = self._col_letter(NUM_COL_IDX)
 
         def _do():
             svc = self._get_service()
             sheet = svc.spreadsheets()
             nums = sheet.values().get(
                 spreadsheetId=SPREADSHEET_ID,
-                range=f"A{DATA_START_ROW}:A",
+                range=f"{num_col}{DATA_START_ROW}:{num_col}",
             ).execute().get("values", [])
 
             data = []
@@ -735,7 +748,7 @@ class GoogleSheetsService:
             migrated = 0
             for n, row in enumerate(rows, start=DATA_START_ROW):
                 padded = row + [""] * (len(COLUMNS) - len(row))
-                if not str(padded[0]).strip():
+                if not str(padded[NUM_COL_IDX]).strip():
                     continue
                 legacy = dict(zip(self.LEGACY_BANK_COLUMNS, padded[first:first + 6]))
                 if not any(str(v).strip() for v in legacy.values()):

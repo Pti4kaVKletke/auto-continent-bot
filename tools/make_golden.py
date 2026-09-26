@@ -65,7 +65,7 @@ def main(path: str) -> None:
     ws = openpyxl.load_workbook(path, data_only=True).active
     deals = []
     for row in ws.iter_rows(min_row=3, values_only=True):
-        if not row or not row[0]:
+        if not row or not row[COLUMNS.index("Номер договора")]:
             continue
         full = {COLUMNS[i]: ("" if v is None else str(v)) for i, v in enumerate(row[:len(COLUMNS)])}
         # номер как число «170726006.0» → строка без дробной части
