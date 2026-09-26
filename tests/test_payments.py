@@ -32,6 +32,10 @@ def test_format_payments_roundtrip():
     ("1,0", 1.0),
     ("", 0.0),
     ("abc", 0.0),
+    ("2 897 690,00 ₽", 2897690.0),               # денежный формат колонок журнала
+    ("3\u00a0356\u00a0285,62\u00a0₽", 3356285.62),
+    ("1 000 руб.", 1000.0),
+    ("38 000 USD", 38000.0),
 ])
 def test_num_parses_sheet_formats(raw, value):
     assert agent._num(raw) == value
@@ -48,9 +52,8 @@ def test_fmt_money():
     assert agent._fmt_money(1234.5) == "1 234,50"
 
 
-@pytest.mark.xfail(reason="_num не понимает «₽»: Google Sheets отдаёт «2 897 690,00 ₽», "
-                          "и сумма договора берётся не из журнала, а пересчитывается из цены")
 def test_total_prefers_journal_value():
+    # Сумма договора из журнала (с «₽», как её отдаёт Sheets) важнее пересчёта из цены
     deal = {"Сумма Договора": "2 897 690,00 ₽", "car_price": "1", "Комиссия %": "50"}
     assert agent._calc_total_amount(deal) == 2897690.0
 

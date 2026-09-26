@@ -3,8 +3,8 @@
 Локальный предпросмотр счёта: собирает счёт настоящим кодом бота
 (DocumentBuilder.build_invoice) на тестовых данных, ничего не деплоя.
 
-Вариант бланка задаётся так же, как в боте, — через INVOICE_TEMPLATE;
-скрипт просто выставляет эту переменную окружения перед сборкой.
+Вариант бланка — общая настройка TEMPLATE_VARIANT (как в боте); ключ --variant
+выставляет эту переменную окружения перед сборкой.
 
 Примеры:
     python3 tools/preview_invoice.py                 # текущий вариант из настроек
@@ -107,11 +107,11 @@ def main() -> None:
 
     os.environ.setdefault("TEMPLATES_DIR", str(ROOT / "templates"))
     if args.variant:
-        os.environ["INVOICE_TEMPLATE"] = args.variant
+        os.environ["TEMPLATE_VARIANT"] = args.variant
 
     import doc_builder
-    print(f"Доступные варианты бланка: {doc_builder.invoice_variants()}")
-    print(f"Собираю вариантом: {doc_builder.invoice_variant()}\n")
+    print(f"Доступные варианты бланка: {doc_builder.template_variants()}")
+    print(f"Собираю вариантом: {doc_builder.template_variant()}\n")
 
     kinds = ["direct", "corr"] if args.type == "both" else [args.type]
     for kind in kinds:

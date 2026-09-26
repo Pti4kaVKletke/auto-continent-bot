@@ -176,8 +176,12 @@ def _num(v) -> float:
     NBSP  , тонкий пробел   и т.п.) — Google Sheets в русской
     локали часто отдаёт числа с неразрывными пробелами.
     """
+    # Обозначения валют тоже убираем: денежные колонки журнала приходят из
+    # Sheets как «2 897 690,00 ₽». Без этого «Сумма Договора» читалась как 0,
+    # и _calc_total_amount молча пересчитывал её из цены (исправлено 26.09.2026).
     try:
-        return float(re.sub(r"\s+", "", str(v).replace(",", ".")))
+        s = re.sub(r"[₽$€]|руб\.?|RUB|USD", "", str(v), flags=re.IGNORECASE)
+        return float(re.sub(r"\s+", "", s.replace(",", ".")))
     except (TypeError, ValueError):
         return 0.0
 
