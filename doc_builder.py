@@ -666,6 +666,47 @@ def _anchor_box_px(ws, coord: str) -> tuple:
     return w_px, h_px
 
 
+def _fit_wrapped_rows(ws, cells) -> list:
+    """Подгоняет высоту строк под текст, который не влез после подстановки.
+
+    Excel и LibreOffice сами не растягивают строку, если ячейка объединена
+    (а в счёте описание позиции — объединённые D:R), поэтому считаем сами:
+    ширина диапазона в пикселях → сколько символов влезает в строку → сколько
+    строк получится при переносе по словам → высота. Строку только
+    увеличиваем, никогда не уменьшаем — вёрстка шаблона остаётся как есть.
+    Коэффициенты подобраны по рендеру LibreOffice (Arial 10: ~50 знаков на
+    D:R шириной ~480 px, 13,5 pt на строку). Возвращает изменённые строки."""
+    import math
+    changed = []
+    for c in cells:
+        if not isinstance(c.value, str) or not c.alignment or not c.alignment.wrap_text:
+            continue
+        rng = next((r for r in ws.merged_cells.ranges
+                    if r.min_row == c.row and r.min_col == c.column), None)
+        if rng is not None and rng.max_row != rng.min_row:
+            continue   # объединение по вертикали — не трогаем
+        w_px, _ = _anchor_box_px(ws, c.coordinate)
+        size = float(c.font.sz or 10) if c.font else 10.0
+        per_line = max(8, int((w_px - 6) / (size * 0.96)))
+        lines = 0
+        for para in c.value.split("\n"):
+            cur, n = 0, 1
+            for word in para.split():
+                need = len(word) + (1 if cur else 0)
+                if cur and cur + need > per_line:
+                    n += 1
+                    cur = len(word)
+                else:
+                    cur += need
+            lines += n
+        height = math.ceil(lines * size * 1.35 + 4)
+        current = ws.row_dimensions[c.row].height or ws.sheet_format.defaultRowHeight or 15.0
+        if height > current:
+            ws.row_dimensions[c.row].height = height
+            changed.append(c.row)
+    return changed
+
+
 class DocumentBuilder:
 
     def __init__(self):
@@ -1034,6 +1075,7 @@ class DocumentBuilder:
         # iter_rows отдаёт объединённые ячейки как MergedCell со значением
         # None, поэтому фильтр по строке заодно защищает от записи в них.
         filled = 0
+        replaced_cells = []
         for row in ws.iter_rows():
             for c in row:
                 if not isinstance(c.value, str):
@@ -1050,6 +1092,13 @@ class DocumentBuilder:
                 if val != c.value:
                     c.value = val
                     filled += 1
+                    replaced_cells.append(c)
+
+        # Длинное описание (машина + покупатель + договор) не влезало в
+        # строку фиксированной высоты и обрезалось — растягиваем строку.
+        grown = _fit_wrapped_rows(ws, replaced_cells)
+        if grown:
+            logger.info(f"Счёт: увеличена высота строк {grown}")
 
         leftover = sorted({
             m for row in ws.iter_rows() for c in row
@@ -1567,12 +1616,28 @@ class DocumentBuilder:
         не блокирует event loop Telegram-бота.
         Возвращает путь к PDF или None если LibreOffice недоступен / ошибка.
         """
+        # Счёт (.xlsx) рендерим в русской локали: числовой формат «#,##0.00»
+        # в Excel зависит от локали, и на сервере (en_US) суммы выходили как
+        # «4,633,490.00». В ru_RU — «4 633 490,00», как в строке «на сумму».
+        # При LC_ALL=ru_RU без установленной системной локали LibreOffice не
+        # может прочитать кириллическое имя файла, поэтому конвертируем копию
+        # с латинским именем во временной папке. Word-документы не трогаем.
+        is_sheet = str(filepath).lower().endswith((".xlsx", ".xls"))
+        src, outdir, env, tmpdir = filepath, str(self.output_dir), None, None
+        if is_sheet:
+            import shutil
+            tmpdir = tempfile.mkdtemp(prefix="lo_ru_")
+            src = str(Path(tmpdir) / ("sheet" + Path(filepath).suffix.lower()))
+            shutil.copy(filepath, src)
+            outdir = tmpdir
+            env = {**os.environ, "LC_ALL": "ru_RU.UTF-8", "LANG": "ru_RU.UTF-8"}
         try:
             proc = await asyncio.create_subprocess_exec(
                 "libreoffice", "--headless", "--convert-to", "pdf",
-                "--outdir", str(self.output_dir), filepath,
+                "--outdir", outdir, src,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env=env,
             )
             try:
                 stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
@@ -1583,6 +1648,13 @@ class DocumentBuilder:
                 await proc.communicate()
                 logger.warning("LibreOffice: таймаут конвертации (> 60 сек)")
                 return None
+
+            if is_sheet:
+                made = Path(tmpdir) / "sheet.pdf"
+                import shutil
+                if made.exists():
+                    shutil.move(str(made), str(filepath).rsplit(".", 1)[0] + ".pdf")
+                shutil.rmtree(tmpdir, ignore_errors=True)
 
             pdf_path = str(filepath).rsplit(".", 1)[0] + ".pdf"
             if Path(pdf_path).exists() and Path(pdf_path).stat().st_size > 0:

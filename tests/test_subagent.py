@@ -193,3 +193,11 @@ def test_brand_name():
     assert salon.inn_from_journal(salon.journal_value(c)) == "770112345678"
     assert "Казах Авто" not in salon.full_details(c)       # в документы не идёт
     assert salon.problems(c) == []
+
+
+def test_invoice_long_description_row_grows():
+    # 26.09.2026: описание позиции не влезало в строку фиксированной высоты
+    data = sub_deal(OOO, buyer_name="Чариев Фархад Файзуллаевич", car_model="AUDI Q3")
+    p = asyncio.run(DocumentBuilder().build_invoice(data, "220626001", "22.06.2026", PCT))
+    ws = openpyxl.load_workbook(p).active
+    assert ws.row_dimensions[22].height > 54

@@ -69,6 +69,8 @@ def to_pdf(xlsx: Path):
         subprocess.run(
             [soffice, "--headless", "--convert-to", "pdf", "--outdir", tmp, str(xlsx)],
             check=False, capture_output=True, timeout=180,
+            # как в doc_builder.convert_to_pdf: суммы в русском формате
+            env={**os.environ, "LC_ALL": "ru_RU.UTF-8", "LANG": "ru_RU.UTF-8"},
         )
         made = Path(tmp) / (xlsx.stem + ".pdf")
         if not made.exists():
