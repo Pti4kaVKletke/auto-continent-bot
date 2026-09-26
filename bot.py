@@ -32,6 +32,8 @@ import memory
 import bank_requisites as br
 import bank_ui
 import company_ui
+import salon
+import salon_ui
 import sign_ui
 import settings_service
 
@@ -350,6 +352,7 @@ async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     memory.clear_history(chat_id)
     memory.clear_pending_scans(chat_id)
+    salon.clear_pending(chat_id)
     context.user_data.clear()
     await update.message.reply_text(
         "✅ История диалога очищена\n"
@@ -401,6 +404,10 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.pop("awaiting_doc_to_sign", None):
         await sign_ui.start(message, context, filepath, filename,
                             agent.builder, getter=memory.get_setting)
+        return
+
+    # ── Сценарий С: ждём карточку нового салона (меню «🏬 Салоны») ──
+    if await salon_ui.handle_file(update, context, agent, filepath, filename):
         return
 
     # ── Сценарий А: ждём скан для конкретной сделки (кнопка "📎 Загрузить скан") ──
@@ -536,8 +543,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("sign:"):
         await sign_ui.handle_callback(update, context, data, drive=agent.drive)
         return
+    if data.startswith("sl:") or data.startswith("nd:"):
+        bank_ui.clear_state(context)
+        company_ui.clear_state(context)
+        await salon_ui.handle_callback(update, context, data)
+        return
     bank_ui.clear_state(context)
     company_ui.clear_state(context)
+    salon_ui.clear_state(context)
 
     # ── Остальные кнопки — по таблице CALLBACK_ROUTES (модули cb_*.py) ──────
     for kind, value, handler in CALLBACK_ROUTES:
@@ -562,6 +575,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await bank_ui.handle_text(update, context, user_text):
         return
     if await company_ui.handle_text(update, context, user_text):
+        return
+    if await salon_ui.handle_text(update, context, agent, user_text):
         return
 
     # ── Ожидание недостающего поля для документа ────────────────────────────

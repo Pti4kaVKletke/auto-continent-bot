@@ -17,6 +17,7 @@ from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
 import bank_requisites as br
 import money
 import company
+import salon
 
 try:  # настройки компании лежат в SQLite бота; без неё работают значения по умолчанию
     from memory import get_setting as _setting
@@ -46,6 +47,7 @@ ALLOW_EMPTY_PLACEHOLDERS = {
     "{{ПОКУПАТЕЛЬ_БАНК_СТРОКА4}}",
     "{{ПОКУПАТЕЛЬ_ИНН_СТРОКА}}",  # пусто для физ.лиц (строка ИНН печатается только для ИП)
     "{{ПОКУПАТЕЛЬ_ОТСТУП_ИП}}",   # пустая строка между «ИП ФИО» и ИНН (только для ИП)
+    "{{АГЕНТ_РФ_БАНК_СТРОКА4}}",  # субагентский договор: 4-я строка банка салона — резерв
 }
 
 # Значение-маркер: абзац, в котором после замены остался ТОЛЬКО этот текст,
@@ -57,6 +59,22 @@ DROP_PARAGRAPH = "\u2063DROP_PARAGRAPH\u2063"
 # Человекочитаемые названия — чтобы в сообщении Александре было понятно,
 # что именно доввести в журнал.
 PLACEHOLDER_LABELS = {
+    # Субагентская сделка — карточка салона и договор салона с клиентом
+    "{{АГЕНТ_РФ_ПОЛНЫЕ_ДАННЫЕ}}":       "данные салона (карточка салона)",
+    "{{АГЕНТ_РФ_НАИМЕНОВАНИЕ}}":        "наименование салона",
+    "{{АГЕНТ_РФ_ИНН_КПП}}":             "ИНН/КПП салона",
+    "{{АГЕНТ_РФ_ОГРН}}":                "ОГРН/ОГРНИП салона",
+    "{{АГЕНТ_РФ_АДРЕС}}":               "адрес салона",
+    "{{АГЕНТ_РФ_СЧЕТ}}":                "расчётный счёт салона",
+    "{{АГЕНТ_РФ_БАНК_СТРОКА1}}":        "банк салона",
+    "{{АГЕНТ_РФ_БАНК_СТРОКА2}}":        "БИК банка салона",
+    "{{АГЕНТ_РФ_БАНК_СТРОКА3}}":        "корр. счёт банка салона",
+    "{{АГЕНТ_РФ_ПОДПИСАНТ_ДОЛЖНОСТЬ}}": "должность подписанта салона",
+    "{{АГЕНТ_РФ_ИНИЦИАЛЫ}}":            "подписант салона",
+    "{{АГЕНТ_РФ_РЕКВИЗИТЫ}}":           "реквизиты салона",
+    "{{ДОГОВОР_КП_НОМЕР}}":             "номер договора салона с клиентом",
+    "{{ДОГОВОР_КП_ДАТА}}":              "дата договора салона с клиентом",
+    "{{ПОКУПАТЕЛЬ_ЛИЦО}}":              "конечный покупатель",
     "{{ПОКУПАТЕЛЬ_ФИО}}":           "ФИО покупателя",
     "{{ПОКУПАТЕЛЬ_ДАТА_РОЖДЕНИЯ}}": "дата рождения покупателя",
     "{{ПОКУПАТЕЛЬ_АДРЕС}}":         "адрес покупателя",
@@ -218,6 +236,11 @@ def dkp_number_from(data: dict, fallback: str = "") -> str:
     if len(vin) >= 6:
         return vin[-6:].upper()
     return fallback
+
+
+class SubagentSetupError(Exception):
+    """Субагентскую сделку нельзя собрать: нет карточки салона, не тот тип
+    счёта и т.п. Текст — готовое сообщение пользователю."""
 
 
 class MissingDataError(Exception):
@@ -527,6 +550,62 @@ def template_variant() -> str:
     return val
 
 
+# ─── Субагентская сделка: свой комплект шаблонов и своя настройка версии ─────
+# Файлы лежат рядом с остальными: «<база> v1.docx», «<база> v2.docx»… — версия
+# у них всегда в имени, в том числе v1. Настройка версии своя
+# (SUBAGENT_TEMPLATE_VARIANT), переключатель прямой сделки их не трогает.
+# ДКП общий с прямой сделкой: покупатель по нему — всегда конечный покупатель.
+
+SUBAGENT_VARIANT_KEY = "SUBAGENT_TEMPLATE_VARIANT"
+SUBAGENT_BASES = {
+    "contract": ("contract_template_subagent", ".docx"),
+    "invoice":  ("invoice_subagent_template",  ".xlsx"),
+    "act":      ("act_subagent_template",      ".docx"),
+    "report":   ("otchet_subagent_template",   ".docx"),
+    "receipt":  ("raspiska_subagent_template", ".docx"),
+}
+
+
+def subagent_template_name(kind: str, variant: str) -> str:
+    base, ext = SUBAGENT_BASES[kind]
+    return f"{base} {variant}{ext}"
+
+
+def subagent_variants() -> list:
+    """Версии субагентского комплекта, у которых в templates/ есть все 5 файлов."""
+    tpl = templates_dir()
+    base, ext = SUBAGENT_BASES["contract"]
+    found = {f.stem[len(base) + 1:] for f in tpl.glob(f"{base} *{ext}")}
+    return sorted(v for v in found
+                  if all((tpl / subagent_template_name(k, v)).exists() for k in SUBAGENT_BASES))
+
+
+def subagent_variant() -> str:
+    """Текущая версия субагентских шаблонов: настройка → env → первая полная."""
+    val = ""
+    if _setting:
+        try:
+            val = (_setting(SUBAGENT_VARIANT_KEY) or "").strip()
+        except Exception as e:  # pragma: no cover
+            logger.warning(f"Не прочитать настройку {SUBAGENT_VARIANT_KEY}: {e}")
+    val = val or os.environ.get(SUBAGENT_VARIANT_KEY, "").strip()
+    available = subagent_variants()
+    if not available:
+        return val or "v1"
+    if val not in available:
+        if val:
+            logger.warning(f"Субагентские шаблоны {val!r} не найдены целиком; беру {available[0]!r}")
+        val = available[0]
+    return val
+
+
+def contract_file_base(data: dict, number: str) -> str:
+    """Имя файла договора без расширения: «АГ_Договор_<№>» у прямой сделки,
+    «САГ_Договор_<№>» у субагентской. Сканы «Подп_САГ_Договор_…» распознаются
+    как тот же договор (agent.SCAN_TYPES)."""
+    return f"{'САГ' if salon.is_subagent(data) else 'АГ'}_Договор_{number}"
+
+
 def _image_last_row(ws, img) -> int:
     """Последняя строка, которую занимает картинка (1-based).
 
@@ -598,7 +677,66 @@ class DocumentBuilder:
 
     # ─── АГЕНТСКИЙ ДОГОВОР ────────────────────────────────────────────────
 
+    # ─── СУБАГЕНТСКАЯ СДЕЛКА: общее ───────────────────────────────────────
+
+    def _subagent_template(self, kind: str) -> Path:
+        variant = subagent_variant()
+        path = self.templates_dir / subagent_template_name(kind, variant)
+        if not path.exists():
+            raise MissingTemplateError(
+                f"Не найден {path.name} — шаблон субагентской сделки "
+                f"(версия «{variant}»). Документ не собран."
+            )
+        return path
+
+    @staticmethod
+    def _require_subagent_setup(data: dict) -> dict:
+        """Карточка салона сделки; заодно проверка, что сделку вообще можно
+        собрать как субагентскую. Возвращает нормализованную карточку."""
+        if br.resolve_account_type(data) != br.CORR:
+            raise SubagentSetupError(
+                "Субагентская сделка оплачивается только на наш счёт в КР через "
+                "банк-корреспондент (п. 2.3 договора), а у сделки выбран прямой "
+                "счёт в РФ. Поменяй реквизиты сделки на профиль «через корреспондента»."
+            )
+        card = salon.card_for_deal(data)
+        if not card:
+            raise SubagentSetupError(
+                f"Не найдена карточка салона «{data.get('salon') or '—'}». "
+                "Заведи её в меню 🏬 Салоны (ИНН должен совпадать с журналом)."
+            )
+        missing = salon.problems(card)
+        if missing:
+            raise SubagentSetupError(
+                f"В карточке салона {card.get('name_short') or card.get('inn')} "
+                f"не заполнено: {', '.join(missing)}. Дополни её в меню 🏬 Салоны."
+            )
+        return card
+
+    def _subagent_replacements(self, data: dict) -> dict:
+        """Плейсхолдеры, которые есть только в субагентских шаблонах."""
+        card = self._require_subagent_setup(data)
+        out = dict(salon.placeholders(card))
+        name = self._normalize(self._strip_ip_prefix(data.get("buyer_name", "")))
+        is_ip = (data.get("buyer_type") or "").strip().lower() in ("ип", "индивидуальный предприниматель")
+        out["{{ПОКУПАТЕЛЬ_ФИО}}"] = f"ИП {name}" if is_ip and name else name
+        out["{{ПОКУПАТЕЛЬ_ЛИЦО}}"] = (
+            f"индивидуального предпринимателя {name}" if is_ip
+            else f"гражданина(ки) Российской Федерации {name}"
+        ) if name else ""
+        num, date = salon.parse_client_contract(data.get("salon_contract"))
+        out["{{ДОГОВОР_КП_НОМЕР}}"] = num
+        out["{{ДОГОВОР_КП_ДАТА}}"] = salon.date_words(date)
+        return out
+
     async def build_contract(self, data: dict, number: str, date: str, commission_pct: float = 1.0) -> str:
+        if salon.is_subagent(data):
+            self._require_subagent_setup(data)
+            template = self._subagent_template("contract")
+            logger.info(f"Шаблон субагентского договора: {template.name}")
+            return await self._fill_template(template, data, number, date,
+                                             contract_file_base(data, number), commission_pct)
+
         # Тип счёта берётся из явного поля (bank_requisites), а не выводится
         # из пустоты банка-корреспондента, как было до 04.09.2026.
         acc_type = br.resolve_account_type(data)
@@ -780,8 +918,16 @@ class DocumentBuilder:
                     f"банк={bank['bank_name']!r}, БИК={bank['bank_bic']!r}, "
                     f"счёт={bank['account_number']!r}")
 
-        # Никакой подмены на шаблон другого типа: у них разный ИНН в шапке.
-        template = self.templates_dir / invoice_template_name(variant, is_direct)
+        subagent = salon.is_subagent(data)
+        sub_repl = {}
+        if subagent:
+            # Субагентский счёт один — на наш счёт в КР через корреспондента.
+            sub_repl = self._subagent_replacements(data)
+            template = self._subagent_template("invoice")
+            variant = subagent_variant()
+        else:
+            # Никакой подмены на шаблон другого типа: у них разный ИНН в шапке.
+            template = self.templates_dir / invoice_template_name(variant, is_direct)
         if not template.exists():
             raise MissingTemplateError(
                 f"Не найден {template.name} — шаблон счёта для типа "
@@ -846,6 +992,7 @@ class DocumentBuilder:
             "{{ИТОГО_ПРОПИСЬЮ}}":   total_words,
             "{{КОЛИЧЕСТВО}}":       "1",
         })
+        replacements.update(sub_repl)
         if is_direct:
             replacements.update({
                 "{{BANK_DIRECT_NAME}}": bank["bank_name"],
@@ -910,6 +1057,9 @@ class DocumentBuilder:
             for m in re.findall(r"\{\{[^}]+\}\}", c.value)
         })
         logger.info(f"Счёт: заполнено ячеек {filled}, вариант шаблона {variant}")
+        if leftover and subagent and STRICT_PLACEHOLDERS:
+            # Субагентский счёт новый — выпускаем его только чистым.
+            raise MissingDataError(f"Счёт_{number}", [], leftover)
         if leftover:
             # Не роняем выдачу: счёт с лишним плейсхолдером видно глазом,
             # а вот молчаливо не собранный счёт хуже.
@@ -1069,7 +1219,8 @@ class DocumentBuilder:
         act_date — дата самого акта (дата закрывающего платежа).
         """
         variant = template_variant()
-        template = self.templates_dir / docx_template_name("act_template", variant)
+        template = (self._subagent_template("act") if salon.is_subagent(data)
+                    else self.templates_dir / docx_template_name("act_template", variant))
         if not template.exists():
             raise FileNotFoundError(
                 f"Шаблон акта не найден: {template}. "
@@ -1117,7 +1268,8 @@ class DocumentBuilder:
         оформляются одним днём.
         """
         variant = template_variant()
-        template = self.templates_dir / docx_template_name("otchet_agenta_template", variant)
+        template = (self._subagent_template("report") if salon.is_subagent(data)
+                    else self.templates_dir / docx_template_name("otchet_agenta_template", variant))
         if not template.exists():
             raise FileNotFoundError(
                 f"Шаблон отчёта агента не найден: {template}. "
@@ -1165,7 +1317,8 @@ class DocumentBuilder:
         хронологически последнего платежа по сделке.
         """
         variant = template_variant()
-        template = self.templates_dir / docx_template_name("raspiska_template", variant)
+        template = (self._subagent_template("receipt") if salon.is_subagent(data)
+                    else self.templates_dir / docx_template_name("raspiska_template", variant))
         if not template.exists():
             raise FileNotFoundError(
                 f"Шаблон расписки не найден: {template}. "
@@ -1761,6 +1914,7 @@ class DocumentBuilder:
         from copy import deepcopy
 
         doc = Document(str(template_path))
+        present_early = self._scan_placeholders(doc)
 
         # Тип покупателя (физ.лицо/ИП) — единая точка сборки «полных данных»
         # и короткой подписи покупателя для ВСЕХ документов сразу (АГ, АГ-прямой,
@@ -2024,6 +2178,15 @@ class DocumentBuilder:
             or data.get("Дата расчёта")
             or ""
         )
+
+        # Субагентская сделка: салон (Агент), договор салона с клиентом и
+        # конечный покупатель — «ИП ФИО» / «гражданина(ки) РФ ФИО». Для ДКП
+        # не нужны (там покупатель — сам клиент, как в прямой сделке).
+        if salon.is_subagent(data) and any(
+                ph in present_early for ph in (
+                    "{{АГЕНТ_РФ_НАИМЕНОВАНИЕ}}", "{{АГЕНТ_РФ_ПОЛНЫЕ_ДАННЫЕ}}",
+                    "{{ПОКУПАТЕЛЬ_ЛИЦО}}", "{{ДОГОВОР_КП_НОМЕР}}")):
+            replacements.update(self._subagent_replacements(data))
 
         # Пробрасываемые снаружи плейсхолдеры (для актов и подобных документов
         # с расширенным набором). Перекрывают базовые при совпадении ключей.

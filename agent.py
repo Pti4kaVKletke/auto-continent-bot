@@ -44,7 +44,9 @@ import bank_requisites as br
 import money
 import company
 from drive_service import GoogleDriveService
+import salon
 from doc_builder import (DocumentBuilder, MissingDataError, AmountMismatchError,
+                         SubagentSetupError, contract_file_base,
                          order_amount, amount_to_words_plain, AMOUNT_TOLERANCE_RUB,
                          _to_float as _dkp_float)
 from gsheets_service import GoogleSheetsService
@@ -294,6 +296,9 @@ def _num_for_sheet(x: float) -> str:
 #
 # (код, подпись для кнопки, имя при загрузке через бота, ключевые слова)
 SCAN_TYPES = [
+    # «САГ_Договор» (субагентская сделка) — тот же договор: «саг договор»
+    # содержит «аг договор», «субагентск» — «агентск». Префикс при загрузке
+    # через бота подменяется на Подп_САГ_Договор (cb_deal.on_scantype).
     ("ag",      "АГ договор + поручение", "Подп_АГ_Договор",   ("аг договор", "агентск")),
     ("dkp",     "ДКП",                    "Подп_ДКП_ТС",       ("дкп",)),
     ("receipt", "Расписка",               "Подп_Расписка",     ("расписк",)),
@@ -650,6 +655,9 @@ _COPY_FIELDS_BANK = [
     "corr_bank_name", "corr_bank_bic", "corr_bank_acc",
 ]
 _COPY_FIELDS_COMMISSION = ["Комиссия %"]
+# Субагентская сделка: салон копируется во всех режимах (новая сделка того же
+# салона). Договор салона с клиентом — свой у каждой сделки, не копируется.
+_COPY_FIELDS_SALON = ["deal_type", "salon"]
 
 # Никогда не копируется — фиксируется в новой сделке независимо
 _COPY_NEVER = {
@@ -682,6 +690,7 @@ def _prepare_copy_data(source: dict, mode: str, overrides: dict | None = None) -
             _COPY_FIELDS_BUYER + _COPY_FIELDS_SELLER
             + _COPY_FIELDS_BANK + _COPY_FIELDS_COMMISSION
         )
+    keys = keys + _COPY_FIELDS_SALON
 
     for k in keys:
         if k in _COPY_NEVER:
@@ -819,6 +828,20 @@ class DocumentAgent:
             '- Черновики можно найти через find_deal с запросом "черновик"',
             '- "Покажи активные сделки" — работает автоматически через меню бота (там свой фильтр)',
         ]))
+
+        # Выбор «Новая сделка → через салон» живёт у бота (salon.get_pending),
+        # здесь только напоминание LLM, что сделка субагентская и что в конце
+        # нужно спросить договор салона с клиентом.
+        _pending_salon = salon.get_pending(getattr(self, "_current_chat_id", ""))
+        if _pending_salon:
+            base += (
+                "\n\n=== ТЕКУЩАЯ НОВАЯ СДЕЛКА: СУБАГЕНТСКАЯ ===\n"
+                f"Салон (Агент): {salon.journal_value(_pending_salon)}. "
+                "Собирай данные конечного покупателя и продавца как обычно; перед "
+                "create_contract обязательно спроси номер и дату договора салона с "
+                "клиентом и передай их в data.salon_contract («№ 45 от 12.09.2026»). "
+                "deal_type и salon бот проставит сам.\n"
+            )
 
         instructions = memory.get_instructions()
         if instructions:
@@ -1583,6 +1606,47 @@ class DocumentAgent:
             _bt = str(data.get("buyer_type") or "").strip().lower()
             data["buyer_type"] = "ИП" if _bt in ("ип", "индивидуальный предприниматель") else "физ.лицо"
 
+            # ── Тип сделки: прямая или субагентская (через салон РФ) ────────
+            # Выбор «через салон» делается кнопкой и хранится у бота
+            # (salon.get_pending), а не в памяти LLM. При перегенерации тип,
+            # салон и договор с клиентом берутся из журнала, если LLM их не
+            # передала, — иначе субагентская сделка пересобралась бы прямой.
+            _chat = getattr(self, "_current_chat_id", "")
+            if is_regen:
+                _old = await self.sheets.get_deal(number) or {}
+                for _k in ("deal_type", "salon", "salon_contract"):
+                    if not str(data.get(_k) or "").strip() and str(_old.get(_k) or "").strip():
+                        data[_k] = _old[_k]
+            else:
+                _pending = salon.get_pending(_chat)
+                if _pending:
+                    data["deal_type"] = salon.DEAL_TYPE_SUBAGENT
+                    data["salon"] = salon.journal_value(_pending)
+            data["deal_type"] = salon.normalize_deal_type(data.get("deal_type"))
+            if salon.is_subagent(data):
+                _card = salon.card_for_deal(data)
+                if not _card:
+                    return {"error": (
+                        f"Сделка не создана: не найдена карточка салона «{data.get('salon') or '—'}». "
+                        "Попроси пользователя выбрать салон кнопкой «📄 Новая сделка → 🏬 Через салон РФ»."
+                    )}
+                data["salon"] = salon.journal_value(_card)
+                _kp_num, _kp_date = salon.parse_client_contract(data.get("salon_contract"))
+                if not _kp_num or not _kp_date:
+                    return {"error": (
+                        "Сделка не создана: для субагентской сделки нужен номер и дата "
+                        "договора салона с клиентом (конечным покупателем). Спроси их у "
+                        "пользователя одним вопросом и вызови create_contract снова с "
+                        "data.salon_contract в виде «№ 45 от 12.09.2026»."
+                    )}
+                data["salon_contract"] = salon.format_client_contract(_kp_num, _kp_date)
+                if br.resolve_account_type(data) != br.CORR:
+                    return {"error": (
+                        "Сделка не создана: субагентская сделка оплачивается только на наш "
+                        "счёт в КР через банк-корреспондент. Попроси пользователя выбрать "
+                        "профиль реквизитов «через корреспондента» (request_bank_choice)."
+                    )}
+
             # «Сумма нал. (USD)» — сумма Поручения в долларах. Агент спрашивает
             # её при создании сделки и передаёт сам. Здесь, ДО создания папки,
             # сборки документов и записи в журнал, проверяем её делением:
@@ -1660,6 +1724,9 @@ class DocumentAgent:
             except AmountMismatchError as e:
                 logger.error(f"Сделка {number}: документы не выданы — {e}")
                 return {"message": _amount_mismatch_text(number, e)}
+            except SubagentSetupError as e:
+                logger.error(f"Сделка {number}: документы не выданы — {e}")
+                return {"message": f"⚠️ Сделка {number}: {e}"}
             except Exception as e:
                 logger.error(f"Ошибка построения документов для сделки {number}: {e}", exc_info=True)
                 files_done = list(built.keys())
@@ -1672,10 +1739,11 @@ class DocumentAgent:
 
             ag_path, dkp_path, invoice_path = built["ag"], built["dkp"], built["invoice"]
 
-            ag_docx  = f"АГ_Договор_{number}.docx"
+            _ag_base = contract_file_base(tool_input["data"], number)
+            ag_docx  = f"{_ag_base}.docx"
             dkp_docx = f"ДКП_ТС_{number}.docx"
             inv_xlsx = f"Счёт_{number}.xlsx"
-            ag_pdf   = f"АГ_Договор_{number}.pdf"
+            ag_pdf   = f"{_ag_base}.pdf"
             dkp_pdf  = f"ДКП_ТС_{number}.pdf"
             inv_pdf  = f"Счёт_{number}.pdf"
 
@@ -1765,6 +1833,13 @@ class DocumentAgent:
             total_files = 1 + len(extra_files)
             pdf_note = " (PDF отключён)" if skip_pdf else ("" if ag_pdf_path else " (LibreOffice недоступен)")
 
+            sub_note = ""
+            if salon.is_subagent(tool_input["data"]):
+                sub_note = (f" · субагентская: салон (Агент) {tool_input['data'].get('salon')}, "
+                            f"договор с клиентом {tool_input['data'].get('salon_contract')}")
+                if not is_regen:
+                    salon.clear_pending(getattr(self, "_current_chat_id", ""))
+
             return {
                 "file":        ag_path,
                 "filename":    ag_docx,
@@ -1772,7 +1847,7 @@ class DocumentAgent:
                 "extra_files": extra_files,
                 "extra_names": extra_names,
                 "extra_links": extra_links,
-                "message":     f"Сделка {number}: {total_files} файлов отправлено{pdf_note}",
+                "message":     f"Сделка {number}: {total_files} файлов отправлено{pdf_note}{sub_note}",
             }
 
         elif tool_name == "generate_docs":
@@ -1797,6 +1872,7 @@ class DocumentAgent:
                 if not deal:
                     return {"message": f"❌ Сделка {contract_number} не найдена в журнале."}
                 REQUIRED_KEYS = [
+                    "deal_type","salon","salon_contract",
                     "buyer_name","buyer_initials","buyer_birth_date","buyer_address",
                     "buyer_type","buyer_inn",
                     "buyer_bank_details",
@@ -1845,7 +1921,7 @@ class DocumentAgent:
             async def _build_and_upload_ag():
                 nonlocal first_file, first_name, first_link
                 path = await self.builder.build_contract(data, contract_number, contract_date, commission_pct)
-                fname = f"АГ_Договор_{contract_number}.docx"
+                fname = f"{contract_file_base(data, contract_number)}.docx"
                 link = await self.drive.upload_file(path, fname, deal_folder_id)
                 first_file = path; first_name = fname
                 if not first_link:
@@ -1853,7 +1929,7 @@ class DocumentAgent:
                 if not skip_pdf:
                     pdf = await self.builder.convert_to_pdf(path)
                     if pdf:
-                        pname = f"АГ_Договор_{contract_number}.pdf"
+                        pname = f"{contract_file_base(data, contract_number)}.pdf"
                         plink = await self.drive.upload_file(pdf, pname, deal_folder_id)
                         if not first_link:
                             first_link = plink
@@ -1925,15 +2001,19 @@ class DocumentAgent:
             except AmountMismatchError as e:
                 logger.error(f"Сделка {contract_number}: документы не выданы — {e}")
                 return {"message": _amount_mismatch_text(contract_number, e)}
+            except SubagentSetupError as e:
+                logger.error(f"Сделка {contract_number}: документы не выданы — {e}")
+                return {"message": f"⚠️ Сделка {contract_number}: {e}"}
             except Exception as e:
                 logger.error(f"Ошибка генерации документов ({doc_type}) для {contract_number}: {e}", exc_info=True)
                 return {"message": f"⚠️ Ошибка создания документов: {e}"}
 
             total = 1 + len(extra_files)
             pdf_note = ", PDF отключён" if skip_pdf else ""
+            _ag_word = "субагентский договор" if salon.is_subagent(data) else "агентский договор"
             doc_names = {
-                "all":     "агентский договор, ДКП и счёт",
-                "ag":      "агентский договор",
+                "all":     f"{_ag_word}, ДКП и счёт",
+                "ag":      _ag_word,
                 "dkp":     "ДКП",
                 "invoice": "счёт",
             }.get(doc_type, "документы")
@@ -2027,6 +2107,20 @@ class DocumentAgent:
                     and not (deal.get("buyer_inn") or "").strip():
                 missing.append("  — ИНН покупателя (`buyer_inn`) — покупатель отмечен как ИП")
 
+            # Субагентская сделка: карточка салона и договор салона с клиентом.
+            if salon.is_subagent(deal):
+                _card = salon.card_for_deal(deal)
+                if not _card:
+                    missing.append(f"  — карточка салона «{deal.get('salon') or '—'}» (меню 🏬 Салоны)")
+                else:
+                    for problem in salon.problems(_card):
+                        missing.append(f"  — карточка салона: {problem}")
+                _kp_num, _kp_date = salon.parse_client_contract(deal.get("salon_contract"))
+                if not _kp_num or not _kp_date:
+                    missing.append("  — договор салона с клиентом: номер и дата (`salon_contract`)")
+                if br.resolve_account_type(deal) != br.CORR:
+                    missing.append("  — реквизиты: для субагентской сделки нужен счёт через корреспондента")
+
             contract_date = deal.get("Дата договора", "")
             commission_pct = _num(deal.get("Комиссия %", "1")) or 1.0
 
@@ -2041,6 +2135,7 @@ class DocumentAgent:
 
             # Всё заполнено — собираем data из ВСЕХ нужных полей (а не только из REQUIRED)
             ALL_DATA_KEYS = [
+                "deal_type","salon","salon_contract",
                 "buyer_name","buyer_initials","buyer_birth_date","buyer_address",
                 "buyer_type","buyer_inn",
                 "buyer_bank_details",
@@ -2065,7 +2160,16 @@ class DocumentAgent:
                 f"📄 *Сделка {contract_number}* от {contract_date} · {status}",
                 "✅ Все обязательные поля заполнены",
                 "",
-                f"👤 Покупатель: {deal.get('buyer_name', '—')}",
+            ]
+            if salon.is_subagent(deal):
+                lines += [
+                    f"🏬 Салон (Агент): {deal.get('salon', '—')}",
+                    f"📑 Договор салона с клиентом: {deal.get('salon_contract', '—')}",
+                    f"👤 Покупатель (конечный): {deal.get('buyer_name', '—')}",
+                ]
+            else:
+                lines.append(f"👤 Покупатель: {deal.get('buyer_name', '—')}")
+            lines += [
                 f"👤 Продавец: {deal.get('seller_name', '—')}",
                 f"🚗 {deal.get('car_model', '—')} · VIN `{deal.get('car_vin', '—')}`",
                 f"💰 Цена авто: {_money_str(deal.get('car_price')) or '—'} · "
@@ -3613,6 +3717,55 @@ class DocumentAgent:
                 {"text": "◀️ К сделке", "callback_data": f"dealaction:{contract_number}:menu"},
             ],
         }
+
+    async def extract_salon_card(self, filepath: str = None, filename: str = None,
+                                 text: str = "") -> dict:
+        """Карточка салона (Агент РФ) из присланной карточки организации,
+        выписки ЕГРЮЛ/ЕГРИП или текста. Отдельный короткий вызов модели с
+        принудительным инструментом — результат сразу в полях salon.FIELDS,
+        пользователь проверяет его на экране перед сохранением."""
+        props = {k: {"type": "string", "description": label} for k, label, _ in salon.FIELDS}
+        props["org_form"]["description"] = "«ООО» для организации (ИНН 10 цифр) или «ИП» (ИНН 12 цифр)"
+        props["signer_position_gen"]["description"] = "должность подписанта в родительном падеже, напр. «Генерального директора» (для ИП пусто)"
+        props["signer_name_gen"]["description"] = "ФИО подписанта в родительном падеже, напр. «Иванова Ивана Ивановича» (для ИП пусто)"
+        props["signer_basis"]["description"] = ("на основании чего действует подписант, в родительном падеже без слова «действующего»: "
+                                                "«Устава» или «доверенности № 5 от 01.09.2026» (для ИП пусто)")
+        props["name_full"]["description"] = "полное наименование, напр. «Общество с ограниченной ответственностью «Автомир»»"
+        props["name_short"]["description"] = "краткое наименование, напр. «ООО «Автомир»» или «ИП Петров Пётр Петрович»"
+        tool = {"name": "salon_card", "description": "Реквизиты салона",
+                "input_schema": {"type": "object", "properties": props}}
+
+        content = []
+        if filepath and filename and Path(filename).suffix.lower() == ".docx":
+            try:
+                import docx as _docx
+                d = _docx.Document(filepath)
+                parts = [p.text for p in d.paragraphs]
+                for t in d.tables:
+                    for r in t.rows:
+                        parts.append(" | ".join(c.text for c in r.cells))
+                content.append({"type": "text", "text": "\n".join(parts)[:15000]})
+            except Exception as e:
+                logger.warning(f"Карточка салона: не прочитан docx {filename}: {e}")
+        elif filepath and filename:
+            # Последний блок — общий промпт «извлеки всё» для сделки, здесь он не нужен.
+            content = (await self._build_file_message(filepath, filename, ""))[:-1]
+        if text:
+            content.append({"type": "text", "text": text})
+        content.append({"type": "text", "text": (
+            "Это карточка организации или ИП (российский автосалон). Извлеки реквизиты "
+            "и вызови salon_card. Ничего не выдумывай: чего нет в документе — оставь пустым. "
+            "Номера (ИНН, КПП, ОГРН, счета, БИК) — только цифры."
+        )})
+        resp = await self.client.messages.create(
+            model=self.model, max_tokens=1500, tools=[tool],
+            tool_choice={"type": "tool", "name": "salon_card"},
+            messages=[{"role": "user", "content": content}],
+        )
+        for block in resp.content:
+            if getattr(block, "type", "") == "tool_use":
+                return salon.normalize(dict(block.input or {}))
+        return salon.normalize({})
 
     async def process_file(self, filepath: str, filename: str, caption: str = "", chat_id: str = "") -> dict:
         return await self.process_message(

@@ -40,6 +40,12 @@ def init_db():
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         );
 
+        CREATE TABLE IF NOT EXISTS salons (
+            inn TEXT PRIMARY KEY,
+            data TEXT NOT NULL,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+
         CREATE TABLE IF NOT EXISTS instructions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             text TEXT NOT NULL,
@@ -132,6 +138,43 @@ def list_companies() -> list:
 def delete_company(name: str):
     conn = get_conn()
     conn.execute("DELETE FROM companies WHERE name=?", (name,))
+    conn.commit()
+    conn.close()
+
+
+# --- Карточки салонов (Агент РФ в субагентских сделках) ---
+# Ключ — ИНН салона: он же стоит в журнале в колонке «Салон (Агент РФ)».
+
+def save_salon(inn: str, data: dict):
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO salons (inn, data, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) "
+        "ON CONFLICT(inn) DO UPDATE SET data=excluded.data, updated_at=CURRENT_TIMESTAMP",
+        (inn, json.dumps(data, ensure_ascii=False)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_salon(inn: str) -> dict:
+    conn = get_conn()
+    row = conn.execute("SELECT data FROM salons WHERE inn=?", (inn,)).fetchone()
+    conn.close()
+    return json.loads(row["data"]) if row else {}
+
+
+def list_salons() -> list:
+    """[(inn, card), ...] по названию."""
+    conn = get_conn()
+    rows = conn.execute("SELECT inn, data FROM salons").fetchall()
+    conn.close()
+    out = [(r["inn"], json.loads(r["data"])) for r in rows]
+    return sorted(out, key=lambda x: (x[1].get("name_short") or x[0]).lower())
+
+
+def delete_salon(inn: str):
+    conn = get_conn()
+    conn.execute("DELETE FROM salons WHERE inn=?", (inn,))
     conn.commit()
     conn.close()
 

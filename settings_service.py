@@ -62,6 +62,13 @@ SETTINGS: list = [
         "options_fn": lambda: _template_variant_options(),
     },
     {
+        "key":      "SUBAGENT_TEMPLATE_VARIANT",
+        "label":    "🏬 Бланк субагентских документов (через салон)",
+        "default":  "v1",
+        "storage":  "db",          # применяется сразу, без передеплоя
+        "options_fn": lambda: _subagent_variant_options(),
+    },
+    {
         "key":     "SCANIFY",
         "label":   "🖨️ Эффект скана на PDF (акт/расписка/отчёт + подпись входящих)",
         "default": "1",
@@ -94,6 +101,18 @@ def _template_variant_options() -> list:
         else:
             opts.append({"label": f"{v} · новые шаблоны (счёт + АГ/акт/отчёт/расписка)", "value": v})
     return opts
+
+
+def _subagent_variant_options() -> list:
+    """Версии субагентского комплекта (договор, счёт, акт, отчёт, расписка),
+    у которых в templates/ лежат все пять файлов «… vN»."""
+    try:
+        import doc_builder
+        variants = doc_builder.subagent_variants() or ["v1"]
+    except Exception as e:  # pragma: no cover
+        logger.warning(f"settings: не удалось прочитать субагентские шаблоны: {e}")
+        variants = ["v1"]
+    return [{"label": f"{v} · субагентские шаблоны", "value": v} for v in variants]
 
 
 def get_options(setting) -> list:

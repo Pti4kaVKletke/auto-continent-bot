@@ -191,6 +191,9 @@ def main_menu_keyboard():
             InlineKeyboardButton("🏢 Компания",        callback_data="menu:company"),
         ],
         [
+            InlineKeyboardButton("🏬 Салоны",          callback_data="menu:salons"),
+        ],
+        [
             InlineKeyboardButton("🧠 Память",          callback_data="menu:memory"),
             InlineKeyboardButton("💾 Бэкапы",          callback_data="menu:backup"),
         ],

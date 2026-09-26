@@ -19,6 +19,7 @@ from agent import (
 )
 import memory
 import bank_requisites as br
+import salon
 import sign_ui
 
 from bot_core import (
@@ -83,6 +84,13 @@ async def on_scantype(update, context, query, data):
 
     num      = pending["num"]
     prefix   = SCAN_PREFIXES.get(code, "Прочее")
+    if code == "ag":
+        # Субагентская сделка: договор называется САГ_Договор — скан тоже.
+        try:
+            if salon.is_subagent(await agent.sheets.get_deal(pending["num"]) or {}):
+                prefix = "Подп_САГ_Договор"
+        except Exception as e:
+            logger.warning(f"Тип сделки {pending['num']} не прочитан: {e}")
     filepath = pending["filepath"]
     ext      = Path(pending["filename"]).suffix or ".pdf"
     base     = f"{prefix}_{num}"
@@ -248,9 +256,15 @@ async def on_dealaction(update, context, query, data):
 
         # Краткое название банка для отображения
         bank_short = bank_ben[:40] + "..." if len(bank_ben) > 43 else bank_ben
+        sub_lines = ""
+        if salon.is_subagent(deal):
+            sub_lines = (f"🏬 Салон (Агент): {deal.get('salon') or '—'}\n"
+                         f"📑 Договор с клиентом: {deal.get('salon_contract') or '—'}\n")
         text = (
-            f"📄 *Сделка {num}* от {date}\n\n"
-            f"👤 {buyer}\n"
+            f"📄 *Сделка {num}* от {date}"
+            + (" · субагентская" if sub_lines else "") + "\n\n"
+            + sub_lines
+            + f"👤 {buyer}\n"
             f"👤 {seller}\n"
             f"🚗 {car} · VIN `{vin}`\n"
             f"💰 Цена авто: {price} руб."
@@ -670,7 +684,10 @@ async def on_scan_route(update, context, query, data):
     caption  = context.user_data.pop("last_scan_caption", "")
 
     if route == "new":
-        # Новая сделка — читаем документ с нуля
+        # Новая сделка — читаем документ с нуля. Файл прислан без кнопки
+        # «Новая сделка», значит сделка прямая: брошенный выбор салона не
+        # должен сделать её субагентской.
+        salon.clear_pending(str(update.effective_chat.id))
         await query.edit_message_text("📥 Читаю документ...")
         result = await typing_while(
             update.effective_chat.id, context,

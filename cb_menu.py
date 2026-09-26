@@ -11,6 +11,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 import memory
 import bank_ui
 import company_ui
+import salon_ui
 import settings_service
 
 from bot_core import (
@@ -41,18 +42,10 @@ async def on_menu(update, context, query, data):
         return
 
     if action == "new_deal":
-        context.user_data["awaiting_new_deal_docs"] = 1
-        await query.edit_message_text(
-            "📄 *Новая сделка*\n\n"
-            "Отправь документы клиента:\n"
-            "• Паспорт РФ покупателя\n"
-            "• ТПО и/или таможенную декларацию продавца\n\n"
-            "Или напиши данные текстом — я извлеку всё нужное.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("◀️ Меню", callback_data="menu:back")
-            ]])
-        )
+        # Сначала тип сделки: прямая или через салон РФ (субагентская).
+        # Документы начинаем ждать после выбора — см. salon_ui (nd:…).
+        text, kb = salon_ui.new_deal_choice_screen()
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
 
     elif action == "find_deal":
         await query.edit_message_text(
@@ -123,6 +116,10 @@ async def on_menu(update, context, query, data):
 
     elif action == "bank_profiles":
         text, kb = bank_ui.list_screen()
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
+
+    elif action == "salons":
+        text, kb = salon_ui.list_screen()
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=kb)
 
     elif action == "company":
