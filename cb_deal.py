@@ -658,11 +658,12 @@ async def on_editbank(update, context, query, data):
             return
 
         await query.edit_message_reply_markup(reply_markup=None)
-        # Пишем профиль через нормализацию: вместе с полями уедут и тип
-        # счёта, и ИНН — иначе сделка получит банк одной юрисдикции и ИНН
-        # другой, и в счёте это никак не проявится.
+        # Пишем профиль через нормализацию: вместе с полями уедет и явный
+        # тип счёта, а поля корреспондента у прямого счёта обнулятся — иначе
+        # в сделке остались бы хвосты прежнего профиля. ИНН/КПП получателя
+        # в журнал не пишутся: они в карточке компании, их берёт шаблон.
         ok = await agent.sheets.update_deal(
-            contract_number, br.full_payload(profile, memory.get_setting)
+            contract_number, br.normalize(profile)
         )
         if ok:
             await query.message.reply_text(

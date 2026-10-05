@@ -936,6 +936,11 @@ def _deal_card(d: dict) -> str:
 # ─── ОБРАБОТЧИК ОШИБОК ───────────────────────────────────────────────────────
 
 async def error_handler(update, context):
+    # Повторное нажатие той же кнопки: Telegram отказывается «редактировать»
+    # сообщение тем же текстом. Это не ошибка — молча пропускаем.
+    if "Message is not modified" in str(context.error):
+        logger.info(f"Пропущено: {context.error}")
+        return
     logger.error(f"Необработанная ошибка: {context.error}", exc_info=context.error)
     if isinstance(update, Update) and update.effective_message:
         try:
