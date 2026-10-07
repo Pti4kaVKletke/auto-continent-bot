@@ -32,6 +32,7 @@ import memory
 import bank_requisites as br
 import bank_ui
 import company_ui
+import kg_deal
 import salon
 import salon_ui
 import sign_ui
@@ -39,6 +40,7 @@ import settings_service
 
 # Общие объекты и помощники — в bot_core.py; кнопки — в cb_*.py (25.09.2026)
 from bot_core import (
+    ALLOWED_CHAT_ID,
     _DEAL_NUM_RE,
     _PAY_ADD_RE,
     _PAY_DEL_RE,
@@ -348,11 +350,37 @@ async def daily_backup_job(context: ContextTypes.DEFAULT_TYPE):
             logger.warning(f"Не удалось уведомить {chat_id} об ошибке бэкапа: {e}")
 
 
+async def kg_reminder_job(context: ContextTypes.DEFAULT_TYPE):
+    """«Учёт КГ»: сделки в статусе «Подбор» — напоминание Илье каждые 5 дней
+    от даты поступления (с 30-го дня — «срок по договору истёк», п. 2.4).
+    Только владельцу бота (ALLOWED_CHAT_ID), не всем чатам с доступом."""
+    try:
+        deals = await agent.sheets.get_all_deals()
+    except Exception as e:
+        logger.error(f"Напоминание «Учёт КГ»: журнал не прочитан — {e}")
+        return
+    items = [(d, n) for d in deals if (n := kg_deal.reminder_days(d))]
+    if not items:
+        return
+    text = kg_deal.reminder_text(items)
+    try:
+        await context.bot.send_message(chat_id=ALLOWED_CHAT_ID, text=text,
+                                       parse_mode="Markdown")
+    except Exception as e:
+        logger.warning(f"Напоминание «Учёт КГ» с разметкой не ушло ({e}) — шлю без неё")
+        try:
+            await context.bot.send_message(chat_id=ALLOWED_CHAT_ID, text=text.replace("*", ""))
+        except Exception as e2:
+            logger.warning(f"Напоминание «Учёт КГ» не отправлено: {e2}")
+
+
 async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     memory.clear_history(chat_id)
     memory.clear_pending_scans(chat_id)
     salon.clear_pending(chat_id)
+    kg_deal.clear_new_pending(chat_id)
+    kg_deal.clear_vehicle_pending(chat_id)
     context.user_data.clear()
     await update.message.reply_text(
         "✅ История диалога очищена\n"
@@ -428,13 +456,36 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "filepath":  filepath,
             "filename":  filename,
         }
+        # Спецификация, СРТС и доверенность — только у сделок «Учёт КГ».
+        try:
+            _is_kg = kg_deal.is_kg(await agent.sheets.get_deal(contract_number) or {})
+        except Exception:
+            _is_kg = False
         kb = [[InlineKeyboardButton(label, callback_data=f"scantype:{code}")]
-              for code, label, _, _ in SCAN_TYPES]
+              for code, label, _, _ in SCAN_TYPES
+              if _is_kg or code not in ("spec", "srts", "poa")]
         kb.append([InlineKeyboardButton("◀️ Отмена",
                                         callback_data=f"dealaction:{contract_number}:menu")])
         await message.reply_text(
             f"📎 Файл получен. Что это за документ по сделке *{contract_number}*?",
             parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb),
+        )
+        return
+
+    # ── Сценарий К: «Учёт КГ», «🚗 Внести данные ТС» — СРТС / ID / доверенность ──
+    # Тип файла выбирается кнопкой: по нему файл получит имя на Drive
+    # (СРТС_XXXXXX, Доверенность_XXXXXX), а LLM — подсказку, что читать.
+    _veh = kg_deal.get_vehicle_pending(chat_id)
+    if _veh and not context.user_data.get("awaiting_new_deal_docs"):
+        context.user_data["kg_file_pending"] = {"filepath": filepath, "filename": filename}
+        kb = [[InlineKeyboardButton(label, callback_data=f"kgfile:{code}")]
+              for code, label, _ in kg_deal.FILE_KINDS]
+        kb.append([InlineKeyboardButton("📄 Другое (только прочитать)", callback_data="kgfile:other")])
+        kb.append([InlineKeyboardButton("◀️ Выйти из ввода данных ТС",
+                                        callback_data=f"kgfile:cancel:{_veh.get('num', '')}")])
+        await message.reply_text(
+            f"📎 Файл получен. Что это по сделке {_veh.get('num', '')}?",
             reply_markup=InlineKeyboardMarkup(kb),
         )
         return
@@ -501,6 +552,7 @@ CALLBACK_ROUTES = [
     ("prefix", "editbank:", cb_deal.on_editbank),
     ("prefix", "scan_route:", cb_deal.on_scan_route),
     ("prefix", "bankprofile:", cb_deal.on_bankprofile),
+    ("prefix", "kgfile:", cb_deal.on_kgfile),
 ]
 
 
@@ -1033,6 +1085,13 @@ def main():
                 name="daily_backup",
             )
             logger.info(f"Автобэкап запланирован на {hour:02d}:{minute:02d} Asia/Bishkek")
+            # «Учёт КГ»: сделки в «Подборе» — каждый день в 10:00 проверка,
+            # сообщение только в дни напоминания (каждые 5 дней).
+            app.job_queue.run_daily(
+                kg_reminder_job,
+                time=_dt_time(hour=10, minute=0, tzinfo=bishkek_tz),
+                name="kg_reminder",
+            )
         except Exception as e:
             logger.error(f"Не удалось запланировать автобэкап: {e}", exc_info=True)
 

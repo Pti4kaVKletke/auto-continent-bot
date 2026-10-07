@@ -27,7 +27,7 @@ def test_inserted_column_detected():
 
 def test_extra_column_at_end_detected():
     diffs = g.compare_headers(REAL + ["Лишняя"])
-    assert diffs == [("BO", "— колонки нет в коде —", "Лишняя")]
+    assert diffs == [("BS", "— колонки нет в коде —", "Лишняя")]
 
 
 class _FakeSvc:

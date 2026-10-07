@@ -19,6 +19,7 @@ from agent import (
 )
 import memory
 import bank_requisites as br
+import kg_deal
 import salon
 import sign_ui
 
@@ -62,10 +63,13 @@ async def on_dkp_date(update, context, query, data):
     else:
         deal_date = context.user_data.pop("pending_deal_date", "")
         dkp_date  = deal_date if value == "__same__" else value
+        msg = f"Дата договора: {deal_date}. Дата ДКП: {dkp_date}"
+        if value == "__none__":
+            msg = f"Дата договора: {deal_date}. Сделка «Учёт КГ» — даты ДКП нет, она будет на этапе 2."
         result = await typing_while(
             update.effective_chat.id, context,
             agent.process_message(
-                f"Дата договора: {deal_date}. Дата ДКП: {dkp_date}",
+                msg,
                 chat_id=str(update.effective_chat.id),
             )
         )
@@ -94,6 +98,14 @@ async def on_scantype(update, context, query, data):
     filepath = pending["filepath"]
     ext      = Path(pending["filename"]).suffix or ".pdf"
     base     = f"{prefix}_{num}"
+    if code in ("srts", "poa"):
+        # «Учёт КГ»: СРТС_XXXXXX / Доверенность_XXXXXX — по 6 знакам VIN,
+        # как номер ДКП. Нет VIN в журнале — по номеру сделки.
+        try:
+            _vin = (await agent.sheets.get_deal(num) or {}).get("car_vin", "")
+        except Exception:
+            _vin = ""
+        base = kg_deal.drive_name(code, num, _vin, ext)[:-len(ext)]
 
     await query.edit_message_text(f"⏳ Загружаю {SCAN_LABELS.get(code, 'скан')}...")
     try:
@@ -260,14 +272,30 @@ async def on_dealaction(update, context, query, data):
         if salon.is_subagent(deal):
             sub_lines = (f"🏬 Салон (Агент): {deal.get('salon') or '—'}\n"
                          f"📑 Договор с клиентом: {deal.get('salon_contract') or '—'}\n")
+        is_kg = kg_deal.is_kg(deal)
+        kg_stage2 = is_kg and kg_deal.stage2_done(deal)
+        if is_kg and not kg_stage2:
+            car_line = f"🚗 {kg_deal.car_line(deal) or car}\n🇰🇬 Данные ТС ещё не внесены\n"
+            seller_line = ""
+        elif is_kg:
+            car_line = (f"🚗 {car} · VIN `{vin}`\n"
+                        f"📘 СРТС: {deal.get('srts') or '—'} · {deal.get('gos_number') or '—'}\n"
+                        f"📜 Доверенность: {deal.get('poa') or 'не внесена'}\n")
+            seller_line = f"👤 {seller}\n"
+        else:
+            car_line = f"🚗 {car} · VIN `{vin}`\n"
+            seller_line = f"👤 {seller}\n"
+        status_txt = str(deal.get("Статус") or "").strip()
         text = (
             f"📄 *Сделка {num}* от {date}"
-            + (" · субагентская" if sub_lines else "") + "\n\n"
+            + (" · субагентская" if sub_lines else "")
+            + (" · Учёт КГ" if is_kg else "")
+            + (f" · {status_txt}" if is_kg and status_txt else "") + "\n\n"
             + sub_lines
             + f"👤 {buyer}\n"
-            f"👤 {seller}\n"
-            f"🚗 {car} · VIN `{vin}`\n"
-            f"💰 Цена авто: {price} руб."
+            + seller_line
+            + car_line
+            + f"💰 Цена авто: {price} руб."
         )
         if total_sum:
             text += f"\n💵 Итого к оплате: *{total_sum}* руб."
@@ -297,6 +325,12 @@ async def on_dealaction(update, context, query, data):
             [InlineKeyboardButton("✅ Завершить сделку",  callback_data=f"dealaction:{num}:complete")],
             [InlineKeyboardButton("❌ Отменить сделку",   callback_data=f"dealaction:{num}:cancel")],
         ]
+        # «Учёт КГ»: этап 2. Кнопка видна, пока данные ТС не внесены целиком
+        # (в том числе пока нет доверенности — её вносят позже тем же путём).
+        if is_kg and (not kg_stage2 or not str(deal.get("poa") or "").strip()
+                      or status_txt.lower() == kg_deal.STATUS_PODBOR.lower()):
+            keyboard.insert(1, [InlineKeyboardButton("🚗 Внести данные ТС",
+                                                     callback_data=f"dealaction:{num}:kg_vehicle")])
         if folder:
             keyboard.insert(0, [InlineKeyboardButton("📁 Открыть на Drive", url=folder)])
         # Возврат туда, откуда пришли: тот же срез и та же страница
@@ -365,7 +399,8 @@ async def on_dealaction(update, context, query, data):
 
         # Заодно обновляем колонку «Сканы» в журнале: файлы могли положить
         # в папку и мимо бота, а колонка — только отражение папки.
-        status = scan_status_text([f.get("name", "") for f in files])
+        status = scan_status_text([f.get("name", "") for f in files],
+                                  kg=kg_deal.is_kg(deal or {}))
         try:
             await agent.sheets.update_deal(num, {"Сканы": status})
         except Exception as e:
@@ -419,6 +454,39 @@ async def on_dealaction(update, context, query, data):
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("◀️ Отмена", callback_data=f"dealaction:{num}:menu")
             ]])
+        )
+
+    elif action == "kg_vehicle":
+        # «Учёт КГ», этап 2. Сделка запоминается у бота (kg_deal), файлы
+        # копятся там же с типом, выбранным кнопкой; LLM получает напоминание
+        # в промпте и в конце вызывает set_kg_vehicle.
+        chat_id = str(update.effective_chat.id)
+        deal = await agent.sheets.get_deal(num) or {}
+        if not kg_deal.is_kg(deal):
+            await query.edit_message_text(f"Сделка {num} — не «Учёт КГ».")
+            return
+        memory.clear_history(chat_id)
+        memory.clear_pending_scans(chat_id)
+        kg_deal.clear_new_pending(chat_id)
+        kg_deal.set_vehicle_pending(chat_id, num)
+        context.user_data["current_deal"] = num
+        have = ""
+        if kg_deal.stage2_done(deal):
+            have = ("\n\nУже внесено: VIN " + str(deal.get("car_vin") or "—")
+                    + ", ДКП от " + str(deal.get("Дата ДКП") or "—")
+                    + ". Пришли то, что нужно добавить или исправить (например доверенность).")
+        await query.edit_message_text(
+            f"🚗 *Внести данные ТС — сделка {num}*\n"
+            f"{kg_deal.car_line(deal)}\n\n"
+            "Пришли по одному файлу:\n"
+            "• СРТС\n"
+            "• ID-карту продавца\n"
+            "• доверенность (если уже есть)\n\n"
+            "Дату ДКП напиши текстом (например «ДКП 12.10.2026»)." + have,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("◀️ Отмена", callback_data=f"kgfile:cancel:{num}")
+            ]]),
         )
 
     elif action == "edit":
@@ -689,6 +757,7 @@ async def on_scan_route(update, context, query, data):
         # «Новая сделка», значит сделка прямая: брошенный выбор салона не
         # должен сделать её субагентской.
         salon.clear_pending(str(update.effective_chat.id))
+        kg_deal.clear_new_pending(str(update.effective_chat.id))
         # С чистого листа: без этого LLM подставляла в новую сделку продавца,
         # машину и суммы из прошлой переписки. Сам файл уже у нас (filepath).
         memory.clear_history(str(update.effective_chat.id))
@@ -742,3 +811,46 @@ async def on_bankprofile(update, context, query, data):
         agent.process_message(user_text, chat_id=str(update.effective_chat.id))
     )
     await send_result(query.message, result)
+
+
+async def on_kgfile(update, context, query, data):
+    """Кнопки: callback_data «kgfile:…» — тип файла на этапе «🚗 Внести данные ТС».
+
+    kgfile:<srts|id|poa|other> — файл из user_data["kg_file_pending"];
+    kgfile:cancel:<номер> — выйти из ввода данных ТС.
+    """
+    chat_id = str(update.effective_chat.id)
+    parts = data.split(":")
+    if parts[1] == "cancel":
+        kg_deal.clear_vehicle_pending(chat_id)
+        context.user_data.pop("kg_file_pending", None)
+        num = parts[2] if len(parts) > 2 else ""
+        await query.edit_message_text(
+            "Ввод данных ТС отменён.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("◀️ К сделке", callback_data=f"dealaction:{num}:menu")
+            ]]) if num else None,
+        )
+        return
+
+    kind = parts[1]
+    pending = context.user_data.pop("kg_file_pending", None)
+    veh = kg_deal.get_vehicle_pending(chat_id)
+    if not pending or not veh:
+        await query.edit_message_text("⚠️ Файл потерялся, пришлите его ещё раз.")
+        return
+    num = veh.get("num", "")
+    if kind in kg_deal.FILE_KIND_PREFIX:
+        kg_deal.add_vehicle_file(chat_id, pending["filepath"], pending["filename"], kind)
+    label = kg_deal.FILE_KIND_LABELS.get(kind, "документ")
+    await query.edit_message_text(f"📥 Читаю: {label}...")
+    caption = (
+        f"Сделка {num} («Учёт КГ», внесение данных ТС). Это {label}. "
+        "Извлеки нужные данные. Если уже есть СРТС, данные продавца и дата ДКП — "
+        "вызови set_kg_vehicle; иначе коротко скажи, чего ещё не хватает."
+    )
+    result = await typing_while(
+        update.effective_chat.id, context,
+        agent.process_file(pending["filepath"], pending["filename"], caption, chat_id=chat_id),
+    )
+    await send_result(query.message, result, context=context)

@@ -389,6 +389,18 @@ async def ask_dkp_date(message, deal_date: str):
     а не инструментом LLM — чтобы шаг нельзя было пропустить.
     """
     from datetime import datetime
+    import kg_deal
+
+    # «Учёт КГ»: ДКП заключается после оплаты (этап 2) — дату не спрашиваем.
+    if kg_deal.get_new_pending(str(message.chat_id)):
+        await message.reply_text(
+            f"📅 Дата договора: *{deal_date}*\n\n"
+            "Сделка «Учёт КГ» — дату ДКП внесём позже, вместе с данными ТС.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                "✅ Продолжить", callback_data="dkp_date:__none__")]]),
+        )
+        return
 
     today_str = datetime.now().strftime("%d.%m.%Y")
     kb = [[InlineKeyboardButton(f"✅ Та же, что договор ({deal_date})",
@@ -429,6 +441,7 @@ _DEAL_STATUS_ICONS = {
     "черновик":     "🔵",
     "активна":      "🟢",
     "ждём доплату": "⏳",
+    "подбор":       "🔎",   # «Учёт КГ»: оплачено, ТС ещё не на продавце
     "завершена":    "✅",
     "отменена":     "❌",
 }
@@ -437,8 +450,9 @@ _DEAL_STATUS_ICONS = {
 # отменённых — отменённые видны только по явному фильтру.
 _DEAL_STATUS_FILTERS = [
     ("all",       "Все",          None),
-    ("active",    "Активные",     ("активна", "ждём доплату")),
+    ("active",    "Активные",     ("активна", "ждём доплату", "подбор")),
     ("pending",   "Ждём доплату", ("ждём доплату",)),
+    ("podbor",    "Подбор",       ("подбор",)),
     ("done",      "Завершённые",  ("завершена",)),
     ("cancelled", "Отменённые",   ("отменена",)),
 ]
@@ -625,6 +639,8 @@ def _build_deals_view(deals, period, status_code, page, date_from="", date_to=""
     filt = []
     for code, lbl, _st in _DEAL_STATUS_FILTERS:
         if code == "cancelled" and "отменена" not in present:
+            continue
+        if code == "podbor" and "подбор" not in present:
             continue
         mark = "• " if code == status_code else ""
         filt.append(InlineKeyboardButton(f"{mark}{lbl}",

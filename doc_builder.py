@@ -18,6 +18,7 @@ import bank_requisites as br
 import money
 import company
 import salon
+import kg_deal
 
 try:  # настройки компании лежат в SQLite бота; без неё работают значения по умолчанию
     from memory import get_setting as _setting
@@ -113,7 +114,19 @@ PLACEHOLDER_LABELS = {
     "{{ДАТА_ПОСТУПЛЕНИЯ}}":         "дата поступления средств",
     "{{ДАТА_РАСЧЕТА}}":             "дата расчёта с получателем",
     "{{СЧЕТ_НОМЕР}}":               "номер счёта",
+    # «Учёт КГ»
+    "{{ЦВЕТ}}":                     "цвет",
+    "{{СРТС}}":                     "СРТС (серия, номер, дата)",
+    "{{ГОСНОМЕР}}":                 "госномер",
+    "{{ДОВЕРЕННОСТЬ_РЕКВИЗИТЫ}}":   "реквизиты доверенности",
+    "{{ДЕНЬ_СПЕЦ}}":                "дата Спецификации",
+    "{{МЕСЯЦ_СПЕЦ}}":               "дата Спецификации",
+    "{{ГОД_СПЕЦ}}":                 "дата Спецификации",
+    "{{ДЕНЬ_ДКП}}":                 "дата ДКП",
 }
+
+# «Учёт КГ»: эти поля обязательны, хотя в прямой сделке могут быть пустыми.
+KG_REQUIRED_PLACEHOLDERS = {"{{ЦВЕТ}}"}
 
 
 # Допуск сходимости «сумма в валюте × курс = цена в рублях», в рублях.
@@ -236,6 +249,11 @@ def dkp_number_from(data: dict, fallback: str = "") -> str:
     if len(vin) >= 6:
         return vin[-6:].upper()
     return fallback
+
+
+class KgStageError(Exception):
+    """Сделка «Учёт КГ»: документ этапа 2 нельзя собрать — данные ТС не внесены,
+    не заполнены или нарушен порядок дат (kg_deal.stage2_block)."""
 
 
 class SubagentSetupError(Exception):
@@ -770,7 +788,47 @@ class DocumentBuilder:
         out["{{ДОГОВОР_КП_ДАТА}}"] = salon.date_words(date)
         return out
 
+    # ─── «УЧЁТ КГ»: свой комплект шаблонов *_KG ──────────────────────────
+
+    def _kg_template(self, kind: str) -> Path:
+        path = self.templates_dir / kg_deal.TEMPLATES[kind]
+        if not path.exists():
+            raise MissingTemplateError(
+                f"Не найден {path.name} — шаблон сделки «Учёт КГ». Документ не собран."
+            )
+        return path
+
+    @staticmethod
+    def _require_kg_stage2(data: dict, need_poa: bool = False, settlement_date: str = "") -> None:
+        reason = kg_deal.stage2_block(data, need_poa=need_poa, settlement_date=settlement_date)
+        if reason:
+            raise KgStageError(reason)
+
+    async def build_spec(self, data: dict, number: str, date: str) -> str:
+        """Спецификация (Приложение № 2 к агентскому договору) — только «Учёт КГ».
+        number/date — номер и дата агентского договора; дата самой Спецификации
+        — колонка «Дата спецификации», по умолчанию = Дата ДКП."""
+        if not kg_deal.is_kg(data):
+            raise KgStageError("Спецификация есть только у сделок «Учёт КГ».")
+        self._require_kg_stage2(data)
+        s_day, s_month, s_year = self._date_parts(kg_deal.spec_date(data))
+        return await self._fill_template(
+            self._kg_template("spec"), data, number, date, f"Спецификация_{number}",
+            extra_replacements={"{{ДЕНЬ_СПЕЦ}}": s_day, "{{МЕСЯЦ_СПЕЦ}}": s_month,
+                                "{{ГОД_СПЕЦ}}": s_year},
+        )
+
     async def build_contract(self, data: dict, number: str, date: str, commission_pct: float = 1.0) -> str:
+        if kg_deal.is_kg(data):
+            # Этап 1: в Поручении марка, модель, цвет, год и цена — без VIN
+            # и продавца (они появятся в Спецификации).
+            missing = kg_deal.stage1_missing(data)
+            if missing:
+                raise MissingDataError(contract_file_base(data, number), missing, [])
+            template = self._kg_template("contract")
+            logger.info(f"Шаблон АГ договора «Учёт КГ»: {template.name}")
+            return await self._fill_template(template, data, number, date,
+                                             contract_file_base(data, number), commission_pct)
         if salon.is_subagent(data):
             self._require_subagent_setup(data)
             template = self._subagent_template("contract")
@@ -871,6 +929,11 @@ class DocumentBuilder:
         date — дата сделки; дата самого ДКП подставляется в _fill_template из
         колонки журнала «Дата ДКП», если она заполнена.
         """
+        if kg_deal.is_kg(data):
+            # Основание права продавца — СРТС, ТПО не используется.
+            self._require_kg_stage2(data)
+            return await self._fill_template(self._kg_template("dkp"), data, number, date,
+                                             f"ДКП_ТС_{number}")
         template = self.templates_dir / "dkp_template.docx"
         if template.exists():
             return await self._fill_template(template, data, number, date, f"ДКП_ТС_{number}")
@@ -996,6 +1059,10 @@ class DocumentBuilder:
         buyer       = data.get("buyer_name", data.get("company_name", ""))
         car         = (f"{data.get('car_model', '')} год выпуска {data.get('car_year', '')} "
                        f"VIN {data.get('car_vin', '')}").strip()
+        if kg_deal.is_kg(data):
+            # «Учёт КГ»: на этапе оплаты VIN и продавца нет — в строке счёта
+            # только марка, цвет и год (как в Поручении).
+            car = kg_deal.car_line(data, self._car_model_case(data.get("car_model", "")))
 
         day_n  = date[0:2]
         mon_n  = date[3:5]
@@ -1137,6 +1204,11 @@ class DocumentBuilder:
                 # ST00012 → Name → PersonalAcc → BankName → BIC → CorrespAcc
                 # Затем опциональные: PayeeINN, KPP, Sum, Purpose
                 car_vin = data.get("car_vin", "")
+                purpose = (f"Оплата по счету №{number} от {date} по Агентскому договору "
+                           f"№{number} от {date} за автомобиль VIN {car_vin}. Без НДС.")
+                if kg_deal.is_kg(data):
+                    purpose = kg_deal.qr_purpose(number, date, data,
+                                                 self._car_model_case(data.get("car_model", "")))
                 qr_str = (
                     "ST00012|"
                     f"Name={payee}|"
@@ -1147,7 +1219,7 @@ class DocumentBuilder:
                     f"PayeeINN={payee_inn}|"
                     f"KPP={kpp}|"
                     f"Sum={sum_kopecks}|"
-                    f"Purpose=Оплата по счету №{number} от {date} по Агентскому договору №{number} от {date} за автомобиль VIN {car_vin}. Без НДС."
+                    f"Purpose={purpose}"
                 )
 
                 # Кодируем в cp1251 как требует ГОСТ
@@ -1268,8 +1340,12 @@ class DocumentBuilder:
         act_date — дата самого акта (дата закрывающего платежа).
         """
         variant = template_variant()
-        template = (self._subagent_template("act") if salon.is_subagent(data)
-                    else self.templates_dir / docx_template_name("act_template", variant))
+        if kg_deal.is_kg(data):
+            self._require_kg_stage2(data, need_poa=True, settlement_date=act_date)
+            template = self._kg_template("act")
+        else:
+            template = (self._subagent_template("act") if salon.is_subagent(data)
+                        else self.templates_dir / docx_template_name("act_template", variant))
         if not template.exists():
             raise FileNotFoundError(
                 f"Шаблон акта не найден: {template}. "
@@ -1317,8 +1393,12 @@ class DocumentBuilder:
         оформляются одним днём.
         """
         variant = template_variant()
-        template = (self._subagent_template("report") if salon.is_subagent(data)
-                    else self.templates_dir / docx_template_name("otchet_agenta_template", variant))
+        if kg_deal.is_kg(data):
+            self._require_kg_stage2(data, need_poa=True, settlement_date=settlement_date)
+            template = self._kg_template("report")
+        else:
+            template = (self._subagent_template("report") if salon.is_subagent(data)
+                        else self.templates_dir / docx_template_name("otchet_agenta_template", variant))
         if not template.exists():
             raise FileNotFoundError(
                 f"Шаблон отчёта агента не найден: {template}. "
@@ -1366,8 +1446,12 @@ class DocumentBuilder:
         хронологически последнего платежа по сделке.
         """
         variant = template_variant()
-        template = (self._subagent_template("receipt") if salon.is_subagent(data)
-                    else self.templates_dir / docx_template_name("raspiska_template", variant))
+        if kg_deal.is_kg(data):
+            self._require_kg_stage2(data, need_poa=True, settlement_date=receipt_date)
+            template = self._kg_template("receipt")
+        else:
+            template = (self._subagent_template("receipt") if salon.is_subagent(data)
+                        else self.templates_dir / docx_template_name("raspiska_template", variant))
         if not template.exists():
             raise FileNotFoundError(
                 f"Шаблон расписки не найден: {template}. "
@@ -2260,6 +2344,19 @@ class DocumentBuilder:
                     "{{ПОКУПАТЕЛЬ_ЛИЦО}}", "{{ДОГОВОР_КП_НОМЕР}}")):
             replacements.update(self._subagent_replacements(data))
 
+        # «Учёт КГ»: СРТС, госномер, доверенность и дата Спецификации.
+        # Всегда в карте замен — у прямой сделки этих плейсхолдеров в шаблонах нет.
+        _sd, _sm, _sy = self._date_parts(kg_deal.spec_date(data))
+        replacements.update({
+            # Как в документе, без _normalize: «серия KG № …» он испортил бы.
+            "{{СРТС}}":                   str(data.get("srts") or "").strip(),
+            "{{ГОСНОМЕР}}":               str(data.get("gos_number") or "").strip().upper(),
+            "{{ДОВЕРЕННОСТЬ_РЕКВИЗИТЫ}}": str(data.get("poa") or "").strip(),
+            "{{ДЕНЬ_СПЕЦ}}":  _sd,
+            "{{МЕСЯЦ_СПЕЦ}}": _sm,
+            "{{ГОД_СПЕЦ}}":   _sy,
+        })
+
         # Пробрасываемые снаружи плейсхолдеры (для актов и подобных документов
         # с расширенным набором). Перекрывают базовые при совпадении ключей.
         if extra_replacements:
@@ -2363,7 +2460,8 @@ class DocumentBuilder:
             PLACEHOLDER_LABELS.get(ph, ph.strip("{}"))
             for ph in present
             if ph in replacements
-            and ph not in ALLOW_EMPTY_PLACEHOLDERS
+            and (ph not in ALLOW_EMPTY_PLACEHOLDERS
+                 or (kg_deal.is_kg(data) and ph in KG_REQUIRED_PLACEHOLDERS))
             and not str(replacements[ph] or "").strip()
         )
 

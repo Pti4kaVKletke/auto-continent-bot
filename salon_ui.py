@@ -18,6 +18,7 @@ import logging
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
+import kg_deal
 import memory
 import salon
 
@@ -32,6 +33,16 @@ NEW_DEAL_DIRECT_TEXT = (
 )
 
 
+NEW_DEAL_KG_TEXT = (
+    "📄 *Новая сделка — Учёт КГ*\n"
+    "Авто выкупается на кыргызских номерах и учёте, продавец пока не известен.\n\n"
+    "Отправь паспорт РФ покупателя и напиши:\n"
+    "• марку и модель, цвет, год выпуска\n"
+    "• цену (руб.), комиссию %, курс\n\n"
+    "Продавца, VIN и СРТС внесём позже — кнопкой «🚗 Внести данные ТС» в карточке сделки."
+)
+
+
 def start_fresh_deal(chat_id: str) -> None:
     """Новая сделка начинается с чистого листа: история диалога и
     неотправленные сканы прошлой сделки забываются. Иначе LLM дополняет
@@ -39,6 +50,8 @@ def start_fresh_deal(chat_id: str) -> None:
     (26.09.2026: прислан только паспорт — в сводке оказалась чужая Toyota)."""
     memory.clear_history(chat_id)
     memory.clear_pending_scans(chat_id)
+    kg_deal.clear_new_pending(chat_id)
+    kg_deal.clear_vehicle_pending(chat_id)
 
 
 def _kb(rows):
@@ -55,10 +68,13 @@ def new_deal_choice_screen():
     text = ("📄 *Новая сделка*\n\n"
             "Какой тип сделки?\n"
             "• *Прямая* — договор с клиентом (физлицо или ИП) напрямую.\n"
-            "• *Через салон РФ* — салон нанимает нас субагентом и платит сам.")
+            "• *Через салон РФ* — салон нанимает нас субагентом и платит сам.\n"
+            "• *Учёт КГ* — авто выкупается на кыргызских номерах; оплата до того, "
+            "как известен продавец (договор + Спецификация).")
     return text, _kb([
         [InlineKeyboardButton("👤 Прямая", callback_data="nd:direct")],
         [InlineKeyboardButton("🏬 Через салон РФ (субагент)", callback_data="nd:sub")],
+        [InlineKeyboardButton("🇰🇬 Учёт КГ", callback_data="nd:kg")],
         [_menu_btn()],
     ])
 
@@ -175,6 +191,13 @@ async def handle_callback(update, context, data: str) -> bool:
         return True
     if data == "nd:sub":
         await show(pick_salon_screen())
+        return True
+    if data == "nd:kg":
+        salon.clear_pending(chat_id)
+        start_fresh_deal(chat_id)
+        kg_deal.set_new_pending(chat_id)
+        context.user_data["awaiting_new_deal_docs"] = 1
+        await show((NEW_DEAL_KG_TEXT, _kb([[_menu_btn()]])))
         return True
     if data.startswith("nd:s:"):
         inn = parts[2]

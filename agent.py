@@ -45,8 +45,9 @@ import money
 import company
 from drive_service import GoogleDriveService
 import salon
+import kg_deal
 from doc_builder import (DocumentBuilder, MissingDataError, AmountMismatchError,
-                         SubagentSetupError, contract_file_base,
+                         SubagentSetupError, KgStageError, contract_file_base,
                          order_amount, amount_to_words_plain, AMOUNT_TOLERANCE_RUB,
                          _to_float as _dkp_float)
 from gsheets_service import GoogleSheetsService
@@ -308,10 +309,17 @@ SCAN_TYPES = [
     # и ловится он отдельным правилом (SCAN_BUNDLE_RE), а не по ключевым
     # словам: один такой файл закрывает сразу все пять позиций.
     ("bundle",  "Комплект одним файлом",  "Скан_АД",           ()),
+    # «Учёт КГ»: подписанная Спецификация (Прил. № 2) — в комплекте только у
+    # этих сделок (REQUIRED_SCANS_KG).
+    ("spec",    "Спецификация (Учёт КГ)", "Подп_Спец",         ("спец",)),
     # Ниже — то, что не подписывается сторонами. В комплект не входит,
     # имена без «Подп_»: их бот и не ищет как подписанные.
     ("invoice", "Платёжка / п.п.",        "Платежка",          ()),
     ("id",      "Документы сторон",       "Документы_сторон",  ()),
+    # «Учёт КГ»: хранятся в папке сделки, имя — по последним 6 знакам VIN
+    # (как номер ДКП): СРТС_XXXXXX, Доверенность_XXXXXX.
+    ("srts",    "СРТС (Учёт КГ)",         "СРТС",              ()),
+    ("poa",     "Доверенность (Учёт КГ)", "Доверенность",      ()),
     ("other",   "Прочее",                 "Прочее",            ()),
 ]
 
@@ -319,6 +327,7 @@ SCAN_TYPES = [
 # Счёт сюда не входит: подписанного счёта не бывает, оплату подтверждает
 # платёжка. Порядок задаёт и порядок перечисления недостающих.
 REQUIRED_SCANS = ("ag", "dkp", "receipt", "act", "report")
+REQUIRED_SCANS_KG = ("ag", "spec", "dkp", "receipt", "act", "report")
 
 SCAN_LABELS   = {code: label for code, label, _, _ in SCAN_TYPES}
 SCAN_PREFIXES = {code: prefix for code, _, prefix, _ in SCAN_TYPES}
@@ -363,7 +372,7 @@ def scan_type_of(filename: str) -> str | None:
     return None
 
 
-def scan_status_text(filenames: list) -> str:
+def scan_status_text(filenames: list, kg: bool = False) -> str:
     """
     Строка статуса сканов для журнала и карточки сделки.
 
@@ -379,7 +388,8 @@ def scan_status_text(filenames: list) -> str:
     found = {scan_type_of(n) for n in filenames}
     found.discard(None)
 
-    total = len(REQUIRED_SCANS)
+    required = REQUIRED_SCANS_KG if kg else REQUIRED_SCANS
+    total = len(required)
 
     # Комплект одним PDF закрывает все позиции разом. Отмечаем это в тексте:
     # искать внутри одного файла — не то же самое, что видеть пять отдельных.
@@ -388,10 +398,10 @@ def scan_status_text(filenames: list) -> str:
         text = f"{total}/{total} ✓ одним файлом"
         return text + (f" (+{extra})" if extra else "")
 
-    have    = [c for c in REQUIRED_SCANS if c in found]
-    missing = [SCAN_LABELS[c] for c in REQUIRED_SCANS if c not in found]
+    have    = [c for c in required if c in found]
+    missing = [SCAN_LABELS[c].replace(" (Учёт КГ)", "") for c in required if c not in found]
     extra   = len(filenames) - len([n for n in filenames
-                                    if scan_type_of(n) in REQUIRED_SCANS])
+                                    if scan_type_of(n) in required])
 
     text = f"{len(have)}/{total}"
     text += " ✓" if not missing else " · нет: " + ", ".join(m.lower() for m in missing)
@@ -668,6 +678,8 @@ _COPY_NEVER = {
     "tpo_number", "car_body_number", "tpo_date",
     "car_price", "cash_amount", "exchange_rate", "car_price_words",
     "currency", "cash_amount_words", "cash_currency",
+    # «Учёт КГ»: данные ТС и даты этапа 2 — свои у каждой сделки
+    "srts", "gos_number", "poa", "Дата спецификации",
 }
 
 _COPY_MODES = {"buyer_only", "seller_only", "all_except_car_sum"}
@@ -816,12 +828,13 @@ class DocumentAgent:
             "- активна      — документы созданы, сделка в работе (ставится автоматически при create_contract)",
             "- ждём доплату — есть частичная оплата, ждём остаток (ставится автоматически при add_payment, если сумма ещё не набрана)",
             "- завершена    — деньги получены полностью, авто передано (ставится автоматически при add_payment, когда остаток = 0)",
+            "- Подбор       — только «Учёт КГ»: деньги получены полностью, ТС ещё не зарегистрировано на продавца (ставится автоматически при add_payment; после set_kg_vehicle — «завершена»)",
             "- отменена     — сделка не состоялась (ставится через cancel_deal)",
             "",
             "Правила работы со статусами:",
             '- При создании новой сделки (create_contract) — статус автоматически "активна"',
             '- При импорте старой сделки (import_deal) — статус "активна" если документы уже были, иначе "черновик"',
-            '- Статусы "ждём доплату" и "завершена" ставит система автоматически по балансу платежей. НЕ ставь их вручную через update_deal — используй add_payment / remove_payment.',
+            '- Статусы "ждём доплату", "Подбор" и "завершена" ставит система автоматически по балансу платежей. НЕ ставь их вручную через update_deal — используй add_payment / remove_payment.',
             '- Когда пользователь говорит "завершить сделку", "закрыть сделку" вручную (без учёта платежей) — вызови update_deal с updates={"Статус": "завершена"}',
             '- Когда пользователь говорит "отменить сделку" — вызови cancel_deal (это ставит статус "отменена")',
             '- Когда пользователь говорит "черновик", "добавь в черновики" — вызови update_deal со статусом "черновик"',
@@ -841,6 +854,40 @@ class DocumentAgent:
                 "create_contract обязательно спроси номер и дату договора салона с "
                 "клиентом и передай их в data.salon_contract («№ 45 от 12.09.2026»). "
                 "deal_type и salon бот проставит сам.\n"
+            )
+
+        # «Учёт КГ»: выбор типа новой сделки и этап 2 («🚗 Внести данные ТС»)
+        # тоже живут у бота (kg_deal), здесь — только напоминание LLM.
+        _chat_kg = getattr(self, "_current_chat_id", "")
+        if kg_deal.get_new_pending(_chat_kg):
+            base += (
+                "\n\n=== ТЕКУЩАЯ НОВАЯ СДЕЛКА: «УЧЁТ КГ» (этап 1 — оплата) ===\n"
+                "Авто будет выкупаться на кыргызских номерах и учёте; продавец по ДКП ещё "
+                "НЕ известен. Собери только: паспорт покупателя (как обычно), марку/модель, "
+                "цвет, год выпуска, цену (руб.), комиссию %, курс поручения и банковский профиль. "
+                "НЕ спрашивай и НЕ заполняй: продавца, VIN, ТПО, номер/дату ДКП, СРТС, госномер, "
+                "доверенность — они вносятся позже кнопкой «🚗 Внести данные ТС». Дату ДКП не "
+                "спрашивай. deal_type бот проставит сам. create_contract выдаст договор и счёт.\n"
+            )
+        _veh = kg_deal.get_vehicle_pending(_chat_kg)
+        if _veh:
+            _kinds = ", ".join(kg_deal.FILE_KIND_LABELS.get(f.get("kind"), "?")
+                               for f in _veh.get("files", [])) or "пока ничего"
+            base += (
+                f"\n\n=== ВНЕСЕНИЕ ДАННЫХ ТС: сделка {_veh.get('num')} («Учёт КГ», этап 2) ===\n"
+                "ТС зарегистрировано на продавца в КР. Из присланных документов извлеки:\n"
+                "• СРТС → car_vin, srts одной строкой «серия KG № 1234567 от ДД.ММ.ГГГГ» "
+                "(дата выдачи СРТС обязательна), gos_number (госномер), при наличии — марку/модель, "
+                "цвет, год (сверь с Поручением, о расхождении скажи пользователю);\n"
+                "• ID-карта продавца → seller_name, seller_initials («Фамилия И.О.»), "
+                "seller_birth_date, seller_address, seller_id_number, seller_id_issued_by, "
+                "seller_id_issued_date, seller_inn (ПИН/ИНН 14 цифр на ID-карте);\n"
+                "• доверенность (если прислана) → poa одной строкой «№ … от ДД.ММ.ГГГГ, "
+                "удостоверена нотариусом …, г. …».\n"
+                "Дату ДКП спроси текстом, если её не назвали (не раньше даты регистрации ТС в СРТС). "
+                "Когда есть СРТС, данные продавца и дата ДКП — вызови set_kg_vehicle. "
+                "Доверенность можно внести и позже (нужна для расписки, акта и отчёта).\n"
+                f"Уже получены файлы: {_kinds}.\n"
             )
 
         instructions = memory.get_instructions()
@@ -1027,13 +1074,14 @@ class DocumentAgent:
                 "description": (
                     "Сгенерировать конкретные документы для сделки из таблицы. "
                     "Используй после check_deal когда известно какие именно документы нужны. "
-                    "doc_type: all=полный пакет, ag=только АГ договор, dkp=только ДКП, invoice=только счёт."
+                    "doc_type: all=полный пакет, ag=только АГ договор, dkp=только ДКП, invoice=только счёт, "
+                    "spec=Спецификация, spec_dkp=Спецификация + ДКП (только «Учёт КГ», после внесения данных ТС)."
                 ),
                 "input_schema": {
                     "type": "object",
                     "properties": {
                         "contract_number": {"type": "string", "description": "Номер договора"},
-                        "doc_type":        {"type": "string", "description": "Тип документов: all / ag / dkp / invoice"},
+                        "doc_type":        {"type": "string", "description": "Тип документов: all / ag / dkp / invoice / spec / spec_dkp"},
                     },
                     "required": ["contract_number", "doc_type"],
                 },
@@ -1090,6 +1138,35 @@ class DocumentAgent:
                         "contract_number": {"type": "string", "description": "Номер договора"},
                     },
                     "required": ["contract_number"],
+                },
+            },
+            {
+                "name": "set_kg_vehicle",
+                "description": (
+                    "«Учёт КГ», этап 2 («🚗 Внести данные ТС»): записать в сделку данные ТС, "
+                    "зарегистрированного на продавца в КР, — продавца (из ID-карты), VIN, СРТС, "
+                    "госномер, реквизиты доверенности и дату ДКП. Вызывай, когда есть СРТС, "
+                    "данные продавца и дата ДКП (доверенность можно внести позже тем же "
+                    "инструментом). Бот сам проставит номер ДКП, дату Спецификации, статус и "
+                    "сохранит присланные СРТС/доверенность в папку сделки. Только для сделок «Учёт КГ»."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "contract_number": {"type": "string", "description": "Номер сделки"},
+                        "data": {
+                            "type": "object",
+                            "description": (
+                                "Ключи: seller_name, seller_initials, seller_birth_date, seller_address, "
+                                "seller_id_number, seller_id_issued_by, seller_id_issued_date, seller_inn, "
+                                "car_vin, srts («серия KG № 1234567 от ДД.ММ.ГГГГ»), gos_number, "
+                                "poa («№ … от ДД.ММ.ГГГГ, удостоверена нотариусом …, г. …»), "
+                                "dkp_date (ДД.ММ.ГГГГ), spec_date (необязательно, по умолчанию = dkp_date). "
+                                "Передавай только то, что извлечено из документов или сказано пользователем."
+                            ),
+                        },
+                    },
+                    "required": ["contract_number", "data"],
                 },
             },
             {
@@ -1618,11 +1695,44 @@ class DocumentAgent:
                     if not str(data.get(_k) or "").strip() and str(_old.get(_k) or "").strip():
                         data[_k] = _old[_k]
             else:
+                _old = {}
                 _pending = salon.get_pending(_chat)
                 if _pending:
                     data["deal_type"] = salon.DEAL_TYPE_SUBAGENT
                     data["salon"] = salon.journal_value(_pending)
-            data["deal_type"] = salon.normalize_deal_type(data.get("deal_type"))
+                elif kg_deal.get_new_pending(_chat):
+                    data["deal_type"] = kg_deal.DEAL_TYPE_KG
+            # «Учёт КГ» (07.10.2026) — третий тип, только прямая сделка.
+            # Этап 1: продавца, VIN, ТПО и ДКП ещё нет — даже если LLM их
+            # «нашла», в договор и журнал они не идут (правила, раздел 3).
+            _is_kg = kg_deal.is_kg(data)
+            if _is_kg:
+                data["deal_type"] = kg_deal.DEAL_TYPE_KG
+                data.pop("salon", None); data.pop("salon_contract", None)
+                if not kg_deal.stage2_done(_old):
+                    for _k in ("seller_name", "seller_inn", "seller_id_number", "seller_birth_date",
+                               "seller_address", "seller_initials", "seller_id_issued_by",
+                               "seller_id_issued_date", "car_vin", "car_body_number",
+                               "tpo_number", "tpo_date", "dkp_date", "srts", "gos_number", "poa"):
+                        data.pop(_k, None)
+                    tool_input.pop("dkp_date", None)
+                else:
+                    # Перегенерация после этапа 2: данные ТС — из журнала.
+                    for _k in ("seller_name", "seller_inn", "seller_id_number", "seller_birth_date",
+                               "seller_address", "seller_initials", "seller_id_issued_by",
+                               "seller_id_issued_date", "car_vin", "srts", "gos_number", "poa",
+                               "Дата ДКП", "Дата спецификации", "Дата договора",
+                               "Дата поступления"):
+                        if not str(data.get(_k) or "").strip() and str(_old.get(_k) or "").strip():
+                            data[_k] = _old[_k]
+                _miss = kg_deal.stage1_missing(data)
+                if _miss:
+                    return {"error": (
+                        "Сделка «Учёт КГ» не создана: не хватает " + ", ".join(_miss)
+                        + ". Спроси у пользователя и вызови create_contract снова."
+                    )}
+            else:
+                data["deal_type"] = salon.normalize_deal_type(data.get("deal_type"))
             if salon.is_subagent(data):
                 _card = salon.card_for_deal(data)
                 if not _card:
@@ -1706,8 +1816,12 @@ class DocumentAgent:
                 logger.info("Строю АГ договор...")
                 built["ag"] = await self.builder.build_contract(tool_input["data"], number, date, commission_pct)
 
-                logger.info("Строю ДКП...")
-                built["dkp"] = await self.builder.build_dkp(tool_input["data"], number, date)
+                if _is_kg and not kg_deal.stage2_done(tool_input["data"]):
+                    # «Учёт КГ», этап 1: ДКП заключается после идентификации ТС.
+                    built["dkp"] = None
+                else:
+                    logger.info("Строю ДКП...")
+                    built["dkp"] = await self.builder.build_dkp(tool_input["data"], number, date)
 
                 logger.info("Строю счёт...")
                 inv_cell, inv_spec = self._jitter_read(tool_input["data"], f"Счёт_{number}")
@@ -1724,7 +1838,7 @@ class DocumentAgent:
             except AmountMismatchError as e:
                 logger.error(f"Сделка {number}: документы не выданы — {e}")
                 return {"message": _amount_mismatch_text(number, e)}
-            except SubagentSetupError as e:
+            except (SubagentSetupError, KgStageError) as e:
                 logger.error(f"Сделка {number}: документы не выданы — {e}")
                 return {"message": f"⚠️ Сделка {number}: {e}"}
             except Exception as e:
@@ -1755,6 +1869,8 @@ class DocumentAgent:
                 (dkp_path,     dkp_docx),
                 (invoice_path, inv_xlsx),
             ):
+                if not fpath:
+                    continue
                 try:
                     await self.drive.upload_file(fpath, fname, deal_folder_id)
                 except Exception as e:
@@ -1768,7 +1884,7 @@ class DocumentAgent:
             if not skip_pdf:
                 logger.info("Конвертирую в PDF...")
                 ag_pdf_path  = await self.builder.convert_to_pdf(ag_path)
-                dkp_pdf_path = await self.builder.convert_to_pdf(dkp_path)
+                dkp_pdf_path = await self.builder.convert_to_pdf(dkp_path) if dkp_path else None
                 inv_pdf_path = await self.builder.convert_to_pdf(invoice_path)
 
                 if ag_pdf_path:
@@ -1820,7 +1936,7 @@ class DocumentAgent:
             if ag_pdf_path and Path(ag_pdf_path).exists():
                 extra_files.append(ag_pdf_path);  extra_names.append(ag_pdf);  extra_links.append(ag_link)
 
-            if Path(dkp_path).exists():
+            if dkp_path and Path(dkp_path).exists():
                 extra_files.append(dkp_path);     extra_names.append(dkp_docx); extra_links.append("")
             if dkp_pdf_path and Path(dkp_pdf_path).exists():
                 extra_files.append(dkp_pdf_path); extra_names.append(dkp_pdf);  extra_links.append(dkp_pdf_link)
@@ -1839,6 +1955,11 @@ class DocumentAgent:
                             f"договор с клиентом {tool_input['data'].get('salon_contract')}")
                 if not is_regen:
                     salon.clear_pending(getattr(self, "_current_chat_id", ""))
+            if _is_kg:
+                sub_note = (" · «Учёт КГ»: договор и счёт. После полной оплаты статус «Подбор»; "
+                            "когда ТС будет на продавце — «🚗 Внести данные ТС» в карточке сделки")
+                if not is_regen:
+                    kg_deal.clear_new_pending(getattr(self, "_current_chat_id", ""))
 
             return {
                 "file":        ag_path,
@@ -1880,6 +2001,7 @@ class DocumentAgent:
                     "seller_name","seller_initials","seller_birth_date","seller_address",
                     "seller_id_number","seller_id_issued_by","seller_id_issued_date","seller_inn",
                     "car_model","car_vin","car_year","car_color","tpo_number","tpo_date",
+                    "srts","gos_number","poa",
                     "car_price","car_price_words","currency","cash_amount","cash_amount_words",
                     "cash_currency","exchange_rate","account_currency","account_number",
                     "account_type","bank_name","bank_bic","bank_corr_acc","bank_swift",
@@ -1889,6 +2011,9 @@ class DocumentAgent:
                 # Дата ДКП не входит в REQUIRED_KEYS (это системная колонка,
                 # а не поле анкеты), но нужна шаблонам ДКП/акта/отчёта.
                 data["Дата ДКП"] = deal.get("Дата ДКП", "")
+                # «Учёт КГ»: даты для проверки порядка дат этапа 2.
+                for _k in ("Дата спецификации", "Дата договора", "Дата поступления", "Дата расчёта"):
+                    data[_k] = deal.get(_k, "")
                 contract_date  = deal.get("Дата договора", datetime.now().strftime("%d.%m.%Y"))
                 # _num умеет читать значения с запятой (русская локаль Sheets: "1,0" → 1.0)
                 commission_pct = _num(deal.get("Комиссия %", "1")) or 1.0
@@ -1984,11 +2109,52 @@ class DocumentAgent:
                             first_link = plink
                         extra_files.append(pdf); extra_names.append(pname); extra_links.append(plink)
 
+            async def _build_and_upload_spec():
+                nonlocal first_file, first_name, first_link
+                path = await self.builder.build_spec(data, contract_number, contract_date)
+                fname = f"Спецификация_{contract_number}.docx"
+                link = await self.drive.upload_file(path, fname, deal_folder_id)
+                if first_file is None:
+                    first_file = path; first_name = fname
+                    if not first_link:
+                        first_link = link
+                else:
+                    extra_files.append(path); extra_names.append(fname); extra_links.append(link)
+                if not skip_pdf:
+                    pdf = await self.builder.convert_to_pdf(path)
+                    if pdf:
+                        pname = f"Спецификация_{contract_number}.pdf"
+                        plink = await self.drive.upload_file(pdf, pname, deal_folder_id)
+                        if not first_link:
+                            first_link = plink
+                        extra_files.append(pdf); extra_names.append(pname); extra_links.append(plink)
+
+            _kg = kg_deal.is_kg(data)
+            _kg_stage2 = _kg and kg_deal.stage2_done(data)
             try:
-                if doc_type == "all":
+                if _kg and doc_type in ("dkp", "spec", "spec_dkp"):
+                    # Этап 2 «Учёт КГ»: без внесённых данных ТС не собираем.
+                    _block = kg_deal.stage2_block(data)
+                    if _block:
+                        return {"message": f"⚠️ Сделка {contract_number}: {_block}",
+                                "buttons": [{"text": "◀️ К сделке",
+                                             "callback_data": f"dealaction:{contract_number}:menu"}]}
+                if doc_type == "all" and _kg:
+                    # «Учёт КГ»: договор и счёт; Спецификация и ДКП — когда
+                    # данные ТС уже внесены.
+                    await _build_and_upload_ag()
+                    await _build_and_upload_invoice()
+                    if _kg_stage2:
+                        await _build_and_upload_spec()
+                        await _build_and_upload_dkp()
+                elif doc_type == "all":
                     await _build_and_upload_ag()
                     await _build_and_upload_dkp()
                     await _build_and_upload_invoice()
+                elif doc_type in ("spec", "spec_dkp"):
+                    await _build_and_upload_spec()
+                    if doc_type == "spec_dkp":
+                        await _build_and_upload_dkp()
                 elif doc_type == "ag":
                     await _build_and_upload_ag()
                 elif doc_type == "dkp":
@@ -2001,7 +2167,7 @@ class DocumentAgent:
             except AmountMismatchError as e:
                 logger.error(f"Сделка {contract_number}: документы не выданы — {e}")
                 return {"message": _amount_mismatch_text(contract_number, e)}
-            except SubagentSetupError as e:
+            except (SubagentSetupError, KgStageError) as e:
                 logger.error(f"Сделка {contract_number}: документы не выданы — {e}")
                 return {"message": f"⚠️ Сделка {contract_number}: {e}"}
             except Exception as e:
@@ -2016,7 +2182,13 @@ class DocumentAgent:
                 "ag":      _ag_word,
                 "dkp":     "ДКП",
                 "invoice": "счёт",
+                "spec":     "Спецификация",
+                "spec_dkp": "Спецификация и ДКП",
             }.get(doc_type, "документы")
+            if doc_type == "all" and _kg:
+                doc_names = (f"{_ag_word}, счёт, Спецификация и ДКП" if _kg_stage2
+                             else f"{_ag_word} и счёт")
+            _warn = kg_deal.overdue_warning(data) if _kg_stage2 and doc_type != "ag" else ""
             return {
                 "file":        first_file,
                 "filename":    first_name,
@@ -2027,13 +2199,21 @@ class DocumentAgent:
                 # Перечисляем именно ДОКУМЕНТЫ, а не файлы: у каждого документа
                 # ещё и PDF, и «6 файлов» читается как «6 документов».
                 "message":     (f"📄 Сделка {contract_number}: сформированы "
-                                f"{doc_names} — {total} файлов{pdf_note}"),
+                                f"{doc_names} — {total} файлов{pdf_note}"
+                                + (f"\n{_warn}" if _warn else "")),
                 # Возврат в меню сделки: после выдачи пакета иначе некуда нажать,
                 # приходится заново искать сделку по номеру.
                 "buttons": [
                     {"text": "◀️ К сделке", "callback_data": f"dealaction:{contract_number}:menu"},
                 ],
             }
+
+        elif tool_name == "set_kg_vehicle":
+            return await self.set_kg_vehicle_impl(
+                tool_input.get("contract_number", ""),
+                tool_input.get("data") or {},
+                chat_id=getattr(self, "_current_chat_id", ""),
+            )
 
         elif tool_name == "check_deal":
             contract_number = tool_input.get("contract_number", "")
@@ -2078,6 +2258,15 @@ class DocumentAgent:
                 ("account_number",       "Номер счёта"),
                 ("bank_name",            "Банк"),
             ]
+
+            # «Учёт КГ»: на этапе 1 продавца, VIN и ТПО нет, ТПО не будет вовсе.
+            # Данные этапа 2 проверяются отдельно (kg_deal.stage2_block).
+            _kg = kg_deal.is_kg(deal)
+            if _kg:
+                _skip = {"seller_name", "seller_initials", "seller_birth_date", "seller_address",
+                         "seller_id_number", "seller_id_issued_by", "seller_id_issued_date",
+                         "car_vin", "tpo_number", "tpo_date"}
+                REQUIRED = [(k, lbl) for k, lbl in REQUIRED if k not in _skip]
 
             # Полнота реквизитов проверяется по нормализованной модели: набор
             # обязательных полей зависит от типа счёта, а тип берётся из
@@ -2143,6 +2332,7 @@ class DocumentAgent:
                 "seller_name","seller_initials","seller_birth_date","seller_address",
                 "seller_id_number","seller_id_issued_by","seller_id_issued_date","seller_inn",
                 "car_model","car_vin","car_year","car_color","tpo_number","tpo_date",
+                "srts","gos_number","poa",
                 "car_price","car_price_words","currency","cash_amount","cash_amount_words",
                 "cash_currency","exchange_rate","account_currency","account_number",
                 "account_type","bank_name","bank_bic","bank_corr_acc","bank_swift",
@@ -2154,6 +2344,8 @@ class DocumentAgent:
             # generate_docs берёт data именно отсюда (из _pending_check), не
             # перечитывая журнал. Без этой строки в ДКП уходит дата договора.
             data["Дата ДКП"] = deal.get("Дата ДКП", "")
+            for _k in ("Дата спецификации", "Дата договора", "Дата поступления", "Дата расчёта"):
+                data[_k] = deal.get(_k, "")
 
             status = (deal.get("Статус") or "—").strip()
             lines = [
@@ -2169,9 +2361,32 @@ class DocumentAgent:
                 ]
             else:
                 lines.append(f"👤 Покупатель: {deal.get('buyer_name', '—')}")
+            _kg_stage2 = _kg and kg_deal.stage2_done(deal)
+            if _kg and not _kg_stage2:
+                lines += [
+                    "🇰🇬 «Учёт КГ» · данные ТС ещё не внесены",
+                    f"🚗 {kg_deal.car_line(deal) or '—'}",
+                ]
+            elif _kg:
+                lines += [
+                    "🇰🇬 «Учёт КГ»",
+                    f"👤 Продавец: {deal.get('seller_name', '—')}",
+                    f"🚗 {deal.get('car_model', '—')} · VIN `{deal.get('car_vin', '—')}`",
+                    f"📘 СРТС: {deal.get('srts') or '—'} · госномер {deal.get('gos_number') or '—'}",
+                    f"📜 Доверенность: {deal.get('poa') or '— (нужна для расписки, акта и отчёта)'}",
+                    f"📅 ДКП и Спецификация от {deal.get('Дата ДКП') or '—'}",
+                ]
+                for _p in kg_deal.date_order_problems(deal):
+                    lines.append(f"⚠️ {_p}")
+                _w = kg_deal.overdue_warning(deal)
+                if _w:
+                    lines.append(_w)
+            if not _kg:
+                lines += [
+                    f"👤 Продавец: {deal.get('seller_name', '—')}",
+                    f"🚗 {deal.get('car_model', '—')} · VIN `{deal.get('car_vin', '—')}`",
+                ]
             lines += [
-                f"👤 Продавец: {deal.get('seller_name', '—')}",
-                f"🚗 {deal.get('car_model', '—')} · VIN `{deal.get('car_vin', '—')}`",
                 f"💰 Цена авто: {_money_str(deal.get('car_price')) or '—'} · "
                 f"комиссия {str(commission_pct).replace('.', ',')}%",
             ]
@@ -2185,7 +2400,7 @@ class DocumentAgent:
                 ("дата расчёта", "Дата расчёта"),
                 ("фактический курс", "Фактический курс"),
             ) if not str(deal.get(key) or "").strip()]
-            if missing:
+            if missing and not (_kg and not _kg_stage2):
                 lines += ["", f"⚠️ Для расписки, акта и отчёта не хватает: {', '.join(missing)}. "
                               "Спрошу при формировании."]
 
@@ -2202,6 +2417,33 @@ class DocumentAgent:
                 "commission_pct": commission_pct,
                 "data": data,
             }
+            if _kg:
+                # «Учёт КГ»: этап 1 — договор и счёт; Спецификация, ДКП и
+                # закрывающие — после «🚗 Внести данные ТС».
+                buttons = [
+                    {"text": "📄 Пакет (АГ + Счёт" + (" + Спец. + ДКП)" if _kg_stage2 else ")"),
+                     "callback_data": f"docmenu:{contract_number}:all"},
+                    {"text": "📋 АГ договор",     "callback_data": f"docmenu:{contract_number}:ag"},
+                    {"text": "💰 Счёт на оплату", "callback_data": f"docmenu:{contract_number}:invoice"},
+                ]
+                if _kg_stage2:
+                    buttons[1:1] = [
+                        {"text": "📄 Спецификация + ДКП",
+                         "callback_data": f"docmenu:{contract_number}:spec_dkp"},
+                        {"text": "🧷 Закрывающие (Расписка + Акт + Отчёт)",
+                         "callback_data": f"docmenu:{contract_number}:closing"},
+                        {"text": "📦 Всё (+ Расписка, Акт, Отчёт)",
+                         "callback_data": f"docmenu:{contract_number}:full"},
+                    ]
+                    buttons += [
+                        {"text": "🧾 Расписка о получении денег", "callback_data": f"dealaction:{contract_number}:build_receipt"},
+                        {"text": "📄 Акт выполненных услуг",     "callback_data": f"dealaction:{contract_number}:build_act"},
+                        {"text": "📊 Отчёт агента",              "callback_data": f"dealaction:{contract_number}:build_report"},
+                    ]
+                else:
+                    buttons.append({"text": "🚗 Внести данные ТС",
+                                    "callback_data": f"dealaction:{contract_number}:kg_vehicle"})
+                return {"message": text, "buttons": buttons}
             buttons = [
                 {"text": "📄 Полный пакет (АГ + ДКП + Счёт)", "callback_data": f"docmenu:{contract_number}:all"},
                 # Закрывающие — для сделки, по которой базовый пакет уже выдан,
@@ -2266,7 +2508,13 @@ class DocumentAgent:
                     f"  Год: {_val(r, 'car_year')}",
                     f"  Цвет: {_val(r, 'car_color')}",
                     f"  ТПО №: {_val(r, 'tpo_number')} от {_val(r, 'tpo_date')}",
-                ]
+                ] + ([
+                    "  Тип: «Учёт КГ»",
+                    f"  СРТС: {_val(r, 'srts')}",
+                    f"  Госномер: {_val(r, 'gos_number')}",
+                    f"  Доверенность: {_val(r, 'poa')}",
+                    f"  Дата ДКП / Спецификации: {_val(r, 'Дата ДКП')}",
+                ] if kg_deal.is_kg(r) else [])
 
             def _section_finances(r):
                 return [
@@ -2578,7 +2826,7 @@ class DocumentAgent:
             # «Отменена» и «черновик» не трогаем.
             current_status = (deal.get("Статус") or "").strip().lower()
             status_msg = None
-            if current_status == "завершена" and remainder > 0.01:
+            if current_status in ("завершена", kg_deal.STATUS_PODBOR.lower()) and remainder > 0.01:
                 if payments:
                     updates["Статус"] = "ждём доплату"
                     status_msg = "Статус возвращён на «ждём доплату»"
@@ -2809,11 +3057,18 @@ class DocumentAgent:
         # Автосмена статуса. Отменённые и черновики автомат не трогает.
         current_status = (deal.get("Статус") or "").strip().lower()
         status_msg = None
+        # «Учёт КГ»: полная оплата до внесения данных ТС — «Подбор»
+        # (деньги у Агента, ТС ещё не зарегистрировано на продавца).
+        _podbor = kg_deal.is_kg(deal) and not kg_deal.stage2_done(deal)
+        _full_status = kg_deal.STATUS_PODBOR if _podbor else "завершена"
         if current_status in ("отменена", "черновик"):
             pass
-        elif remainder <= 0.01 and current_status != "завершена":
-            updates["Статус"] = "завершена"
-            status_msg = "🎉 Сделка полностью оплачена — статус сменён на «завершена»"
+        elif remainder <= 0.01 and current_status != _full_status.lower():
+            updates["Статус"] = _full_status
+            status_msg = ("🎉 Сделка полностью оплачена — статус «Подбор». Когда ТС будет "
+                          "зарегистрировано на продавца — «🚗 Внести данные ТС» в карточке сделки."
+                          if _podbor else
+                          "🎉 Сделка полностью оплачена — статус сменён на «завершена»")
         elif remainder > 0.01 and payments and current_status != "ждём доплату":
             updates["Статус"] = "ждём доплату"
             status_msg = "⏳ Статус изменён на «ждём доплату»"
@@ -2839,7 +3094,12 @@ class DocumentAgent:
         # Кнопки — при полном закрытии сделки предлагаем сразу сформировать акт.
         # Отменённые/черновики не трогаем.
         buttons = []
-        if remainder <= 0.01 and current_status not in ("отменена", "черновик"):
+        if remainder <= 0.01 and _podbor and current_status not in ("отменена", "черновик"):
+            buttons.append({
+                "text":          "🚗 Внести данные ТС",
+                "callback_data": f"dealaction:{contract_number}:kg_vehicle",
+            })
+        elif remainder <= 0.01 and current_status not in ("отменена", "черновик"):
             # Порядок как в сделке: расписка (деньги выданы) → акт → отчёт
             buttons.append({
                 "text":          "🧾 Сформировать расписку",
@@ -3102,6 +3362,123 @@ class DocumentAgent:
             "skipped": skipped,
         }
 
+    # ══ «УЧЁТ КГ»: ЭТАП 2 — ДАННЫЕ ТС ══════════════════════════════════════
+
+    _KG_VEHICLE_KEYS = (
+        "seller_name", "seller_initials", "seller_birth_date", "seller_address",
+        "seller_id_number", "seller_id_issued_by", "seller_id_issued_date", "seller_inn",
+        "car_vin", "srts", "gos_number", "poa",
+    )
+
+    async def set_kg_vehicle_impl(self, contract_number: str, data: dict, chat_id: str = "") -> dict:
+        """Этап 2 сделки «Учёт КГ»: данные ТС, зарегистрированного на продавца.
+
+        Пишет продавца, VIN, СРТС, госномер, доверенность, дату ДКП и дату
+        Спецификации (= ДКП) в журнал, сохраняет присланные кнопкой файлы
+        (СРТС_XXXXXX, Доверенность_XXXXXX — по 6 знакам VIN) в «Сканы» и
+        переводит сделку из «Подбора» в «завершена». Проверки — kg_deal.
+        """
+        contract_number = (contract_number or "").strip()
+        deal = await self.sheets.get_deal(contract_number) if contract_number else None
+        if not deal:
+            return {"error": f"⚠️ Сделка {contract_number or '—'} не найдена."}
+        if not kg_deal.is_kg(deal):
+            return {"error": f"⚠️ Сделка {contract_number} — не «Учёт КГ», данные ТС вносятся при создании сделки."}
+
+        updates = {}
+        for k in self._KG_VEHICLE_KEYS:
+            v = str((data or {}).get(k) or "").strip()
+            if v and v != "None":
+                updates[k] = v
+        if "car_vin" in updates:
+            updates["car_vin"] = re.sub(r"[^A-Za-z0-9]", "", updates["car_vin"]).upper()
+        if "gos_number" in updates:
+            updates["gos_number"] = re.sub(r"\s+", "", updates["gos_number"]).upper()
+        if not updates.get("seller_birth_date") and not str(deal.get("seller_birth_date") or "").strip():
+            _bd = self._birth_date_from_inn(updates.get("seller_inn") or deal.get("seller_inn") or "")
+            if _bd:
+                updates["seller_birth_date"] = _bd
+
+        dkp = str((data or {}).get("dkp_date") or (data or {}).get("Дата ДКП") or "").strip()
+        dkp = dkp or str(deal.get("Дата ДКП") or "").strip()
+        if dkp:
+            updates["Дата ДКП"] = dkp
+        spec = str((data or {}).get("spec_date") or "").strip() or dkp
+        if spec:
+            updates["Дата спецификации"] = spec
+
+        merged = {**deal, **updates}
+        block = kg_deal.stage2_block(merged)
+        if block:
+            # Ничего не пишем: пусть LLM доспросит недостающее.
+            return {"error": block + "\nДоспроси у пользователя недостающее и вызови set_kg_vehicle снова."}
+
+        # Полностью оплаченная сделка выходит из «Подбора».
+        if str(deal.get("Статус") or "").strip().lower() == kg_deal.STATUS_PODBOR.lower():
+            updates["Статус"] = "завершена"
+
+        if not await self.sheets.update_deal(contract_number, updates):
+            return {"error": f"⚠️ Не удалось записать данные ТС в журнал по сделке {contract_number}."}
+
+        # Файлы, присланные после кнопки «🚗 Внести данные ТС», — на Drive.
+        saved = []
+        pending = kg_deal.get_vehicle_pending(chat_id) if chat_id else {}
+        if pending and pending.get("num") == contract_number and pending.get("files"):
+            try:
+                folder_id = await self.drive.get_or_create_deal_folder(contract_number)
+                scans_id = await self.drive._get_or_create_folder("Сканы", folder_id)
+                _, existing = await self.list_scan_files(contract_number)
+                taken = {f.get("name", "") for f in existing}
+                for f in pending["files"]:
+                    if not Path(f.get("path", "")).exists():
+                        continue
+                    ext = Path(f.get("name") or f["path"]).suffix or ".pdf"
+                    name = kg_deal.drive_name(f.get("kind"), contract_number,
+                                              merged.get("car_vin", ""), ext)
+                    base, n = name[:-len(ext)], 1
+                    while name in taken:
+                        n += 1
+                        name = f"{base}_{n}{ext}"
+                    await self.drive.upload_file(f["path"], name, scans_id)
+                    taken.add(name)
+                    saved.append(name)
+            except Exception as e:
+                logger.error(f"Сделка {contract_number}: файлы этапа 2 не загружены — {e}", exc_info=True)
+        if chat_id:
+            kg_deal.clear_vehicle_pending(chat_id)
+            memory.clear_pending_scans(chat_id)
+        if saved:
+            try:
+                await self.refresh_scan_status(contract_number)
+            except Exception as e:
+                logger.warning(f"Сделка {contract_number}: статус сканов не обновлён — {e}")
+
+        lines = [
+            f"✅ Данные ТС по сделке {contract_number} внесены",
+            f"👤 Продавец: {merged.get('seller_name', '—')}",
+            f"🚗 VIN {merged.get('car_vin', '—')} · госномер {merged.get('gos_number', '—')}",
+            f"📘 СРТС: {merged.get('srts', '—')}",
+            f"📅 ДКП № {kg_deal.vin6(merged.get('car_vin', ''))} и Спецификация от {dkp}",
+        ]
+        if str(merged.get("poa") or "").strip():
+            lines.append(f"📜 Доверенность: {merged['poa']}")
+        else:
+            lines.append("📜 Доверенность пока не внесена — она нужна для расписки, акта и отчёта.")
+        if updates.get("Статус"):
+            lines.append("Статус: «Подбор» → «завершена».")
+        if saved:
+            lines.append("🗂 В папку сделки: " + ", ".join(saved))
+        _w = kg_deal.overdue_warning(merged)
+        if _w:
+            lines.append(_w)
+        return {
+            "message": "\n".join(lines),
+            "buttons": [
+                {"text": "📄 Спецификация + ДКП", "callback_data": f"docmenu:{contract_number}:spec_dkp"},
+                {"text": "◀️ К сделке", "callback_data": f"dealaction:{contract_number}:menu"},
+            ],
+        }
+
     async def refresh_scan_status(self, contract_number: str) -> str:
         """
         Пересчитывает статус сканов по папке Drive и пишет его в журнал.
@@ -3116,7 +3493,11 @@ class DocumentAgent:
             logger.warning(f"Сделка {contract_number}: не удалось прочитать сканы — {e}")
             return ""
 
-        status = scan_status_text([f.get("name", "") for f in files])
+        try:
+            _kg = kg_deal.is_kg(await self.sheets.get_deal(contract_number) or {})
+        except Exception:
+            _kg = False
+        status = scan_status_text([f.get("name", "") for f in files], kg=_kg)
         await self.sheets.update_deal(contract_number, {"Сканы": status})
         return status
 
@@ -3150,7 +3531,7 @@ class DocumentAgent:
             folder = folder_of.get(num)
             if not folder or folder not in names_by_folder:
                 continue
-            status = scan_status_text(names_by_folder[folder])
+            status = scan_status_text(names_by_folder[folder], kg=kg_deal.is_kg(d))
             statuses[num] = status
             if status != str(d.get("Сканы") or "").strip():
                 changed[num] = status
@@ -3395,6 +3776,13 @@ class DocumentAgent:
                 "needs": "fact_rate",
             }
 
+        # «Учёт КГ»: закрывающие — только после внесения данных ТС, с
+        # доверенностью и в правильном порядке дат (раздел 6 правил).
+        if kg_deal.is_kg(deal):
+            _kg_block = kg_deal.stage2_block(deal, need_poa=True)
+            if _kg_block:
+                return {"error": f"⚠️ Сделка {contract_number}: {_kg_block}"}
+
         # Фиксируем фактически выданную сумму в журнале ДО сборки документа.
         deal = await self._ensure_paid_amount(contract_number, deal)
 
@@ -3524,6 +3912,13 @@ class DocumentAgent:
                 "error": _fact_rate_missing_text(contract_number),
                 "needs": "fact_rate",
             }
+
+        # «Учёт КГ»: закрывающие — только после внесения данных ТС, с
+        # доверенностью и в правильном порядке дат (раздел 6 правил).
+        if kg_deal.is_kg(deal):
+            _kg_block = kg_deal.stage2_block(deal, need_poa=True)
+            if _kg_block:
+                return {"error": f"⚠️ Сделка {contract_number}: {_kg_block}"}
 
         # Фиксируем фактически выданную сумму в журнале ДО сборки документа.
         deal = await self._ensure_paid_amount(contract_number, deal)
@@ -3655,6 +4050,13 @@ class DocumentAgent:
                 "error": _fact_rate_missing_text(contract_number),
                 "needs": "fact_rate",
             }
+
+        # «Учёт КГ»: закрывающие — только после внесения данных ТС, с
+        # доверенностью и в правильном порядке дат (раздел 6 правил).
+        if kg_deal.is_kg(deal):
+            _kg_block = kg_deal.stage2_block(deal, need_poa=True)
+            if _kg_block:
+                return {"error": f"⚠️ Сделка {contract_number}: {_kg_block}"}
 
         # Фиксируем фактически выданную сумму в журнале ДО сборки документа.
         deal = await self._ensure_paid_amount(contract_number, deal)
