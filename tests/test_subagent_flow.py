@@ -158,3 +158,29 @@ def test_new_deal_starts_with_clean_history():
     upd, ctx = _Upd(), _Ctx()
     asyncio.run(salon_ui.handle_callback(upd, ctx, "nd:direct"))
     assert memory.get_history(limit=10, chat_id="chat-ui") == []
+
+
+def test_service_company_record_never_reaches_prompt(ag):
+    """19.10.2026: запись `__pending_deal__` (сделка из июня — продавец Бакытбек,
+    Toyota RAV4) лежала в таблице компаний и попадала в системный промпт, из-за
+    чего LLM считала её «текущей сделкой». При старте она удаляется, в промпт
+    и в список компаний не попадает, сохранить такое имя нельзя."""
+    import json, memory
+    conn = memory.get_conn()
+    conn.execute("INSERT INTO companies (name, data) VALUES (?, ?)",
+                 ("__pending_deal__", json.dumps({"seller_name": "БАКЫТБЕК УУЛУ ЗАЛКАРБЕК"},
+                                                ensure_ascii=False)))
+    conn.commit(); conn.close()
+    assert memory.list_companies() == [] or all(
+        not c["name"].startswith("__") for c in memory.list_companies())
+    assert "БАКЫТБЕК" not in ag._build_system_prompt()
+    memory.init_db()
+    conn = memory.get_conn()
+    left = conn.execute("SELECT COUNT(*) FROM companies WHERE name='__pending_deal__'").fetchone()[0]
+    conn.close()
+    assert left == 0
+    with pytest.raises(ValueError):
+        memory.save_company("__pending_deal__", {"x": 1})
+    memory.save_company("ООО Тест", {"inn": "1"})
+    assert any(c["name"] == "ООО Тест" for c in memory.list_companies())
+    memory.delete_company("ООО Тест")

@@ -898,7 +898,9 @@ class DocumentAgent:
 
         companies = memory.list_companies()
         if companies:
-            base += "\n\nСОХРАНЁННЫЕ РЕКВИЗИТЫ КОМПАНИЙ:\n"
+            base += ("\n\nСОХРАНЁННЫЕ РЕКВИЗИТЫ КОМПАНИЙ (справочник; это НЕ данные текущей "
+                     "сделки — не подставляй их в новую сделку и не говори, что сделка "
+                     "«уже собирается», если пользователь сам не назвал эту компанию):\n")
             for c in companies:
                 data = memory.get_company(c["name"])
                 base += f"\n{c['name']}:\n"
@@ -1302,7 +1304,12 @@ class DocumentAgent:
             },
             {
                 "name": "save_company",
-                "description": "Сохранить реквизиты компании или клиента в память",
+                "description": (
+                    "Сохранить реквизиты компании в постоянную память — только когда "
+                    "пользователь прямо просит запомнить компанию. НЕ использовать для "
+                    "данных сделки (покупатель, продавец, авто, суммы): сделка собирается "
+                    "в диалоге и создаётся через create_contract."
+                ),
                 "input_schema": {
                     "type": "object",
                     "properties": {
@@ -2682,6 +2689,9 @@ class DocumentAgent:
                 return {"message": f"❌ Сделка {contract_number} не найдена в журнале."}
 
         elif tool_name == "save_company":
+            if memory.is_service_company_name(tool_input.get("name", "")):
+                return {"error": "Служебное имя («__…») — не сохраняю. Данные сделки "
+                                 "в память компаний не пишутся."}
             memory.save_company(tool_input["name"], tool_input["data"])
             return {"message": f"Реквизиты «{tool_input['name']}» сохранены"}
 

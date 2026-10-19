@@ -70,7 +70,23 @@ def init_db():
     """)
     conn.commit()
     _migrate_history_chat_id(conn)
+    _purge_service_companies(conn)
     conn.close()
+
+
+def is_service_company_name(name: str) -> bool:
+    """Служебные записи в таблице компаний (имя «__…»), например
+    `__pending_deal__` — недособранная сделка, оставшаяся от старой версии
+    бота (18.06.2026). Это не реквизиты компании: в системном промпте такая
+    запись выглядела как «текущая сделка», и LLM подмешивала её продавца
+    и машину в каждую новую сделку (найдено 19.10.2026)."""
+    return str(name or "").startswith("__")
+
+
+def _purge_service_companies(conn):
+    """Удаляет служебные записи «__…» из таблицы компаний. Идемпотентна."""
+    conn.execute("DELETE FROM companies WHERE substr(name, 1, 2) = '__'")
+    conn.commit()
 
 
 def _migrate_history_chat_id(conn):
@@ -110,6 +126,8 @@ def get_setting(key: str, default=None):
 # --- Компании/реквизиты ---
 
 def save_company(name: str, data: dict):
+    if is_service_company_name(name):
+        raise ValueError(f"Имя «{name}» служебное — так компанию сохранить нельзя")
     conn = get_conn()
     # Обновляем если уже есть с таким именем
     existing = conn.execute("SELECT id FROM companies WHERE name=?", (name,)).fetchone()
@@ -132,7 +150,8 @@ def list_companies() -> list:
     conn = get_conn()
     rows = conn.execute("SELECT name, created_at FROM companies ORDER BY name").fetchall()
     conn.close()
-    return [{"name": r["name"], "created_at": r["created_at"]} for r in rows]
+    return [{"name": r["name"], "created_at": r["created_at"]} for r in rows
+            if not is_service_company_name(r["name"])]
 
 
 def delete_company(name: str):
