@@ -891,8 +891,9 @@ class DocumentAgent:
                 f"Уже получены файлы: {_kinds}.\n"
             )
 
-        # «📝 Только ДКП»: режим тоже живёт у бота (dkp_only), здесь — правила для LLM.
-        base += dkp_only.prompt_section(_chat_kg)
+        # «📝 Только ДКП»: режим тоже живёт у бота (dkp_only), здесь — правила для LLM:
+        # шапка в самом начале промпта и подробный блок здесь.
+        base = dkp_only.prompt_head(_chat_kg) + base + dkp_only.prompt_section(_chat_kg)
 
         instructions = memory.get_instructions()
         if instructions:
@@ -1027,6 +1028,9 @@ class DocumentAgent:
         """
         if not result or result.get("buttons"):
             return result
+        # В режиме «Только ДКП» реквизиты не нужны — кнопки банков не подставляем.
+        if dkp_only.get_pending(getattr(self, "_current_chat_id", "")):
+            return result
         text = (result.get("text") or result.get("message") or "").lower()
         if not text:
             return result
@@ -1057,6 +1061,14 @@ class DocumentAgent:
         return result
 
     def _get_tools(self) -> list:
+        tools = self._all_tools()
+        # «📝 Только ДКП»: LLM видит только свой инструмент — без create_contract,
+        # request_bank_choice и прочего ей не о чем спрашивать «полный пакет или ДКП?».
+        if dkp_only.get_pending(getattr(self, "_current_chat_id", "")):
+            tools = [t for t in tools if t["name"] == dkp_only.TOOL_NAME]
+        return tools
+
+    def _all_tools(self) -> list:
         return [
             {
                 "name": "create_contract",

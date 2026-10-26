@@ -180,19 +180,19 @@ def main_menu_keyboard():
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("📄 Новая сделка",    callback_data="menu:new_deal"),
-            InlineKeyboardButton("🔍 Найти сделку",    callback_data="menu:find_deal"),
+            InlineKeyboardButton("📝 Только ДКП",      callback_data="menu:dkp_only"),
         ],
         [
             InlineKeyboardButton("📋 Сделки",          callback_data="menu:deals"),
+            InlineKeyboardButton("🔍 Найти сделку",    callback_data="menu:find_deal"),
+        ],
+        [
             InlineKeyboardButton("📊 Статистика",      callback_data="menu:stats"),
-        ],
-        [
             InlineKeyboardButton("🏦 Реквизиты",       callback_data="menu:bank_profiles"),
-            InlineKeyboardButton("🏢 Компания",        callback_data="menu:company"),
         ],
         [
+            InlineKeyboardButton("🏢 Компания",        callback_data="menu:company"),
             InlineKeyboardButton("🏬 Салоны",          callback_data="menu:salons"),
-            InlineKeyboardButton("📝 Только ДКП",      callback_data="menu:dkp_only"),
         ],
         [
             InlineKeyboardButton("🧠 Память",          callback_data="menu:memory"),

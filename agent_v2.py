@@ -24,6 +24,7 @@ from pathlib import Path
 import anthropic
 import httpx
 
+import dkp_only
 import memory
 from agent import DocumentAgent as _AgentV1
 
@@ -260,6 +261,14 @@ class DocumentAgent(_AgentV1):
             current_content = await self._build_file_message(filepath, filename, user_text)
         else:
             current_content = user_text
+
+        # «📝 Только ДКП»: напоминание прямо в сообщении пользователя (в историю не пишется).
+        _dkp_note = dkp_only.user_reminder(chat_id)
+        if _dkp_note:
+            if isinstance(current_content, list):
+                current_content = current_content + [{"type": "text", "text": _dkp_note}]
+            else:
+                current_content = f"{current_content}\n\n{_dkp_note}"
 
         # Если предыдущий тёрн упал между add_to_history("user") и
         # add_to_history("assistant"), последним в sanitized остался "user".

@@ -170,8 +170,21 @@ def test_create_contract_blocked_in_mode(ag):
 
 def test_tool_is_journal_readonly():
     assert dkp_only.TOOL_NAME in agent_mod.DocumentAgent.JOURNAL_READONLY_TOOLS
-    names = [t["name"] for t in agent_mod.DocumentAgent._get_tools(None)]
+    names = [t["name"] for t in agent_mod.DocumentAgent._all_tools(None)]
     assert dkp_only.TOOL_NAME in names
+
+
+def test_mode_restricts_tools_prompt_and_bank_buttons(ag):
+    names = [t["name"] for t in ag._get_tools()]
+    assert "create_contract" in names and dkp_only.TOOL_NAME in names
+    dkp_only.set_pending(CHAT, "tpo")
+    assert [t["name"] for t in ag._get_tools()] == [dkp_only.TOOL_NAME]
+    prompt = ag._build_system_prompt()
+    assert prompt.startswith("!!! СЕЙЧАС РЕЖИМ «ТОЛЬКО ДКП»")
+    assert "РЕЖИМ «ТОЛЬКО ДКП»" in prompt[-6000:]
+    assert "Не спрашивай тип сделки" in dkp_only.user_reminder(CHAT)
+    res = ag._maybe_inject_bank_choice({"text": "Какой профиль использовать?"})
+    assert not res.get("buttons")
 
 
 def test_menu_has_button():
