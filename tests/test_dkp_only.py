@@ -82,15 +82,16 @@ def test_prompt_section_only_in_mode():
 
 
 def test_file_name():
-    assert dkp_only.file_base({"seller_initials": "ПЕТРОВ П.П."}, "C66483") == "ДКП_C66483_Петров"
-    assert dkp_only.file_base({"seller_name": "Асанов Бакыт"}, "123456") == "ДКП_123456_Асанов"
+    assert dkp_only.file_base({"buyer_initials": "КОЧЕТОВ В.В.", "seller_initials": "Петров П.П."},
+                              "C66483") == "ДКП_C66483_Кочетов"
+    assert dkp_only.file_base({"buyer_name": "ИП Иванов Иван"}, "123456") == "ДКП_123456_Иванов"
 
 
 def test_tpo_dkp_without_journal(ag):
     dkp_only.set_pending(CHAT, "tpo")
     res = run(ag, "build_dkp_only", {"data": tpo_data(), "dkp_date": "12.10.2026"})
     assert "error" not in res, res
-    assert res["filename"] == "ДКП_C66483_Петров.docx"
+    assert res["filename"] == "ДКП_C66483_Иванов.docx"
     assert "не сохранялся" in res["caption"]
     txt = text_of(res["file"])
     assert "Договор купли-продажи автомобиля № C66483" in txt

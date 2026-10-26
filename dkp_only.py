@@ -266,16 +266,20 @@ def insert_poa(docx_path: str, poa: str) -> bool:
     return False
 
 
-def seller_surname(data: dict) -> str:
-    src = _v(data, "seller_initials") or _v(data, "seller_name")
-    word = src.split()[0] if src.split() else ""
+def buyer_surname(data: dict) -> str:
+    """Фамилия покупателя для имени файла (решение Ильи 26.10.2026 —
+    покупатель, не продавец). Префикс «ИП» у покупателя-ИП отбрасывается."""
+    src = _v(data, "buyer_initials") or _v(data, "buyer_name")
+    words = [w for w in src.split()
+             if w.upper().strip(".") not in ("ИП", "ИНДИВИДУАЛЬНЫЙ", "ПРЕДПРИНИМАТЕЛЬ")]
+    word = words[0] if words else ""
     word = re.sub(r"[^\w-]", "", word)
     return word[:1].upper() + word[1:].lower() if word else ""
 
 
 def file_base(data: dict, dkp_number: str) -> str:
     parts = ["ДКП", dkp_number or "б-н"]
-    surname = seller_surname(data)
+    surname = buyer_surname(data)
     if surname:
         parts.append(surname)
     return "_".join(parts)
