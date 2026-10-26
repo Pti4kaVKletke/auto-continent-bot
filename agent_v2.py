@@ -505,18 +505,21 @@ class DocumentAgent(_AgentV1):
                 "file":       tool_result["file"],
                 "filename":   tool_result["filename"],
                 "drive_link": tool_result.get("drive_link", ""),
+                "caption":    tool_result.get("caption", ""),
             })
-        for f_path, f_name, f_link in zip(
+        n_extra = len(tool_result.get("extra_files", []))
+        for f_path, f_name, f_link, f_cap in zip(
             tool_result.get("extra_files", []),
             tool_result.get("extra_names", []),
-            tool_result.get("extra_links",
-                            [""] * len(tool_result.get("extra_files", []))),
+            tool_result.get("extra_links", [""] * n_extra),
+            tool_result.get("extra_captions", [""] * n_extra),
         ):
             if Path(f_path).exists():
-                            result["files"].append({
+                result["files"].append({
                     "file":       f_path,
                     "filename":   f_name,
                     "drive_link": f_link,
+                    "caption":    f_cap,
                 })
 
     @staticmethod

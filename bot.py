@@ -32,6 +32,7 @@ import memory
 import bank_requisites as br
 import bank_ui
 import company_ui
+import dkp_only
 import kg_deal
 import salon
 import salon_ui
@@ -381,6 +382,7 @@ async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     salon.clear_pending(chat_id)
     kg_deal.clear_new_pending(chat_id)
     kg_deal.clear_vehicle_pending(chat_id)
+    dkp_only.clear_pending(chat_id)
     context.user_data.clear()
     await update.message.reply_text(
         "✅ История диалога очищена\n"

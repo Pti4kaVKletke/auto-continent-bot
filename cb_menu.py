@@ -11,8 +11,10 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 import memory
 import bank_ui
 import company_ui
+import salon
 import salon_ui
 import settings_service
+import dkp_only
 
 from bot_core import (
     backup,
@@ -35,6 +37,39 @@ async def on_menu(update, context, query, data):
             "Пришли договор или другой документ — PDF или Word.\n"
             "Найду, где стоит наша подпись, поставлю росчерк и печать "
             "и покажу, что получилось.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀️ Меню", callback_data="menu:back")]]),
+        )
+        return
+
+    # «📝 Только ДКП» — договор купли-продажи без сделки (см. dkp_only.py).
+    if action == "dkp_only":
+        await query.edit_message_text(
+            dkp_only.CHOICE_TEXT,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🛃 По ТПО", callback_data="menu:dkp_only:tpo")],
+                [InlineKeyboardButton("🇰🇬 Учёт КГ (СРТС, госномер)",
+                                      callback_data="menu:dkp_only:kg")],
+                [InlineKeyboardButton("◀️ Меню", callback_data="menu:back")],
+            ]),
+        )
+        return
+    if action.startswith("dkp_only:"):
+        variant = action.split(":", 1)[1]
+        if variant not in dkp_only.VARIANTS:
+            return
+        chat_id = str(update.effective_chat.id)
+        # С чистого листа, как новая сделка: иначе LLM подтянет продавца и
+        # машину из прошлой переписки.
+        salon.clear_pending(chat_id)
+        salon_ui.start_fresh_deal(chat_id)
+        dkp_only.set_pending(chat_id, variant)
+        # Файлы сразу читаются как документы (без вопроса «что с ним делать»).
+        context.user_data["awaiting_new_deal_docs"] = 1
+        await query.edit_message_text(
+            dkp_only.docs_text(variant),
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("◀️ Меню", callback_data="menu:back")]]),
@@ -193,6 +228,7 @@ async def on_menu(update, context, query, data):
 
     elif action == "back":
         context.user_data.pop("current_deal", None)
+        dkp_only.clear_pending(str(update.effective_chat.id))
         await query.edit_message_text(
             get_menu_text(),
             parse_mode="MarkdownV2",

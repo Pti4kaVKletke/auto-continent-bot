@@ -46,6 +46,7 @@ import company
 from drive_service import GoogleDriveService
 import salon
 import kg_deal
+import dkp_only
 from doc_builder import (DocumentBuilder, MissingDataError, AmountMismatchError,
                          SubagentSetupError, KgStageError, contract_file_base,
                          order_amount, amount_to_words_plain, AMOUNT_TOLERANCE_RUB,
@@ -890,6 +891,9 @@ class DocumentAgent:
                 f"Уже получены файлы: {_kinds}.\n"
             )
 
+        # «📝 Только ДКП»: режим тоже живёт у бота (dkp_only), здесь — правила для LLM.
+        base += dkp_only.prompt_section(_chat_kg)
+
         instructions = memory.get_instructions()
         if instructions:
             base += "\n\nТВОИ ПОСТОЯННЫЕ ИНСТРУКЦИИ (всегда выполняй):\n"
@@ -1069,6 +1073,30 @@ class DocumentAgent:
                         "existing_contract_number": {"type": "string", "description": "Номер существующей сделки для перегенерации документов. Если указан — новый номер не генерируется, папка на Drive ищется по этому номеру, строка в Sheets обновляется."},
                     },
                     "required": ["data", "commission_pct"],
+                },
+            },
+            {
+                "name": "build_dkp_only",
+                "description": (
+                    "ТОЛЬКО в режиме «Только ДКП» (кнопка в меню): собрать отдельный договор "
+                    "купли-продажи ТС без сделки — без журнала, Drive, агентского договора и "
+                    "счёта. Файлы DOCX и PDF уходят в чат. Номер ДКП — по VIN (бот считает сам). "
+                    "При исправлении данных вызывай снова с полным исправленным набором."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "data": {
+                            "type": "object",
+                            "description": "Данные продавца, покупателя и авто — ключи как для сделки "
+                                           "(seller_*, buyer_*, passport_*, car_*, tpo_number/tpo_date "
+                                           "или srts/gos_number, car_price, car_price_words, currency). "
+                                           "dkp_number — только если пользователь сам назвал номер ДКП.",
+                        },
+                        "dkp_date": {"type": "string", "description": "Дата ДКП ДД.ММ.ГГГГ; пусто — сегодня"},
+                        "variant":  {"type": "string", "description": "tpo — по ТПО, kg — «Учёт КГ» (СРТС, госномер)"},
+                    },
+                    "required": ["data"],
                 },
             },
             {
@@ -1621,9 +1649,25 @@ class DocumentAgent:
         "find_deal", "get_statistics", "copy_deal",
         "save_company", "save_instruction", "save_bank_profile", "delete_bank_profile",
         "request_bank_choice", "request_date_choice",
+        dkp_only.TOOL_NAME,   # журнал не трогает — работает и при блокировке
     }
 
     async def _execute_tool(self, tool_name: str, tool_input: dict) -> dict:
+
+        # «📝 Только ДКП» — до проверки журнала: журнал этот инструмент не трогает.
+        _chat = getattr(self, "_current_chat_id", "")
+        if tool_name == dkp_only.TOOL_NAME:
+            return await self.build_dkp_only_impl(
+                tool_input.get("data") or {},
+                tool_input.get("dkp_date") or "",
+                tool_input.get("variant") or "",
+                chat_id=_chat,
+            )
+        # В режиме «Только ДКП» сделку не создаём — иначе строка попадёт в журнал.
+        if tool_name == "create_contract" and dkp_only.get_pending(_chat):
+            return {"error": ("Включён режим «📝 Только ДКП» — сделка не создаётся. "
+                              "Собери ДКП через build_dkp_only. Если нужна полноценная "
+                              "сделка — пусть пользователь нажмёт «📄 Новая сделка».")}
 
         # Колонки журнала разошлись с кодом → не пишем и не выпускаем документы:
         # иначе комплект уйдёт клиенту, а строка в журнале запишется криво.
@@ -3379,6 +3423,84 @@ class DocumentAgent:
         "seller_id_number", "seller_id_issued_by", "seller_id_issued_date", "seller_inn",
         "car_vin", "srts", "gos_number", "poa",
     )
+
+    async def build_dkp_only_impl(self, data: dict, dkp_date: str = "", variant: str = "",
+                                  chat_id: str = "") -> dict:
+        """«📝 Только ДКП»: отдельный договор купли-продажи без сделки.
+
+        Журнал и Drive не трогаются (ни чтения, ни записи), агентский договор
+        и счёт не собираются. Шаблон — dkp_template.docx (по ТПО) или
+        dkp_template_KG.docx (СРТС + госномер); заполнение — тем же
+        _fill_template, что и в комплекте сделки, поэтому регистр, пропись и
+        покупатель-ИП выходят одинаково. Подписи — только сторон, без печати.
+        """
+        from doc_builder import dkp_number_from, MissingTemplateError
+
+        variant = (variant or "").strip().lower()
+        if variant not in dkp_only.VARIANTS:
+            variant = dkp_only.get_pending(chat_id) or dkp_only.VARIANT_TPO
+        dkp_date = (dkp_date or "").strip() or str((data or {}).get("dkp_date") or "").strip() \
+            or dkp_only.today()
+
+        miss = dkp_only.missing_fields(data, variant)
+        probs = dkp_only.problems(data, variant, dkp_date)
+        if miss or probs:
+            lines = ["ДКП не собран."]
+            if miss:
+                lines.append("Не хватает: " + ", ".join(miss) + ".")
+            lines += [f"• {p}" for p in probs]
+            lines.append("Спроси у пользователя недостающее одним сообщением и вызови снова.")
+            return {"error": "\n".join(lines)}
+
+        d = dkp_only.prepare_data(data, variant, dkp_date)
+        number = dkp_number_from(d, "")
+        base = dkp_only.file_base(d, number)
+        try:
+            if variant == dkp_only.VARIANT_KG:
+                template = self.builder._kg_template("dkp")
+            else:
+                template = self.builder.templates_dir / "dkp_template.docx"
+                if not template.exists():
+                    raise MissingTemplateError(f"Не найден {template.name}. ДКП не собран.")
+            path = await self.builder._fill_template(template, d, number, dkp_date, base)
+            if variant == dkp_only.VARIANT_KG and not dkp_only.insert_poa(path, d.get(kg_deal.COL_POA)):
+                return {"error": ("ДКП не собран: в шаблоне dkp_template_KG.docx не найден п. 8 "
+                                  f"со словами «{dkp_only.POA_ANCHOR}» — некуда вписать доверенность.")}
+        except MissingDataError as e:
+            logger.error(f"Только ДКП: не собран — {e}")
+            parts = []
+            if e.missing:
+                parts.append("не заполнены: " + ", ".join(e.missing))
+            if e.leftover:
+                parts.append("неизвестные плейсхолдеры: " + ", ".join(e.leftover))
+            return {"error": "ДКП не собран — " + "; ".join(parts)}
+        except MissingTemplateError as e:
+            return {"error": str(e)}
+
+        files = [(path, f"{base}.docx")]
+        if os.environ.get("SKIP_PDF", "0") != "1":
+            try:
+                pdf = await self.builder.convert_to_pdf(path)
+                if pdf:
+                    files.append((pdf, f"{base}.pdf"))
+            except Exception as e:
+                logger.warning(f"Только ДКП: PDF не сделан — {e}")
+        note = "📝 Только ДКП — в журнал и на Drive не сохранялся"
+        logger.info(f"Только ДКП собран: {base} ({dkp_only.VARIANTS[variant]})")
+        return {
+            "file":        files[0][0],
+            "filename":    files[0][1],
+            "caption":     note,
+            "extra_files": [p for p, _ in files[1:]],
+            "extra_names": [n for _, n in files[1:]],
+            "extra_captions": [note] * (len(files) - 1),
+            "message": (f"📝 ДКП № {number} от {dkp_date} ({dkp_only.VARIANTS[variant]}) собран: "
+                        f"{', '.join(n for _, n in files)}. В журнал и на Drive не сохранялся."),
+            "buttons": [
+                {"text": "📝 Ещё ДКП", "callback_data": "menu:dkp_only"},
+                {"text": "◀️ Меню",    "callback_data": "menu:back"},
+            ],
+        }
 
     async def set_kg_vehicle_impl(self, contract_number: str, data: dict, chat_id: str = "") -> dict:
         """Этап 2 сделки «Учёт КГ»: данные ТС, зарегистрированного на продавца.

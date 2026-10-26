@@ -192,6 +192,7 @@ def main_menu_keyboard():
         ],
         [
             InlineKeyboardButton("🏬 Салоны",          callback_data="menu:salons"),
+            InlineKeyboardButton("📝 Только ДКП",      callback_data="menu:dkp_only"),
         ],
         [
             InlineKeyboardButton("🧠 Память",          callback_data="menu:memory"),
@@ -341,7 +342,10 @@ async def send_result(message, result: dict, context=None, chat_id=None):
             try:
                 with open(f_info["file"], "rb") as f:
                     link = f_info.get("drive_link", "")
-                    caption = f"☁️ {link}" if link else "☁️ (не загружено на Drive)"
+                    # Свою подпись задаёт инструмент, который на Drive не грузит
+                    # вовсе («📝 Только ДКП»), — «не загружено» там читалось бы как сбой.
+                    caption = (f_info.get("caption")
+                               or (f"☁️ {link}" if link else "☁️ (не загружено на Drive)"))
                     await message.reply_document(
                         document=f,
                         filename=f_info["filename"],
