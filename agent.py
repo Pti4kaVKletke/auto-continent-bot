@@ -170,6 +170,24 @@ def _settlement_base(deal: dict) -> float:
     return money.base_from_received(received, pct, legacy)
 
 
+def _stringify_scalars(data: dict) -> dict:
+    """Числа в анкете → строки (на месте). 4533980 → "4533980", 81.4 → "81.4".
+
+    Сборка документов везде работает со строками (.replace/.strip), а LLM
+    может прислать цену или год числом JSON. bool и None не трогаем.
+    """
+    if not isinstance(data, dict):
+        return data
+    for k, v in list(data.items()):
+        if isinstance(v, bool) or v is None:
+            continue
+        if isinstance(v, float):
+            data[k] = str(int(v)) if v.is_integer() else repr(v)
+        elif isinstance(v, int):
+            data[k] = str(v)
+    return data
+
+
 def _num(v) -> float:
     """Парсит число из значения (в т.ч. с запятой как десятичным разделителем).
 
@@ -1732,6 +1750,9 @@ class DocumentAgent:
                 excluded = {"contract_date", "commission_pct", "existing_contract_number"}
                 data = {k: v for k, v in tool_input.items() if k not in excluded}
                 logger.warning(f"create_contract: поле 'data' отсутствует, извлекаю из tool_input напрямую. Ключи: {list(data.keys())}")
+            # LLM иногда присылает числа числами (car_price: 4533980), а весь
+            # код сборки ждёт строки — 27.10.2026 АГ-договор упал на .replace.
+            _stringify_scalars(data)
             tool_input["data"] = data
 
             # Та же защита точечно для dkp_date: LLM нередко кладёт её рядом
@@ -3448,6 +3469,7 @@ class DocumentAgent:
         """
         from doc_builder import dkp_number_from, MissingTemplateError
 
+        _stringify_scalars(data)
         variant = (variant or "").strip().lower()
         if variant not in dkp_only.VARIANTS:
             variant = dkp_only.get_pending(chat_id) or dkp_only.VARIANT_TPO

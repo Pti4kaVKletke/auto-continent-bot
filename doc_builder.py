@@ -2088,7 +2088,7 @@ class DocumentBuilder:
         month = date[3:5]
         year  = date[6:10]
 
-        price_str = data.get("car_price", "0").replace(" ", "").replace(",", ".")
+        price_str = str(data.get("car_price") or "0").replace(" ", "").replace(",", ".")
         try:
             price_val = float(price_str)
         except Exception:
