@@ -148,11 +148,11 @@ def prepare_source(pending: dict, out_path: str):
         import pymupdf as fitz
     except ImportError:
         import fitz
-    from scan_upload import images_to_pdf, is_image_name
+    from scan_upload import files_to_pdf, images_to_pdf, is_image_name
 
     filepath = pending["filepath"]
-    if pending.get("pages"):
-        src = images_to_pdf(pending["pages"], out_path)
+    if len(pending.get("pages") or []) > 1:
+        src, _n = files_to_pdf(pending["pages"], out_path)   # фото и PDF вместе
     elif is_image_name(pending["filename"]):
         src = images_to_pdf([filepath], out_path)
     elif filepath.lower().endswith(".pdf"):

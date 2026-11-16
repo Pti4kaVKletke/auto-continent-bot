@@ -156,7 +156,7 @@ def test_begin_asks_type_for_photo_and_builds_pdf(monkeypatch, tmp_path):
                                         pages[0], "photo.jpg", pages=pages, show_summary=True))
     assert ok is True
     assert "Сделка найдена" in msg.sent[0][0]          # сводка
-    assert "Страниц: 3" in msg.sent[1][0]               # вопрос про тип
+    assert "Файлов: 3" in msg.sent[1][0]               # вопрос про тип
     pending = ctx.user_data["pending_scan"]
     assert pending["folder_id"] == "FOLDER1" and len(pending["pages"]) == 3
     # выбрали «Платёжка» → PDF с нужным именем
@@ -217,3 +217,42 @@ def test_multi_done_without_selection_keeps_pending(monkeypatch, tmp_path):
     _run(cb_deal.on_scanmulti(SimpleNamespace(effective_chat=SimpleNamespace(id=1)),
                               ctx, Q(), "scanmulti:done"))
     assert "pending_scan" in ctx.user_data and "хотя бы один" in msg.sent[-1][0]
+
+
+def test_pdf_and_photo_merge_into_one_payment_scan(monkeypatch, tmp_path):
+    """Платёжка: PDF (2 стр.) + фото → один Платежка_<номер>.pdf из 3 страниц."""
+    import pymupdf as fitz
+    from scan_upload import files_to_pdf, is_scan_part_name
+
+    pdf = tmp_path / "pay.pdf"
+    d = fitz.open()
+    d.new_page(); d.new_page()
+    d.save(str(pdf)); d.close()
+    jpg = tmp_path / "pay.jpg"
+    Image.new("RGB", (200, 300)).save(jpg)
+
+    assert is_scan_part_name("a.PDF") and is_scan_part_name("b.jpg") and not is_scan_part_name("c.docx")
+    out, n = files_to_pdf([str(pdf), str(jpg)], str(tmp_path / "m.pdf"))
+    assert n == 3
+
+    uploads = []
+    monkeypatch.setattr(cb_deal, "agent", _fake_agent(DEAL, uploads))
+    msg, ctx = _Msg(), SimpleNamespace(user_data={})
+    _run(cb_deal.begin_scan_upload(msg, ctx, "1", "110826001", None, str(jpg), "photo.jpg",
+                                   pages=[str(jpg), str(pdf)]))
+    pending = ctx.user_data["pending_scan"]
+    assert len(pending["pages"]) == 2 and "Файлов: 2" in msg.sent[-1][0]
+    _run(cb_deal.upload_scan(msg, "1", pending, "invoice"))
+    assert uploads[0][0] == "Платежка_110826001.pdf"
+    assert any("страниц в PDF: 3" in t for t, _ in msg.sent)
+
+
+def test_single_pdf_uploaded_as_is(monkeypatch, tmp_path):
+    uploads = []
+    monkeypatch.setattr(cb_deal, "agent", _fake_agent(DEAL, uploads))
+    f = tmp_path / "one.pdf"
+    f.write_bytes(b"%PDF-1.4 original-bytes")
+    msg, ctx = _Msg(), SimpleNamespace(user_data={})
+    _run(cb_deal.begin_scan_upload(msg, ctx, "1", "110826001", None, str(f), "one.pdf"))
+    _run(cb_deal.upload_scan(msg, "1", ctx.user_data["pending_scan"], "invoice"))
+    assert uploads[0] == ("Платежка_110826001.pdf", b"%PDF-1.4")      # файл невалидный: загружен как есть, без пересборки

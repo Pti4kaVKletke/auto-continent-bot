@@ -34,7 +34,8 @@ import sign_ui
 from scan_split import (format_ranges, parse_ranges, prepare_source,
                         ranges_from_page_labels, split_pdf)
 from scan_merge import _is_image, merge_parts, merged_name, plan_merge
-from scan_upload import auto_scan_type, deal_summary, images_to_pdf, is_image_name
+from scan_upload import (auto_scan_type, deal_summary, files_to_pdf, images_to_pdf,
+                         is_image_name, is_scan_part_name)
 
 from bot_core import (
     agent,
@@ -239,13 +240,14 @@ async def begin_scan_upload(message, context, chat_id, num, folder_id, filepath,
     except Exception:
         is_kg = False
     is_img = is_image_name(filename)
+    is_part = is_scan_part_name(filename)       # фото или PDF — к нему можно добавить ещё файлы
     pending = {
         "num":       num,
         "folder_id": folder_id,
         "filepath":  filepath,
         "filename":  filename,
         "is_kg":     is_kg,
-        "pages":     (pages or [filepath]) if is_img else None,
+        "pages":     (pages or [filepath]) if is_part else None,
         "ts":        time.time(),
     }
 
@@ -264,12 +266,13 @@ async def begin_scan_upload(message, context, chat_id, num, folder_id, filepath,
 
     text = f"📎 Файл получен. Что это за документ по сделке *{num}*?"
     if pending["pages"] and len(pending["pages"]) > 1:
-        text = (f"📎 Страниц: {len(pending['pages'])}. Пришлите остальные или "
-                f"выберите тип документа по сделке *{num}*:")
+        text = (f"📎 Файлов: {len(pending['pages'])} (объединятся в один PDF). "
+                f"Пришлите остальные или выберите тип документа по сделке *{num}*:")
     if warn:
         text = f"⚠️ {warn}.\n" + text
-    if is_img:
-        text += "\n_Если страниц несколько — пришлите остальные фото, потом выберите тип._"
+    if is_part:
+        text += ("\n_Если документ из нескольких файлов или фото — пришлите остальные "
+                 "(фото, PDF), потом выберите тип._")
     m = await message.reply_text(text, parse_mode="Markdown",
                                  reply_markup=scan_type_keyboard(num, is_kg))
     pending["prompt_id"] = m.message_id
@@ -579,12 +582,13 @@ async def upload_scan(message, chat_id, pending, code, edit_query=None, auto=Fal
         await message.reply_text(progress)
 
     made_pdf = None
+    pdf_pages = 0
     try:
         pages = pending.get("pages")
-        if pages or is_image_name(pending["filename"]):
-            # Фото документа → PDF (несколько страниц — один файл)
+        if (pages and len(pages) > 1) or is_image_name(pending["filename"]):
+            # Фото документа → PDF; несколько фото/PDF — один файл
             made_pdf = str(Path(filepath).with_name(f"scan_{int(time.time())}.pdf"))
-            await asyncio.to_thread(images_to_pdf, pages or [filepath], made_pdf)
+            _, pdf_pages = await asyncio.to_thread(files_to_pdf, pages or [filepath], made_pdf)
             filepath, ext = made_pdf, ".pdf"
         new_name = await _put_scan(pending, filepath, base, ext)
         # Файл уже на Drive — повторно грузить его при create_contract не нужно
@@ -606,7 +610,7 @@ async def upload_scan(message, chat_id, pending, code, edit_query=None, auto=Fal
     if auto:
         text.append("🔎 Тип определён по имени файла")
     if pages and len(pages) > 1:
-        text.append(f"📄 Страниц в PDF: {len(pages)}")
+        text.append(f"📄 Файлов объединено: {len(pages)}, страниц в PDF: {pdf_pages}")
     if status:
         text.append(f"🗂 Сканы по сделке *{num}*: {status}")
     await message.reply_text(
@@ -1269,7 +1273,7 @@ async def on_scan_route(update, context, query, data):
         # Читать/подписывать можно только один файл — склеиваем страницы в PDF.
         try:
             out = str(Path(filepath).with_name(f"scan_{int(time.time())}_pages.pdf"))
-            await asyncio.to_thread(images_to_pdf, pages, out)
+            await asyncio.to_thread(files_to_pdf, pages, out)
             filepath, filename = out, "scan.pdf"
         except Exception as e:
             logger.error(f"Склейка страниц: {e}", exc_info=True)
@@ -1317,12 +1321,12 @@ async def on_scan_route(update, context, query, data):
         context.user_data["awaiting_scan_for_existing"] = True
         context.user_data["existing_scan"] = {
             "filepath": filepath, "filename": filename,
-            "pages": pages or ([filepath] if is_image_name(filename) else None),
+            "pages": pages or ([filepath] if is_scan_part_name(filename) else None),
             "ts": time.time(),
         }
         text = "Укажи номер сделки (например: `280626001`)"
-        if is_image_name(filename):
-            text += "\n_Если страниц несколько — пришли остальные фото, потом номер._"
+        if is_scan_part_name(filename):
+            text += "\n_Если файлов или фото несколько — пришли остальные, потом номер._"
         await query.edit_message_text(text + ":", parse_mode="Markdown",
                                       reply_markup=existing_prompt_keyboard(context))
 

@@ -29,7 +29,7 @@ from telegram.ext import (
 )
 from agent import _money_str, SCAN_TYPES
 from scan_split import parse_ranges
-from scan_upload import is_image_name
+from scan_upload import is_image_name, is_scan_part_name
 import memory
 import bank_requisites as br
 import bank_ui
@@ -446,12 +446,13 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # («Сохранить скан в существующую сделку» → фото второй страницы)
     _ex = context.user_data.get("existing_scan")
     if (_ex and context.user_data.get("awaiting_scan_for_existing")
-            and _ex.get("pages") and is_image_name(filename)
+            and _ex.get("pages") and is_scan_part_name(filename)
             and time.time() - _ex.get("ts", 0) < 300):
         _ex["pages"].append(filepath)
         _ex["ts"] = time.time()
         await message.reply_text(
-            f"📎 Страниц: {len(_ex['pages'])}. Пришлите остальные или укажите номер сделки:",
+            f"📎 Файлов: {len(_ex['pages'])} (объединятся в один PDF). "
+            "Пришлите остальные или укажите номер сделки:",
             reply_markup=cb_deal.existing_prompt_keyboard(context),
         )
         return
@@ -460,7 +461,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Фото документа из нескольких страниц приходят отдельными сообщениями —
     # добавляем их к ожидающему выбора типа скану, а не начинаем заново.
     _ps = context.user_data.get("pending_scan")
-    if (_ps and _ps.get("pages") and is_image_name(filename)
+    if (_ps and _ps.get("pages") and is_scan_part_name(filename)
             and time.time() - _ps.get("ts", 0) < 300):
         _ps["pages"].append(filepath)
         _ps["ts"] = time.time()
@@ -470,8 +471,8 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
         _m = await message.reply_text(
-            f"📎 Страниц: {len(_ps['pages'])}. Пришлите остальные или выберите тип "
-            f"документа по сделке *{_ps['num']}*:",
+            f"📎 Файлов: {len(_ps['pages'])} (объединятся в один PDF). Пришлите остальные "
+            f"или выберите тип документа по сделке *{_ps['num']}*:",
             parse_mode="Markdown",
             reply_markup=cb_deal.scan_type_keyboard(_ps["num"], _ps["is_kg"]),
         )
@@ -531,11 +532,12 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Сценарий Г: файл без контекста — спрашиваем что делать ──
     caption = message.caption or ""
     is_img  = is_image_name(filename)
+    is_part = is_scan_part_name(filename)
 
-    # Несколько фото подряд (страницы одного документа) — копим под одним меню,
-    # а не плодим меню на каждое фото.
+    # Несколько фото/PDF подряд (страницы одного документа) — копим под одним
+    # меню, а не плодим меню на каждый файл.
     rp = context.user_data.get("route_pages")
-    if (is_img and rp and time.time() - rp.get("ts", 0) < 120
+    if (is_part and rp and time.time() - rp.get("ts", 0) < 120
             and context.user_data.get("last_scan_filepath")):
         rp["pages"].append(filepath)
         rp["ts"] = time.time()
@@ -545,7 +547,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
     else:
-        rp = {"pages": [filepath], "ts": time.time()} if is_img else None
+        rp = {"pages": [filepath], "ts": time.time()} if is_part else None
         context.user_data["last_scan_filepath"] = filepath
         context.user_data["last_scan_filename"]  = filename
         context.user_data["last_scan_caption"]   = caption
@@ -562,7 +564,8 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     buttons.append([InlineKeyboardButton("◀️ Меню", callback_data="menu:back")])
 
     if rp and len(rp["pages"]) > 1:
-        title = f"📎 Получила страниц: {len(rp['pages'])}. Что с ними делать?"
+        title = (f"📎 Получила файлов: {len(rp['pages'])} (объединю в один PDF). "
+                 "Что с ними делать?")
     elif is_img:
         title = "📎 Получила файл. Что с ним делать?\n(Если страниц несколько — пришли остальные фото.)"
     else:

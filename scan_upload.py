@@ -24,6 +24,15 @@ def is_image_name(filename: str) -> bool:
     return os.path.splitext(filename or "")[1].lower() in IMAGE_EXTS
 
 
+def is_pdf_name(filename: str) -> bool:
+    return (filename or "").lower().endswith(".pdf")
+
+
+def is_scan_part_name(filename: str) -> bool:
+    """Файл, который можно склеить в один скан: фото страницы или PDF."""
+    return is_image_name(filename) or is_pdf_name(filename)
+
+
 def contract_numbers_in(filename: str) -> set:
     return set(_CONTRACT_RE.findall(filename or ""))
 
@@ -94,3 +103,17 @@ def deal_summary(deal: dict, num: str) -> str:
         f"🚗 {car} · VIN {vin}",
         f"💰 Сумма договора: {total_s}",
     ])
+
+
+def files_to_pdf(paths: list, out_path: str) -> tuple:
+    """Склеивает фото и PDF (в порядке списка) в один PDF. Возвращает (путь, страниц)."""
+    from scan_merge import merge_parts
+
+    parts = []
+    for p in paths:
+        with open(p, "rb") as f:
+            parts.append((os.path.basename(p), f.read(), is_image_name(p)))
+    pages, bad = merge_parts(parts, out_path)
+    if bad or not pages:
+        raise ValueError("не удалось прочитать: " + ", ".join(bad or ["файлы"]))
+    return out_path, pages
