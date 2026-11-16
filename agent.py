@@ -391,6 +391,63 @@ def scan_type_of(filename: str) -> str | None:
     return None
 
 
+# Короткие метки документов для имени ОБЩЕГО файла (несколько документов в одном
+# PDF): Подп_АГ+ДКП+Расп+Акт+Отч_<номер>.pdf. По меткам бот потом узнаёт, что
+# внутри, и считает статус «Сканы» как для отдельных файлов. Метки не должны
+# быть префиксами друг друга.
+SCAN_TAGS = {"ag": "АГ", "dkp": "ДКП", "receipt": "Расп", "report": "Отч",
+             "act": "Акт", "spec": "Спец", "invoice": "Плат", "id": "Док"}
+_TAG_TO_CODE = {t.lower(): c for c, t in SCAN_TAGS.items()}
+_MULTI_RE = re.compile(r"^подп\s+([^\s+]+(?:\+[^\s+]+)+)")
+
+
+def scan_codes_sorted(codes) -> list:
+    """Коды документов в порядке списка SCAN_TYPES (для стабильного имени)."""
+    codes = set(codes)
+    return [c for c, *_ in SCAN_TYPES if c in codes]
+
+
+def scan_multi_name(codes) -> str:
+    """Имя общего файла без номера и расширения: «Подп_АГ+ДКП+Акт».
+
+    «Подп_» ставится, если среди документов есть подписываемые: платёжка и
+    документы сторон сами по себе не подписываются."""
+    ordered = scan_codes_sorted(codes)
+    tags = "+".join(SCAN_TAGS[c] for c in ordered if c in SCAN_TAGS)
+    signed = any(c in REQUIRED_SCANS_KG for c in ordered)
+    return f"Подп_{tags}" if signed else tags
+
+
+def scan_codes_of(filename: str) -> frozenset:
+    """Все типы документов, которые содержит файл (у обычного — один)."""
+    name = _normalize_scan_name(filename)
+    if SCAN_BUNDLE_RE.match(name):
+        return frozenset({"bundle"})
+    if not name.startswith("подп"):
+        return frozenset()
+    m = _MULTI_RE.match(name)
+    if m:
+        codes = {_TAG_TO_CODE.get(t) for t in m.group(1).split("+")}
+        codes.discard(None)
+        if codes:
+            return frozenset(codes)
+    # Старые файлы «Подп_Акт_Отчет_агента…»: акт и отчёт одним PDF.
+    if "акт" in name and "отчет" in name:
+        return frozenset({"act", "report"})
+    code = scan_type_of(filename)
+    return frozenset({code}) if code else frozenset()
+
+
+# Единый PDF «Комплект_<номер>…pdf» (кнопка «Собрать единый PDF») лежит в той же
+# папке «Сканы», но это производный файл: в статусе его нет и «лишним» он не
+# считается (иначе после сборки к «5/5 ✓» дописывалось бы «(+1)»).
+SCAN_MERGED_RE = re.compile(r"^комплект\s+\d{9}\b")
+
+
+def is_merged_scan(filename: str) -> bool:
+    return bool(SCAN_MERGED_RE.match(_normalize_scan_name(filename)))
+
+
 def scan_status_text(filenames: list, kg: bool = False) -> str:
     """
     Строка статуса сканов для журнала и карточки сделки.
@@ -400,12 +457,13 @@ def scan_status_text(filenames: list, kg: bool = False) -> str:
     сторон, копии без подписи) на счётчик не влияют, но считаются отдельно —
     иначе непонятно, почему в папке файлов больше, чем в статусе.
     """
-    filenames = [n for n in (filenames or []) if n]
+    filenames = [n for n in (filenames or []) if n and not is_merged_scan(n)]
     if not filenames:
         return "нет"
 
-    found = {scan_type_of(n) for n in filenames}
-    found.discard(None)
+    found = set()
+    for n in filenames:
+        found |= scan_codes_of(n)
 
     required = REQUIRED_SCANS_KG if kg else REQUIRED_SCANS
     total = len(required)
@@ -413,14 +471,14 @@ def scan_status_text(filenames: list, kg: bool = False) -> str:
     # Комплект одним PDF закрывает все позиции разом. Отмечаем это в тексте:
     # искать внутри одного файла — не то же самое, что видеть пять отдельных.
     if "bundle" in found:
-        extra = len([n for n in filenames if scan_type_of(n) != "bundle"])
+        extra = len([n for n in filenames if "bundle" not in scan_codes_of(n)])
         text = f"{total}/{total} ✓ одним файлом"
         return text + (f" (+{extra})" if extra else "")
 
     have    = [c for c in required if c in found]
     missing = [SCAN_LABELS[c].replace(" (Учёт КГ)", "") for c in required if c not in found]
     extra   = len(filenames) - len([n for n in filenames
-                                    if scan_type_of(n) in required])
+                                    if scan_codes_of(n) & set(required)])
 
     text = f"{len(have)}/{total}"
     text += " ✓" if not missing else " · нет: " + ", ".join(m.lower() for m in missing)
@@ -3271,6 +3329,52 @@ class DocumentAgent:
         else:
             logger.warning(f"Сделка {contract_number}: не удалось записать сумму выдана {value}")
         return deal
+
+    async def classify_scan_pages(self, pdf_path: str, codes: list):
+        """Для каждой страницы PDF определяет, к какому документу она относится.
+
+        Возвращает список кодов по числу страниц (код документа или "other") или
+        None, если определить не удалось (страниц слишком много, ответ модели не
+        разобрался). Решение принимает человек: бот только предлагает разбивку.
+        """
+        from scan_split import SPLIT_DESC, render_pages_jpeg
+
+        pages = await asyncio.to_thread(render_pages_jpeg, pdf_path)
+        if not pages:
+            return None
+        content = []
+        for i, jpg in enumerate(pages, 1):
+            content.append({"type": "text", "text": f"Страница {i}:"})
+            content.append({"type": "image", "source": {
+                "type": "base64", "media_type": "image/jpeg",
+                "data": base64.standard_b64encode(jpg).decode("utf-8")}})
+        desc = "\n".join(f'- "{c}": {SPLIT_DESC.get(c, c)}' for c in codes)
+        content.append({"type": "text", "text": (
+            "Это страницы одного PDF, склеенного из нескольких подписанных документов "
+            "по сделке. Определи, к какому документу относится каждая страница.\n"
+            f"Документы:\n{desc}\n"
+            "Страницы одного документа идут подряд. Продолжение документа (последние "
+            "листы с подписями, приложения) относится к тому же документу. Если страница "
+            'не подходит ни под один документ — "other".\n'
+            f"Верни ТОЛЬКО JSON-массив из {len(pages)} строк-кодов, по одной на страницу, "
+            "без пояснений.")})
+        resp = await self.client.messages.create(
+            model=self.model, max_tokens=400,
+            messages=[{"role": "user", "content": content}])
+        answer = "".join(b.text for b in resp.content
+                         if getattr(b, "type", "") == "text").strip()
+        m = re.search(r"\[.*\]", answer, re.S)
+        if not m:
+            return None
+        try:
+            labels = json.loads(m.group(0))
+        except ValueError:
+            return None
+        allowed = set(codes) | {"other"}
+        if (not isinstance(labels, list) or len(labels) != len(pages)
+                or any(l not in allowed for l in labels)):
+            return None
+        return labels
 
     async def list_scan_files(self, contract_number: str) -> tuple:
         """

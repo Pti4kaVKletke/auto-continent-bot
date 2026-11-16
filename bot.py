@@ -28,6 +28,8 @@ from telegram.ext import (
     ContextTypes,
 )
 from agent import _money_str, SCAN_TYPES
+from scan_split import parse_ranges
+from scan_upload import is_image_name
 import memory
 import bank_requisites as br
 import bank_ui
@@ -440,6 +442,42 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await salon_ui.handle_file(update, context, agent, filepath, filename):
         return
 
+    # ── Сценарий Б: ещё одна страница, пока бот ждёт номер сделки ──
+    # («Сохранить скан в существующую сделку» → фото второй страницы)
+    _ex = context.user_data.get("existing_scan")
+    if (_ex and context.user_data.get("awaiting_scan_for_existing")
+            and _ex.get("pages") and is_image_name(filename)
+            and time.time() - _ex.get("ts", 0) < 300):
+        _ex["pages"].append(filepath)
+        _ex["ts"] = time.time()
+        await message.reply_text(
+            f"📎 Страниц: {len(_ex['pages'])}. Пришлите остальные или укажите номер сделки:",
+            reply_markup=cb_deal.existing_prompt_keyboard(context),
+        )
+        return
+
+    # ── Сценарий А2: следующая страница к уже присланному фото скана ──
+    # Фото документа из нескольких страниц приходят отдельными сообщениями —
+    # добавляем их к ожидающему выбора типа скану, а не начинаем заново.
+    _ps = context.user_data.get("pending_scan")
+    if (_ps and _ps.get("pages") and is_image_name(filename)
+            and time.time() - _ps.get("ts", 0) < 300):
+        _ps["pages"].append(filepath)
+        _ps["ts"] = time.time()
+        if _ps.get("prompt_id"):
+            try:
+                await context.bot.delete_message(chat_id, _ps["prompt_id"])
+            except Exception:
+                pass
+        _m = await message.reply_text(
+            f"📎 Страниц: {len(_ps['pages'])}. Пришлите остальные или выберите тип "
+            f"документа по сделке *{_ps['num']}*:",
+            parse_mode="Markdown",
+            reply_markup=cb_deal.scan_type_keyboard(_ps["num"], _ps["is_kg"]),
+        )
+        _ps["prompt_id"] = _m.message_id
+        return
+
     # ── Сценарий А: ждём скан для конкретной сделки (кнопка "📎 Загрузить скан") ──
     if context.user_data.get("awaiting_scan_for_deal"):
         contract_number = context.user_data.pop("awaiting_scan_for_deal")
@@ -448,31 +486,9 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not deal_folder_id:
             await message.reply_text(f"⚠️ Папка сделки {contract_number} не найдена на Drive.")
             return
-
-        # Файл не грузим сразу: сначала спрашиваем, что это за документ.
-        # Тип уходит в имя файла — по нему потом читается статус комплекта
-        # и видно содержимое папки без открывания файлов.
-        context.user_data["pending_scan"] = {
-            "num":       contract_number,
-            "folder_id": deal_folder_id,
-            "filepath":  filepath,
-            "filename":  filename,
-        }
-        # Спецификация, СРТС и доверенность — только у сделок «Учёт КГ».
-        try:
-            _is_kg = kg_deal.is_kg(await agent.sheets.get_deal(contract_number) or {})
-        except Exception:
-            _is_kg = False
-        kb = [[InlineKeyboardButton(label, callback_data=f"scantype:{code}")]
-              for code, label, _, _ in SCAN_TYPES
-              if _is_kg or code not in ("spec", "srts", "poa")]
-        kb.append([InlineKeyboardButton("◀️ Отмена",
-                                        callback_data=f"dealaction:{contract_number}:menu")])
-        await message.reply_text(
-            f"📎 Файл получен. Что это за документ по сделке *{contract_number}*?",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(kb),
-        )
+        # Дальше — общий сценарий (тот же, что у «📂 существующая сделка»).
+        await cb_deal.begin_scan_upload(message, context, chat_id, contract_number,
+                                        deal_folder_id, filepath, filename)
         return
 
     # ── Сценарий К: «Учёт КГ», «🚗 Внести данные ТС» — СРТС / ID / доверенность ──
@@ -514,6 +530,26 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Сценарий Г: файл без контекста — спрашиваем что делать ──
     caption = message.caption or ""
+    is_img  = is_image_name(filename)
+
+    # Несколько фото подряд (страницы одного документа) — копим под одним меню,
+    # а не плодим меню на каждое фото.
+    rp = context.user_data.get("route_pages")
+    if (is_img and rp and time.time() - rp.get("ts", 0) < 120
+            and context.user_data.get("last_scan_filepath")):
+        rp["pages"].append(filepath)
+        rp["ts"] = time.time()
+        if rp.get("menu_id"):
+            try:
+                await context.bot.delete_message(chat_id, rp["menu_id"])
+            except Exception:
+                pass
+    else:
+        rp = {"pages": [filepath], "ts": time.time()} if is_img else None
+        context.user_data["last_scan_filepath"] = filepath
+        context.user_data["last_scan_filename"]  = filename
+        context.user_data["last_scan_caption"]   = caption
+        context.user_data.pop("route_pages", None)
 
     has_history = len(memory.get_history(limit=3, chat_id=chat_id)) > 0
     buttons = [
@@ -525,10 +561,16 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     buttons.append([InlineKeyboardButton("✍️ Подписать документ", callback_data="scan_route:sign")])
     buttons.append([InlineKeyboardButton("◀️ Меню", callback_data="menu:back")])
 
-    context.user_data["last_scan_filepath"] = filepath
-    context.user_data["last_scan_filename"]  = filename
-    context.user_data["last_scan_caption"]   = caption
-    await message.reply_text("📎 Получила файл. Что с ним делать?", reply_markup=InlineKeyboardMarkup(buttons))
+    if rp and len(rp["pages"]) > 1:
+        title = f"📎 Получила страниц: {len(rp['pages'])}. Что с ними делать?"
+    elif is_img:
+        title = "📎 Получила файл. Что с ним делать?\n(Если страниц несколько — пришли остальные фото.)"
+    else:
+        title = "📎 Получила файл. Что с ним делать?"
+    m = await message.reply_text(title, reply_markup=InlineKeyboardMarkup(buttons))
+    if rp:
+        rp["menu_id"] = m.message_id
+        context.user_data["route_pages"] = rp
 
 
 # ─── МАРШРУТЫ КНОПОК ──────────────────────────────────────────────────────────
@@ -546,6 +588,9 @@ CALLBACK_ROUTES = [
     ("prefix", "deal_date:", cb_deal.on_deal_date),
     ("prefix", "dkp_date:", cb_deal.on_dkp_date),
     ("prefix", "scantype:", cb_deal.on_scantype),
+    ("prefix", "scanexist:", cb_deal.on_scanexist),
+    ("prefix", "scanmulti:", cb_deal.on_scanmulti),
+    ("prefix", "scansplit:", cb_deal.on_scansplit),
     ("prefix", "docfield:", cb_deal.on_docfield),
     ("prefix", "docmenu:", cb_deal.on_docmenu),
     ("prefix", "dealaction:", cb_deal.on_dealaction),
@@ -579,8 +624,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("awaiting_doc_field", None)
 
     # То же для файла, ждущего выбора типа: он нужен ветке scantype:
-    if not (query.data or "").startswith("scantype:"):
+    if not (query.data or "").startswith(("scantype:", "scanmulti:", "scansplit:")):
         context.user_data.pop("pending_scan", None)
+    # Файл, ждущий номера сделки, нужен только кнопке «📂 Сделка …» (scanexist:)
+    if not (query.data or "").startswith("scanexist:"):
+        context.user_data.pop("existing_scan", None)
 
     data = query.data or ""
 
@@ -688,33 +736,42 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_result(update.message, result, context=context, chat_id=chat_id)
         return
 
+    if context.user_data.get("awaiting_scan_ranges"):
+        # Ручной ввод страниц документов общего файла: «АГ 1-4, ДКП 5-6»
+        _pend = context.user_data.get("pending_scan")
+        _sp = (_pend or {}).get("split")
+        if not _sp:
+            context.user_data.pop("awaiting_scan_ranges", None)
+            await update.message.reply_text("⚠️ Файл потерялся, пришлите его ещё раз.")
+            return
+        ranges, err = parse_ranges(user_text, _sp["codes"], _sp["n"])
+        if err:
+            await update.message.reply_text(f"⚠️ {err}")
+            return
+        context.user_data.pop("awaiting_scan_ranges", None)
+        _sp["ranges"] = ranges
+        await cb_deal.show_split_confirm(update.message, _pend)
+        return
+
     if context.user_data.get("awaiting_scan_for_existing"):
         context.user_data.pop("awaiting_scan_for_existing")
         contract_number = user_text.strip()
-        filepath = context.user_data.pop("pending_existing_filepath", None)
-        filename  = context.user_data.pop("pending_existing_filename", "file")
+        ex = context.user_data.get("existing_scan")
 
-        if not filepath or not Path(filepath).exists():
+        if not ex or not Path(ex["filepath"]).exists():
+            context.user_data.pop("existing_scan", None)
             await update.message.reply_text("⚠️ Файл не найден, попробуй загрузить снова.")
             return
 
-        try:
-            deal_folder_id  = await agent.drive.get_or_create_deal_folder(contract_number)
-            scans_folder_id = await agent.drive._get_or_create_folder("Сканы", deal_folder_id)
-            await typing_while(
-                update.effective_chat.id, context,
-                agent.drive.upload_file(filepath, filename, scans_folder_id)
-            )
-            await update.message.reply_text(
-                f"✅ Скан загружен в папку сделки *{contract_number}*",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("◀️ Меню", callback_data="menu:back")
-                ]])
-            )
-        except Exception as e:
-            logger.error(f"Ошибка загрузки скана: {e}", exc_info=True)
-            await update.message.reply_text(f"⚠️ Ошибка загрузки: {e}")
+        # Проверка номера → сводка → тип (по имени или кнопкой) → PDF → статус.
+        # Сделка не найдена — остаёмся в ожидании номера.
+        ok = await cb_deal.begin_scan_upload(
+            update.message, context, chat_id, contract_number, None,
+            ex["filepath"], ex["filename"], ex.get("pages"), show_summary=True)
+        if ok:
+            context.user_data.pop("existing_scan", None)
+        else:
+            context.user_data["awaiting_scan_for_existing"] = True
         return
 
     if context.user_data.get("awaiting_deals_dates"):

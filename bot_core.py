@@ -63,6 +63,7 @@ AWAITING_FLAGS = (
     "awaiting_scan_for_deal",
     "awaiting_scan_folder_id",
     "awaiting_scan_for_existing",
+    "awaiting_scan_ranges",
     "awaiting_edit_deal",
     "awaiting_payment_for_deal",
     "awaiting_doc_to_sign",

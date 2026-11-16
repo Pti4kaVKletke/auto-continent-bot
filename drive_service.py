@@ -428,6 +428,20 @@ class GoogleDriveService:
             logger.error(f"Ошибка скачивания файла {file_id}: {e}", exc_info=True)
             return b""
 
+    async def trash_file(self, file_id: str) -> bool:
+        """Переносит файл в корзину Drive (не удаляет навсегда — можно вернуть)."""
+        def _do():
+            self.service.files().update(
+                fileId=file_id, body={"trashed": True}, supportsAllDrives=True,
+            ).execute()
+
+        try:
+            await asyncio.to_thread(_do)
+            return True
+        except Exception as e:
+            logger.warning(f"Не удалось убрать в корзину файл {file_id}: {e}")
+            return False
+
     async def _get_or_create_folder(self, name: str, parent_id: str) -> str:
         def _do_find_or_create():
             query = (

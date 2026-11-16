@@ -7,6 +7,10 @@ cb_deal.py — Работа с одной сделкой: карточка и д
 """
 
 import asyncio
+import os
+import shutil
+import tempfile
+import time
 from pathlib import Path
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from agent import (
@@ -15,6 +19,11 @@ from agent import (
     _fmt_money,
     SCAN_LABELS,
     SCAN_PREFIXES,
+    SCAN_TAGS,
+    is_merged_scan,
+    SCAN_TYPES,
+    scan_multi_name,
+    scan_codes_sorted,
     scan_status_text,
 )
 import memory
@@ -22,6 +31,10 @@ import bank_requisites as br
 import kg_deal
 import salon
 import sign_ui
+from scan_split import (format_range, parse_ranges, prepare_source,
+                        ranges_from_page_labels, split_pdf)
+from scan_merge import _is_image, merge_parts, merged_name, plan_merge
+from scan_upload import auto_scan_type, deal_summary, images_to_pdf, is_image_name
 
 from bot_core import (
     agent,
@@ -85,19 +98,427 @@ async def on_scantype(update, context, query, data):
     if not pending:
         await query.edit_message_text("⚠️ Файл потерялся, пришлите его ещё раз.")
         return
+    await upload_scan(query.message, str(update.effective_chat.id), pending, code,
+                      edit_query=query)
 
-    num      = pending["num"]
-    prefix   = SCAN_PREFIXES.get(code, "Прочее")
+
+def scan_type_keyboard(contract_number: str, is_kg: bool):
+    """Кнопки выбора типа скана (спец/СРТС/доверенность — только «Учёт КГ»)."""
+    kb = [[InlineKeyboardButton(label, callback_data=f"scantype:{code}")]
+          for code, label, _, _ in SCAN_TYPES
+          if is_kg or code not in ("spec", "srts", "poa")]
+    kb.append([InlineKeyboardButton("📚 Несколько документов в одном файле",
+                                    callback_data="scanmulti:open")])
+    kb.append([InlineKeyboardButton("◀️ Отмена",
+                                    callback_data=f"dealaction:{contract_number}:menu")])
+    return InlineKeyboardMarkup(kb)
+
+
+# Что можно отметить внутри общего файла (комплект «Скан_АД», СРТС и прочее
+# сюда не входят: у них своя кнопка).
+_MULTI_CODES = ("ag", "dkp", "receipt", "report", "act", "spec", "invoice", "id")
+
+
+def scan_multi_keyboard(selected, is_kg: bool):
+    """Список документов с галочками для общего файла."""
+    sel = set(selected or ())
+    kb = []
+    for code, label, _, _ in SCAN_TYPES:
+        if code not in _MULTI_CODES or (code == "spec" and not is_kg):
+            continue
+        mark = "☑" if code in sel else "☐"
+        kb.append([InlineKeyboardButton(f"{mark} {label.replace(' (Учёт КГ)', '')}",
+                                        callback_data=f"scanmulti:t:{code}")])
+    kb.append([InlineKeyboardButton(f"✅ Готово ({len(sel)})" if sel else "✅ Готово",
+                                    callback_data="scanmulti:done")])
+    kb.append([InlineKeyboardButton("◀️ Назад к списку", callback_data="scanmulti:back")])
+    return InlineKeyboardMarkup(kb)
+
+
+async def on_scanmulti(update, context, query, data):
+    """Кнопки: callback_data «scanmulti:…» — общий файл с несколькими документами."""
+    action = data.split(":", 1)[1]
+    pending = context.user_data.get("pending_scan")
+    if not pending:
+        await query.edit_message_text("⚠️ Файл потерялся, пришлите его ещё раз.")
+        return
+    num, is_kg = pending["num"], pending.get("is_kg", False)
+    sel = pending.setdefault("multi", [])
+
+    async def show(warn=""):
+        text = (f"📚 Какие документы в файле по сделке *{num}*?\n"
+                "Отметьте все и нажмите «Готово».")
+        if warn:
+            text = f"⚠️ {warn}\n" + text
+        try:
+            await query.edit_message_text(text, parse_mode="Markdown",
+                                          reply_markup=scan_multi_keyboard(sel, is_kg))
+        except Exception:
+            pass  # то же самое содержимое — Telegram не даёт отредактировать
+
+    if action == "open":
+        await show()
+    elif action.startswith("t:"):
+        code = action[2:]
+        if code in sel:
+            sel.remove(code)
+        elif code in _MULTI_CODES:
+            sel.append(code)
+        await show()
+    elif action == "back":
+        pending.pop("multi", None)
+        await query.edit_message_text(
+            f"📎 Файл получен. Что это за документ по сделке *{num}*?",
+            parse_mode="Markdown", reply_markup=scan_type_keyboard(num, is_kg))
+    elif action == "done":
+        if not sel:
+            await show("Отметьте хотя бы один документ.")
+            return
+        context.user_data.pop("pending_scan", None)
+        codes = scan_codes_sorted(sel)
+        chat_id = str(update.effective_chat.id)
+        if len(codes) == 1:
+            await upload_scan(query.message, chat_id, pending, codes[0], edit_query=query)
+        else:
+            # Несколько документов: делим на отдельные сканы (с подтверждением).
+            await start_split(query.message, context, chat_id, pending, codes,
+                              edit_query=query)
+
+
+def existing_prompt_keyboard(context):
+    """Под вопросом «номер сделки?»: кнопка последней открытой сделки."""
+    kb = []
+    cur = context.user_data.get("current_deal")
+    if cur:
+        kb.append([InlineKeyboardButton(f"📂 Сделка {cur} (последняя открытая)",
+                                        callback_data=f"scanexist:{cur}")])
+    kb.append([InlineKeyboardButton("◀️ Меню", callback_data="menu:back")])
+    return InlineKeyboardMarkup(kb)
+
+
+async def begin_scan_upload(message, context, chat_id, num, folder_id, filepath,
+                            filename, pages=None, show_summary=False) -> bool:
+    """Общий вход для обоих путей загрузки скана в сделку.
+
+    Путь 1 (файл прислан без контекста → «Сохранить скан в существующую
+    сделку» → номер) и путь 2 (карточка сделки → «📎 Загрузить скан») дальше
+    идут одинаково: тип по имени файла или кнопкой, фото → PDF, статус «Сканы».
+
+    show_summary — проверить, что сделка есть, и показать сводку (путь 1, где
+    номер вводят руками). Возвращает False, если сделка не найдена: вызывающий
+    оставляет ожидание номера.
+    """
+    try:
+        deal = await agent.sheets.get_deal(num)
+    except Exception as e:
+        logger.warning(f"Сделка {num} не прочитана: {e}")
+        deal = None
+
+    if show_summary:
+        if not deal:
+            await message.reply_text(
+                f"❌ Сделка {num} не найдена. Проверьте номер и введите ещё раз.",
+                reply_markup=existing_prompt_keyboard(context))
+            return False
+        await message.reply_text(deal_summary(deal, num))
+
+    if not folder_id:
+        link = (deal or {}).get("Папка Drive", "") or ""
+        folder_id = (link.split("/folders/")[-1].split("?")[0]
+                     if "/folders/" in link else "")
+        if not folder_id:
+            try:
+                folder_id = await agent.drive.get_or_create_deal_folder(num)
+            except Exception as e:
+                logger.error(f"Папка сделки {num}: {e}", exc_info=True)
+                await message.reply_text(f"⚠️ Не удалось открыть папку сделки {num}: {e}")
+                return True
+
+    try:
+        is_kg = kg_deal.is_kg(deal or {})
+    except Exception:
+        is_kg = False
+    is_img = is_image_name(filename)
+    pending = {
+        "num":       num,
+        "folder_id": folder_id,
+        "filepath":  filepath,
+        "filename":  filename,
+        "is_kg":     is_kg,
+        "pages":     (pages or [filepath]) if is_img else None,
+        "ts":        time.time(),
+    }
+
+    # Файл уже назван по правилам («Подп_ДКП_ТС_…», «Скан_АД_…») — тип берём из
+    # имени и не спрашиваем. Номер другой сделки в имени отключает автотип.
+    allowed = [code for code, _, _, _ in SCAN_TYPES
+               if is_kg or code not in ("spec", "srts", "poa")]
+    auto_code, warn = auto_scan_type(filename, num, allowed)
+    if isinstance(auto_code, tuple):
+        # Файл назван как общий («Подп_АГ+ДКП_…») — делим на отдельные сканы.
+        await start_split(message, context, chat_id, pending, auto_code)
+        return True
+    if auto_code:
+        await upload_scan(message, chat_id, pending, auto_code, auto=True)
+        return True
+
+    text = f"📎 Файл получен. Что это за документ по сделке *{num}*?"
+    if pending["pages"] and len(pending["pages"]) > 1:
+        text = (f"📎 Страниц: {len(pending['pages'])}. Пришлите остальные или "
+                f"выберите тип документа по сделке *{num}*:")
+    if warn:
+        text = f"⚠️ {warn}.\n" + text
+    if is_img:
+        text += "\n_Если страниц несколько — пришлите остальные фото, потом выберите тип._"
+    m = await message.reply_text(text, parse_mode="Markdown",
+                                 reply_markup=scan_type_keyboard(num, is_kg))
+    pending["prompt_id"] = m.message_id
+    context.user_data["pending_scan"] = pending
+    return True
+
+
+async def build_merged_scan(num: str) -> dict:
+    """Собирает «Комплект_<номер>….pdf» из сканов сделки и кладёт в папку «Сканы».
+
+    Порядок безопасный: новый файл сначала загружается, и только потом старый
+    единый файл (если был) уходит в корзину — потерять нечего. Если хоть один
+    файл не прочитался, единый PDF не собирается: имя «5 из 5» при дыре в
+    содержимом было бы ложью.
+    """
+    scans_id, files = await agent.list_scan_files(num)
+    if not scans_id:
+        return {"ok": False, "error": "Папка «Сканы» не найдена — сканов ещё не загружали."}
+    deal = await agent.sheets.get_deal(num) or {}
+    try:
+        kg = kg_deal.is_kg(deal)
+    except Exception:
+        kg = False
+    plan = plan_merge(files or [], kg=kg)
+    if not plan["items"]:
+        return {"ok": False,
+                "error": "В папке «Сканы» нет подписанных документов (Подп_…) для сборки."}
+
+    parts, bad = [], []
+    for f in plan["items"]:
+        data = await agent.drive.download_file_bytes(f["id"])
+        if not data:
+            bad.append(f["name"])
+        else:
+            parts.append((f["name"], data, _is_image(f)))
+    if bad:
+        return {"ok": False, "error": "Не удалось скачать: " + ", ".join(bad)
+                                      + ". Единый PDF не собран."}
+
+    tmp = tempfile.mkdtemp(prefix="merge_")
+    try:
+        out = os.path.join(tmp, "merged.pdf")
+        pages, unreadable = await asyncio.to_thread(merge_parts, parts, out)
+        if unreadable or not pages:
+            return {"ok": False, "error": "Не удалось прочитать как PDF/фото: "
+                                          + ", ".join(unreadable or ["все файлы"])
+                                          + ". Единый PDF не собран."}
+        name = merged_name(num, plan)
+        link = await agent.drive.upload_file(out, name, scans_id)
+        if not link:
+            return {"ok": False, "error": "Не удалось загрузить единый PDF на Drive."}
+        # Прежние единые файлы (имя могло быть другим — комплект был неполный)
+        for f in files or []:
+            if is_merged_scan(f.get("name", "")):
+                await agent.drive.trash_file(f["id"])
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    status = await agent.refresh_scan_status(num)
+    missing_labels = [SCAN_LABELS[c].replace(" (Учёт КГ)", "") for c in plan["missing"]]
+    return {"ok": True, "name": name, "link": link, "pages": pages,
+            "included": [f["name"] for f in plan["items"]],
+            "missing_labels": missing_labels,
+            "dups": [SCAN_LABELS[c] for c in plan["dups"]],
+            "skipped": plan["skipped"], "status": status}
+
+
+def _split_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Верно, разделить", callback_data="scansplit:ok")],
+        [InlineKeyboardButton("✏️ Исправить страницы", callback_data="scansplit:edit")],
+        [InlineKeyboardButton("📎 Оставить одним файлом", callback_data="scansplit:keep")],
+        [InlineKeyboardButton("◀️ Отмена", callback_data="scansplit:cancel")],
+    ])
+
+
+async def show_split_confirm(message, pending, auto=False):
+    """Показывает разбивку по страницам и просит подтвердить."""
+    sp = pending["split"]
+    lines = [f"📑 В файле {sp['n']} стр. " +
+             ("Разбивка определена автоматически — проверьте:" if auto else "Разбивка:")]
+    for code in scan_codes_sorted(sp["codes"]):
+        label = SCAN_LABELS[code].replace(" (Учёт КГ)", "")
+        lines.append(f"• {label} — {format_range(sp['ranges'][code])}")
+    covered = {p for a, b in sp["ranges"].values() for p in range(a, b + 1)}
+    rest = [p for p in range(1, sp["n"] + 1) if p not in covered]
+    if rest:
+        lines.append("⚠️ Не войдут (не отмечены): стр. " + ", ".join(map(str, rest)))
+    await message.reply_text("\n".join(lines), reply_markup=_split_keyboard())
+
+
+async def ask_split_ranges(message, context, pending, note=""):
+    """Просит ввести страницы вручную: «АГ 1-4, ДКП 5-6»."""
+    sp = pending["split"]
+    codes = scan_codes_sorted(sp["codes"])
+    example = ", ".join(f"{SCAN_TAGS[c]} {i}" for i, c in enumerate(codes, 1) if c in SCAN_TAGS)
+    context.user_data["awaiting_scan_ranges"] = True
+    text = (f"{note}Пришлите страницы каждого документа — например: {example}\n"
+            f"(диапазон — через дефис: АГ 1-4). В файле {sp['n']} стр.\n"
+            "Метки: " + ", ".join(SCAN_TAGS[c] for c in codes if c in SCAN_TAGS))
+    await message.reply_text(text, reply_markup=InlineKeyboardMarkup([
+        [InlineKeyboardButton("📎 Оставить одним файлом", callback_data="scansplit:keep")],
+        [InlineKeyboardButton("◀️ Отмена", callback_data="scansplit:cancel")],
+    ]))
+
+
+async def start_split(message, context, chat_id, pending, codes, edit_query=None):
+    """В файле несколько документов: определить страницы и предложить разбивку."""
+    codes = list(codes)
+    progress = "⏳ Определяю, где какой документ..."
+    if edit_query is not None:
+        await edit_query.edit_message_text(progress)
+    else:
+        await message.reply_text(progress)
+
+    src, n = None, 0
+    try:
+        out = str(Path(pending["filepath"]).with_name(f"split_src_{int(time.time())}.pdf"))
+        src, n = await asyncio.to_thread(prepare_source, pending, out)
+    except Exception as e:
+        logger.warning(f"Разделение {pending['num']}: источник не подготовлен: {e}")
+    if not src or n < len(codes):
+        why = ("Не удалось разобрать файл." if not src
+               else f"В файле {n} стр. — меньше, чем документов.")
+        await message.reply_text(f"{why} Сохраняю одним файлом.")
+        await upload_scan(message, chat_id, pending, codes)
+        return
+    if src != pending["filepath"]:
+        memory.add_pending_scan(str(chat_id), src, "split_source.pdf")  # уберётся с остальными
+
+    labels = None
+    try:
+        labels = await agent.classify_scan_pages(src, codes)
+    except Exception as e:
+        logger.warning(f"Разделение {pending['num']}: страницы не определены: {e}")
+    ranges = ranges_from_page_labels(labels, codes)
+
+    pending["split"] = {"codes": codes, "src": src, "n": n, "ranges": ranges}
+    context.user_data["pending_scan"] = pending
+    if ranges:
+        await show_split_confirm(message, pending, auto=True)
+    else:
+        await ask_split_ranges(message, context, pending,
+                               "Не удалось определить страницы автоматически. ")
+
+
+async def _split_and_upload(message, chat_id, pending):
+    """Режет файл по подтверждённой разбивке и кладёт каждый документ отдельно."""
+    sp, num = pending["split"], pending["num"]
+    out_dir = str(Path(sp["src"]).parent)
+    parts = await asyncio.to_thread(split_pdf, sp["src"], sp["ranges"], out_dir,
+                                    str(int(time.time())))
+    done = []
+    try:
+        for code in scan_codes_sorted(sp["codes"]):
+            base = await _scan_base(pending, code, ".pdf")
+            name = await _put_scan(pending, parts[code], base, ".pdf")
+            done.append((name, sp["ranges"][code]))
+        memory.clear_pending_scans(str(chat_id))
+        status = await agent.refresh_scan_status(num)
+    except Exception as e:
+        logger.error(f"Разделение скана {num}: {e}", exc_info=True)
+        text = f"⚠️ Не удалось загрузить: {e}"
+        if done:
+            text += "\nУже загружены: " + ", ".join(n for n, _ in done)
+        await message.reply_text(text)
+        return
+    finally:
+        for p in parts.values():
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+    lines = ["✅ Файл разделён, документы сохранены отдельно:"]
+    lines += [f"• {n} ({format_range(r)})" for n, r in done]
+    if status:
+        lines.append(f"🗂 Сканы по сделке {num}: {status}")
+    await message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup([
+        [InlineKeyboardButton("📎 Загрузить ещё", callback_data=f"dealaction:{num}:scan")],
+        [InlineKeyboardButton("📚 Собрать единый PDF", callback_data=f"dealaction:{num}:merge")],
+        [InlineKeyboardButton("◀️ К сделке", callback_data=f"dealaction:{num}:menu")],
+    ]))
+
+
+async def on_scansplit(update, context, query, data):
+    """Кнопки: callback_data «scansplit:…» — подтверждение разбивки общего файла."""
+    action = data.split(":", 1)[1]
+    chat_id = str(update.effective_chat.id)
+    pending = context.user_data.get("pending_scan")
+    sp = (pending or {}).get("split")
+    if not sp:
+        await query.edit_message_text("⚠️ Файл потерялся, пришлите его ещё раз.")
+        return
+
+    if action == "ok":
+        if not sp.get("ranges"):
+            await ask_split_ranges(query.message, context, pending)
+            return
+        context.user_data.pop("pending_scan", None)
+        await query.edit_message_text("⏳ Делю файл и загружаю...")
+        await _split_and_upload(query.message, chat_id, pending)
+    elif action == "edit":
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await ask_split_ranges(query.message, context, pending)
+    elif action == "keep":
+        context.user_data.pop("pending_scan", None)
+        context.user_data.pop("awaiting_scan_ranges", None)
+        await upload_scan(query.message, chat_id, pending, list(sp["codes"]),
+                          edit_query=query)
+    elif action == "cancel":
+        context.user_data.pop("pending_scan", None)
+        context.user_data.pop("awaiting_scan_ranges", None)
+        memory.clear_pending_scans(chat_id)
+        await query.edit_message_text("Отменено, файл не сохранён.", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("◀️ К сделке", callback_data=f"dealaction:{pending['num']}:menu")]]))
+
+
+async def on_scanexist(update, context, query, data):
+    """Кнопка «📂 Сделка …» под вопросом о номере: callback_data «scanexist:<номер>»."""
+    num = data.split(":", 1)[1]
+    ex = context.user_data.pop("existing_scan", None)
+    if not ex or not Path(ex["filepath"]).exists():
+        await query.edit_message_text("⚠️ Файл потерялся, пришлите его ещё раз.")
+        return
+    await query.edit_message_text(f"⏳ Проверяю сделку {num}...")
+    ok = await begin_scan_upload(query.message, context, str(update.effective_chat.id),
+                                 num, None, ex["filepath"], ex["filename"],
+                                 ex.get("pages"), show_summary=True)
+    if not ok:
+        context.user_data["awaiting_scan_for_existing"] = True
+        context.user_data["existing_scan"] = ex
+
+
+async def _scan_base(pending, code, ext) -> str:
+    """Имя скана одного типа без расширения: «Подп_ДКП_ТС_<номер>»."""
+    num    = pending["num"]
+    prefix = SCAN_PREFIXES.get(code, "Прочее")
     if code == "ag":
         # Субагентская сделка: договор называется САГ_Договор — скан тоже.
         try:
-            if salon.is_subagent(await agent.sheets.get_deal(pending["num"]) or {}):
+            if salon.is_subagent(await agent.sheets.get_deal(num) or {}):
                 prefix = "Подп_САГ_Договор"
         except Exception as e:
-            logger.warning(f"Тип сделки {pending['num']} не прочитан: {e}")
-    filepath = pending["filepath"]
-    ext      = Path(pending["filename"]).suffix or ".pdf"
-    base     = f"{prefix}_{num}"
+            logger.warning(f"Тип сделки {num} не прочитан: {e}")
+    base = f"{prefix}_{num}"
     if code in ("srts", "poa"):
         # «Учёт КГ»: СРТС_XXXXXX / Доверенность_XXXXXX — по 6 знакам VIN,
         # как номер ДКП. Нет VIN в журнале — по номеру сделки.
@@ -106,38 +527,92 @@ async def on_scantype(update, context, query, data):
         except Exception:
             _vin = ""
         base = kg_deal.drive_name(code, num, _vin, ext)[:-len(ext)]
+    return base
 
-    await query.edit_message_text(f"⏳ Загружаю {SCAN_LABELS.get(code, 'скан')}...")
+
+async def _put_scan(pending, filepath, base, ext) -> str:
+    """Кладёт файл в папку «Сканы» сделки, возвращает имя на Drive."""
+    num = pending["num"]
+    scans_folder_id = await agent.drive._get_or_create_folder("Сканы", pending["folder_id"])
+
+    # Имя занято (переснятый скан, вторая страница) — дописываем номер,
+    # а не затираем: потерять уже подписанный документ хуже, чем
+    # оставить в папке лишний файл.
+    _, existing = await agent.list_scan_files(num)
+    taken = {f.get("name", "") for f in existing}
+    new_name, n = f"{base}{ext}", 1
+    while new_name in taken:
+        n += 1
+        new_name = f"{base}_{n}{ext}"
+
+    await agent.drive.upload_file(filepath, new_name, scans_folder_id)
+    return new_name
+
+
+async def upload_scan(message, chat_id, pending, code, edit_query=None, auto=False):
+    """Кладёт скан в папку «Сканы» сделки под именем по типу и пересчитывает статус.
+
+    pending — {num, folder_id, filepath, filename[, pages]}. Если есть pages
+    (фото страниц), они склеиваются в один PDF. auto=True — тип взят из имени
+    файла, а не выбран кнопкой (только для строки в ответе).
+    """
+    num      = pending["num"]
+    multi    = list(code) if isinstance(code, (list, tuple)) else None
+    if multi:
+        # Несколько документов в одном файле: «Подп_АГ+ДКП+Акт» — метки читает
+        # scan_codes_of, поэтому по имени видно (и считается), что внутри.
+        prefix = scan_multi_name(multi)
+        label  = ", ".join(SCAN_LABELS[c].replace(" (Учёт КГ)", "") for c in multi)
+    else:
+        label  = SCAN_LABELS.get(code, "скан")
+    filepath = pending["filepath"]
+    ext      = Path(pending["filename"]).suffix or ".pdf"
+    base     = (f"{prefix}_{num}" if multi
+                else await _scan_base(pending, code, ext))
+
+    progress = f"⏳ Загружаю: {label}..."
+    if edit_query is not None:
+        await edit_query.edit_message_text(progress)
+    else:
+        await message.reply_text(progress)
+
+    made_pdf = None
     try:
-        scans_folder_id = await agent.drive._get_or_create_folder("Сканы", pending["folder_id"])
-
-        # Имя занято (переснятый скан, вторая страница) — дописываем номер,
-        # а не затираем: потерять уже подписанный документ хуже, чем
-        # оставить в папке лишний файл.
-        _, existing = await agent.list_scan_files(num)
-        taken = {f.get("name", "") for f in existing}
-        new_name, n = f"{base}{ext}", 1
-        while new_name in taken:
-            n += 1
-            new_name = f"{base}_{n}{ext}"
-
-        await agent.drive.upload_file(filepath, new_name, scans_folder_id)
+        pages = pending.get("pages")
+        if pages or is_image_name(pending["filename"]):
+            # Фото документа → PDF (несколько страниц — один файл)
+            made_pdf = str(Path(filepath).with_name(f"scan_{int(time.time())}.pdf"))
+            await asyncio.to_thread(images_to_pdf, pages or [filepath], made_pdf)
+            filepath, ext = made_pdf, ".pdf"
+        new_name = await _put_scan(pending, filepath, base, ext)
         # Файл уже на Drive — повторно грузить его при create_contract не нужно
-        memory.clear_pending_scans(str(update.effective_chat.id))
+        memory.clear_pending_scans(str(chat_id))
         status = await agent.refresh_scan_status(num)
     except Exception as e:
         logger.error(f"Ошибка загрузки скана для сделки {num}: {e}", exc_info=True)
-        await query.message.reply_text(f"⚠️ Не удалось загрузить скан: {e}")
+        await message.reply_text(f"⚠️ Не удалось загрузить скан: {e}")
         return
+    finally:
+        if made_pdf and os.path.exists(made_pdf):
+            try:
+                os.remove(made_pdf)
+            except OSError:
+                pass
 
-    text = [f"✅ {SCAN_LABELS.get(code, 'Скан')} загружен: `{new_name}`"]
+    text = [f"✅ Загружено ({label}): `{new_name}`" if multi
+            else f"✅ {label[:1].upper() + label[1:]} загружен: `{new_name}`"]
+    if auto:
+        text.append("🔎 Тип определён по имени файла")
+    if pages and len(pages) > 1:
+        text.append(f"📄 Страниц в PDF: {len(pages)}")
     if status:
         text.append(f"🗂 Сканы по сделке *{num}*: {status}")
-    await query.message.reply_text(
+    await message.reply_text(
         "\n".join(text),
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("📎 Загрузить ещё", callback_data=f"dealaction:{num}:scan")],
+            [InlineKeyboardButton("📚 Собрать единый PDF", callback_data=f"dealaction:{num}:merge")],
             [InlineKeyboardButton("◀️ К сделке",      callback_data=f"dealaction:{num}:menu")],
         ]),
     )
@@ -428,6 +903,9 @@ async def on_dealaction(update, context, query, data):
         if scans_folder_url:
             kb.append([InlineKeyboardButton("📁 Открыть папку Сканы", url=scans_folder_url)])
         kb.append([InlineKeyboardButton("📎 Загрузить скан", callback_data=f"dealaction:{num}:scan")])
+        if files:
+            kb.append([InlineKeyboardButton("📚 Собрать единый PDF",
+                                            callback_data=f"dealaction:{num}:merge")])
         kb.append([InlineKeyboardButton("◀️ Назад",          callback_data=f"dealaction:{num}:menu")])
 
         await query.edit_message_text(
@@ -436,6 +914,37 @@ async def on_dealaction(update, context, query, data):
             reply_markup=InlineKeyboardMarkup(kb),
             disable_web_page_preview=True,
         )
+
+    elif action == "merge":
+        await query.edit_message_text(f"⏳ Собираю единый PDF по сделке {num}...")
+        try:
+            r = await build_merged_scan(num)
+        except Exception as e:
+            logger.error(f"Единый PDF {num}: {e}", exc_info=True)
+            r = {"ok": False, "error": f"Не удалось собрать: {e}"}
+        kb = []
+        if r.get("ok") and r.get("link"):
+            kb.append([InlineKeyboardButton("📄 Открыть единый PDF", url=r["link"])])
+        kb.append([InlineKeyboardButton("🗂 Сканы",    callback_data=f"dealaction:{num}:scans")])
+        kb.append([InlineKeyboardButton("◀️ К сделке", callback_data=f"dealaction:{num}:menu")])
+        if not r.get("ok"):
+            text = f"⚠️ {r.get('error')}"
+        else:
+            lines = [f"✅ Единый PDF собран: {r['name']}",
+                     f"📄 Страниц: {r['pages']} · файлов в нём: {len(r['included'])}"]
+            lines += [f"   {i}. {n}" for i, n in enumerate(r["included"], 1)]
+            if r["missing_labels"]:
+                lines.append(f"⚠️ Комплект неполный, не хватает: {', '.join(r['missing_labels'])}")
+            if r["dups"]:
+                lines.append(f"⚠️ Есть повторы ({', '.join(r['dups'])}) — вошли все версии, "
+                             "лишнюю можно убрать из «Сканы» и собрать заново")
+            if r["skipped"]:
+                lines.append(f"Не вошли (не подписанные документы): {len(r['skipped'])}")
+            if r.get("status"):
+                lines.append(f"🗂 Сканы: {r['status']}")
+            text = "\n".join(lines)
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb),
+                                      disable_web_page_preview=True)
 
     elif action == "scan":
         # Получаем folder_id для этой сделки
@@ -751,6 +1260,19 @@ async def on_scan_route(update, context, query, data):
     filepath = context.user_data.pop("last_scan_filepath", None)
     filename = context.user_data.pop("last_scan_filename", "file")
     caption  = context.user_data.pop("last_scan_caption", "")
+    # Фото документа из нескольких страниц: страницы копились, пока висело меню.
+    pages = (context.user_data.pop("route_pages", None) or {}).get("pages")
+
+    if route in ("new", "add", "sign") and pages and len(pages) > 1 and filepath:
+        # Читать/подписывать можно только один файл — склеиваем страницы в PDF.
+        try:
+            out = str(Path(filepath).with_name(f"scan_{int(time.time())}_pages.pdf"))
+            await asyncio.to_thread(images_to_pdf, pages, out)
+            filepath, filename = out, "scan.pdf"
+        except Exception as e:
+            logger.error(f"Склейка страниц: {e}", exc_info=True)
+            await query.edit_message_text(f"⚠️ Не удалось склеить страницы: {e}")
+            return
 
     if route == "new":
         # Новая сделка — читаем документ с нуля. Файл прислан без кнопки
@@ -788,14 +1310,19 @@ async def on_scan_route(update, context, query, data):
                             agent.builder, getter=memory.get_setting)
 
     elif route == "existing":
-        # Сохраняем скан в папку существующей сделки
+        # Скан в папку существующей сделки: номер → сводка → тип → PDF → статус
+        # (тот же сценарий, что у «📎 Загрузить скан» в карточке сделки).
         context.user_data["awaiting_scan_for_existing"] = True
-        context.user_data["pending_existing_filepath"]  = filepath
-        context.user_data["pending_existing_filename"]  = filename
-        await query.edit_message_text(
-            "Укажи номер сделки (например: `280626001`):",
-            parse_mode="Markdown",
-        )
+        context.user_data["existing_scan"] = {
+            "filepath": filepath, "filename": filename,
+            "pages": pages or ([filepath] if is_image_name(filename) else None),
+            "ts": time.time(),
+        }
+        text = "Укажи номер сделки (например: `280626001`)"
+        if is_image_name(filename):
+            text += "\n_Если страниц несколько — пришли остальные фото, потом номер._"
+        await query.edit_message_text(text + ":", parse_mode="Markdown",
+                                      reply_markup=existing_prompt_keyboard(context))
 
 
 async def on_bankprofile(update, context, query, data):
