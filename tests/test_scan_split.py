@@ -8,7 +8,7 @@ import pytest
 from PIL import Image
 
 import cb_deal
-from scan_split import (format_range, parse_ranges, prepare_source,
+from scan_split import (format_ranges, parse_ranges, prepare_source,
                         ranges_from_page_labels, split_pdf)
 
 try:
@@ -35,7 +35,7 @@ def n_pages(data):
 def test_ranges_from_labels_ok_and_invalid():
     labels = ["ag", "ag", "ag", "dkp", "dkp", "act", "other"]
     assert ranges_from_page_labels(labels, ["ag", "dkp", "act"]) == \
-        {"ag": (1, 3), "dkp": (4, 5), "act": (6, 6)}
+        {"ag": [(1, 3)], "dkp": [(4, 5)], "act": [(6, 6)]}
     assert ranges_from_page_labels(["ag", "dkp", "ag"], ["ag", "dkp"]) is None   # не подряд
     assert ranges_from_page_labels(["ag", "ag"], ["ag", "dkp"]) is None           # ДКП не найден
     assert ranges_from_page_labels(["ag", "act"], ["ag", "dkp"]) is None          # чужой код
@@ -44,19 +44,29 @@ def test_ranges_from_labels_ok_and_invalid():
 
 def test_parse_ranges():
     r, err = parse_ranges("АГ 1-4, ДКП 5-6; Расп 7", ["ag", "dkp", "receipt"], 7)
-    assert err is None and r == {"ag": (1, 4), "dkp": (5, 6), "receipt": (7, 7)}
-    r, err = parse_ranges("аг договор 1", ["ag"], 3)       # «аг договор» → не знаем слово
-    assert r is None and err
+    assert err is None and r == {"ag": [(1, 4)], "dkp": [(5, 6)], "receipt": [(7, 7)]}
+    # страницы документа не подряд — через запятую или «и»
+    want = {"ag": [(1, 5)], "dkp": [(7, 7)], "invoice": [(6, 6), (8, 8)]}
+    codes = ["ag", "dkp", "invoice"]
+    assert parse_ranges("аг 1-5, дкп 7, плат 6, 8", codes, 8) == (want, None)
+    assert parse_ranges("аг 1-5, дкп 7, плат 6 и 8", codes, 8) == (want, None)
+    assert parse_ranges("АГ 1-5\nДКП 7\nПлатёжка стр. 6, 8", codes, 8) == (want, None)
+    # слова «договор»/«поручение» при названии не мешают
+    r, err = parse_ranges("аг договор 1-3, поручение 4-5, дкп договор 6", ["ag", "dkp"], 6)
+    assert err is None and r == {"ag": [(1, 3), (4, 5)], "dkp": [(6, 6)]}
+    assert "Сначала название" in parse_ranges("1-3 аг", ["ag"], 5)[1]
     assert parse_ranges("АГ 1-9", ["ag"], 5)[1]             # за пределами
     assert "пересек" in parse_ranges("АГ 1-3, ДКП 3-4", ["ag", "dkp"], 5)[1]
     assert "Не указаны" in parse_ranges("АГ 1-3", ["ag", "dkp"], 5)[1]
     assert "не отмечен" in parse_ranges("АГ 1-3, Акт 4", ["ag"], 5)[1]
-    assert format_range((2, 2)) == "стр. 2" and format_range((1, 4)) == "стр. 1–4"
+    assert "Не знаю" in parse_ranges("квитанция 1", ["ag"], 5)[1]
+    assert format_ranges([(2, 2)]) == "стр. 2" and format_ranges([(1, 4)]) == "стр. 1–4"
+    assert format_ranges([(1, 5), (8, 8)]) == "стр. 1–5, 8"
 
 
 def test_split_pdf_and_prepare_source(tmp_path):
     src = make_pdf(tmp_path / "a.pdf", 6)
-    parts = split_pdf(src, {"ag": (1, 4), "dkp": (5, 6)}, str(tmp_path), "t")
+    parts = split_pdf(src, {"ag": [(1, 4)], "dkp": [(5, 5), (6, 6)]}, str(tmp_path), "t")
     assert n_pages(open(parts["ag"], "rb").read()) == 4
     assert n_pages(open(parts["dkp"], "rb").read()) == 2
     # фото → PDF
@@ -196,3 +206,38 @@ def test_too_few_pages_falls_back(monkeypatch, tmp_path):
     run(cb_deal.start_split(msg, ctx, "1", pending, ["ag", "dkp"]))
     assert [n for n, _ in uploads] == ["Подп_АГ+ДКП_110826001.pdf"]
     assert any("меньше" in t for t, _ in msg.sent)
+
+
+def test_real_case_ag_bill_dkp_payment(monkeypatch, tmp_path):
+    """Файл из жизни: АГ+поручение (1-5), счёт (6), ДКП (7), платёжка (8)."""
+    uploads = []
+    labels = ["ag"] * 5 + ["bill", "dkp", "invoice"]
+    monkeypatch.setattr(cb_deal, "agent", fake_agent(uploads, labels))
+    f = make_pdf(tmp_path / "Агентский договор Авдеев.pdf", 8)
+    msg, ctx = _Msg(), SimpleNamespace(user_data={})
+    pending = {"num": "121126001", "folder_id": "F1", "filepath": f,
+               "filename": "Агентский договор Авдеев.pdf", "pages": None, "is_kg": False}
+    run(cb_deal.start_split(msg, ctx, "1", pending, ["ag", "dkp", "bill", "invoice"]))
+    run(cb_deal.on_scansplit(UPD, ctx, _Q(msg), "scansplit:ok"))
+    got = {n: n_pages(d) for n, d in uploads}
+    assert got == {"Подп_АГ_Договор_121126001.pdf": 5, "Подп_ДКП_ТС_121126001.pdf": 1,
+                   "Счет_121126001.pdf": 1, "Платежка_121126001.pdf": 1}
+
+
+def test_payment_and_bill_in_one_file_manual(monkeypatch, tmp_path):
+    """То же, но счёт и платёжка одним файлом: «Плат 6, 8» (страницы не подряд)."""
+    uploads = []
+    monkeypatch.setattr(cb_deal, "agent", fake_agent(uploads, None))
+    f = make_pdf(tmp_path / "x.pdf", 8)
+    msg, ctx = _Msg(), SimpleNamespace(user_data={})
+    pending = {"num": "121126001", "folder_id": "F1", "filepath": f,
+               "filename": "x.pdf", "pages": None, "is_kg": False}
+    run(cb_deal.start_split(msg, ctx, "1", pending, ["ag", "dkp", "invoice"]))
+    sp = ctx.user_data["pending_scan"]["split"]
+    ranges, err = parse_ranges("аг 1-5, дкп 7, плат 6, 8", sp["codes"], sp["n"])
+    assert err is None
+    sp["ranges"] = ranges
+    run(cb_deal.on_scansplit(UPD, ctx, _Q(msg), "scansplit:ok"))
+    got = {n: n_pages(d) for n, d in uploads}
+    assert got == {"Подп_АГ_Договор_121126001.pdf": 5, "Подп_ДКП_ТС_121126001.pdf": 1,
+                   "Платежка_121126001.pdf": 2}

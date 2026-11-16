@@ -20,18 +20,20 @@ SPLIT_DESC = {
     "report":  "отчёт агента",
     "act":     "акт (приёма-передачи / оказанных услуг)",
     "spec":    "спецификация (приложение № 2)",
-    "invoice": "платёжка: платёжное поручение, чек или квитанция об оплате",
+    "bill":    "счёт на оплату (выставленный счёт, инвойс) — это НЕ платёжка",
+    "invoice": "платёжка: платёжное поручение, чек или квитанция об оплате (подтверждение, что деньги уплачены)",
     "id":      "документы сторон: паспорт, удостоверение личности",
 }
 
 # Как человек может назвать документ в ручном вводе диапазонов
 _ALIASES = {
-    "ag": {"аг", "агдоговор", "агентский", "договор", "ад"},
+    "ag": {"аг", "агдоговор", "агентский", "ад"},
     "dkp": {"дкп"},
     "receipt": {"расп", "расписка"},
     "report": {"отч", "отчет"},
     "act": {"акт"},
     "spec": {"спец", "спецификация"},
+    "bill": {"счет", "сч", "инвойс"},
     "invoice": {"плат", "платежка"},
     "id": {"док", "документы"},
 }
@@ -43,7 +45,7 @@ def _norm(word: str) -> str:
 
 
 def ranges_from_page_labels(labels, codes):
-    """По списку «страница → код» получает {код: (с, по)} (страницы с 1).
+    """По списку «страница → код» получает {код: [(с, по)]} (страницы с 1).
 
     None — если разметка неправдоподобна: документ не найден, его страницы идут
     не подряд или встретился код, которого не отмечали. Тогда надёжнее спросить
@@ -63,46 +65,79 @@ def ranges_from_page_labels(labels, codes):
         pages = pos.get(c)
         if not pages or pages != list(range(pages[0], pages[-1] + 1)):
             return None
-        out[c] = (pages[0], pages[-1])
+        out[c] = [(pages[0], pages[-1])]
     return out
 
 
+_WORD_RE = re.compile(r"[А-Яа-яЁёA-Za-z]+|\d+\s*[-–—]\s*\d+|\d+")
+# «договор» и «поручение» — просто слова при названии («АГ договор 1-5»,
+# «ДКП договор 7»): приложение «Поручение» — часть файла АГ.
+_SKIP_WORDS = {"и", "стр", "страница", "страницы", "страниц", "с", "на", "а", "также",
+               "договор", "поручение"}
+
+
 def parse_ranges(text: str, codes, n_pages: int):
-    """Разбор ручного ввода «АГ 1-4, ДКП 5-6, Расп 7» → ({код: (с, по)}, ошибка)."""
+    """Разбор ручного ввода → ({код: [(с, по), …]}, ошибка).
+
+    «АГ 1-5, ДКП 7, Плат 6, 8» и «АГ 1-5; ДКП 7; Плат 6 и 8» — одно и то же:
+    названия документов начинают новую группу, числа после названия (через
+    запятую или «и») относятся к нему. У документа может быть несколько
+    диапазонов — когда его страницы идут не подряд."""
     codes = list(codes)
-    segs = [s.strip() for s in re.split(r"[;,\n]+", text or "") if s.strip()]
-    if not segs:
+    out, cur, expect_pages = {}, None, False
+    tokens = _WORD_RE.findall(text or "")
+    if not tokens:
         return None, "Пусто. Пример: АГ 1-4, ДКП 5-6"
-    out, used = {}, set()
-    for seg in segs:
-        m = re.match(r"^(\S+)\s+(\d+)(?:\s*[-–—]\s*(\d+))?\s*$", seg)
-        if not m:
-            return None, f"Не понял «{seg}». Формат: АГ 1-4"
-        code = _ALIAS_TO_CODE.get(_norm(m.group(1)))
+    for tok in tokens:
+        if tok[0].isdigit():
+            if cur is None:
+                return None, f"Сначала название документа, потом страницы («{tok}»). Пример: АГ 1-4"
+            m = re.match(r"^(\d+)(?:\s*[-–—]\s*(\d+))?$", tok)
+            a = int(m.group(1))
+            b = int(m.group(2) or a)
+            if a < 1 or b < a or b > n_pages:
+                return None, f"Страницы {a}–{b}: в файле {n_pages} стр."
+            out[cur].append((a, b))
+            expect_pages = False
+            continue
+        word = _norm(tok)
+        if word in _SKIP_WORDS:
+            continue
+        code = _ALIAS_TO_CODE.get(word)
         if not code:
-            return None, f"Не знаю документ «{m.group(1)}»"
+            return None, f"Не знаю документ «{tok}»"
         if code not in codes:
-            return None, f"«{m.group(1)}» не отмечен среди документов этого файла"
-        if code in out:
-            return None, f"Документ «{m.group(1)}» указан дважды"
-        a = int(m.group(2))
-        b = int(m.group(3) or a)
-        if a < 1 or b < a or b > n_pages:
-            return None, f"Страницы {a}–{b}: в файле {n_pages} стр."
-        pages = set(range(a, b + 1))
-        if pages & used:
-            return None, f"Страницы {a}–{b} пересекаются с другим документом"
-        used |= pages
-        out[code] = (a, b)
+            return None, f"«{tok}» не отмечен среди документов этого файла"
+        if code == cur and expect_pages:
+            continue                      # «аг договор 1-5»: два слова одного названия
+        cur, expect_pages = code, True
+        out.setdefault(code, [])
+
+    used = set()
+    for code, rngs in out.items():
+        if not rngs:
+            return None, f"Для «{SCAN_TAG_HINT.get(code, code)}» не указаны страницы"
+        for a, b in rngs:
+            pages = set(range(a, b + 1))
+            if pages & used:
+                return None, f"Страницы {a}–{b} пересекаются с другим документом"
+            used |= pages
     missing = [c for c in codes if c not in out]
     if missing:
-        return None, "Не указаны страницы для: " + ", ".join(missing)
+        return None, "Не указаны страницы для: " + ", ".join(SCAN_TAG_HINT.get(c, c) for c in missing)
     return out, None
 
 
-def format_range(rng) -> str:
-    a, b = rng
-    return f"стр. {a}" if a == b else f"стр. {a}–{b}"
+# Подписи для сообщений об ошибках ввода (метки, как в именах файлов)
+SCAN_TAG_HINT = {"ag": "АГ", "dkp": "ДКП", "receipt": "Расп", "report": "Отч",
+                 "act": "Акт", "spec": "Спец", "bill": "Счет", "invoice": "Плат",
+                 "id": "Док"}
+
+
+def format_ranges(rngs) -> str:
+    """[(1, 5), (8, 8)] → «стр. 1–5, 8»."""
+    parts = [str(a) if a == b else f"{a}–{b}" for a, b in rngs]
+    return "стр. " + ", ".join(parts)
 
 
 def prepare_source(pending: dict, out_path: str):
@@ -153,9 +188,10 @@ def split_pdf(src: str, ranges: dict, out_dir: str, tag: str = "") -> dict:
         import fitz
     paths = {}
     with fitz.open(src) as doc:
-        for code, (a, b) in ranges.items():
+        for code, rngs in ranges.items():
             part = fitz.open()
-            part.insert_pdf(doc, from_page=a - 1, to_page=b - 1)
+            for a, b in rngs:
+                part.insert_pdf(doc, from_page=a - 1, to_page=b - 1)
             p = os.path.join(out_dir, f"part_{tag}_{code}.pdf")
             part.save(p, garbage=3, deflate=True)
             part.close()

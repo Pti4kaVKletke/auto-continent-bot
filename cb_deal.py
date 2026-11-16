@@ -31,7 +31,7 @@ import bank_requisites as br
 import kg_deal
 import salon
 import sign_ui
-from scan_split import (format_range, parse_ranges, prepare_source,
+from scan_split import (format_ranges, parse_ranges, prepare_source,
                         ranges_from_page_labels, split_pdf)
 from scan_merge import _is_image, merge_parts, merged_name, plan_merge
 from scan_upload import auto_scan_type, deal_summary, images_to_pdf, is_image_name
@@ -116,7 +116,7 @@ def scan_type_keyboard(contract_number: str, is_kg: bool):
 
 # Что можно отметить внутри общего файла (комплект «Скан_АД», СРТС и прочее
 # сюда не входят: у них своя кнопка).
-_MULTI_CODES = ("ag", "dkp", "receipt", "report", "act", "spec", "invoice", "id")
+_MULTI_CODES = ("ag", "dkp", "receipt", "report", "act", "spec", "bill", "invoice", "id")
 
 
 def scan_multi_keyboard(selected, is_kg: bool):
@@ -353,8 +353,8 @@ async def show_split_confirm(message, pending, auto=False):
              ("Разбивка определена автоматически — проверьте:" if auto else "Разбивка:")]
     for code in scan_codes_sorted(sp["codes"]):
         label = SCAN_LABELS[code].replace(" (Учёт КГ)", "")
-        lines.append(f"• {label} — {format_range(sp['ranges'][code])}")
-    covered = {p for a, b in sp["ranges"].values() for p in range(a, b + 1)}
+        lines.append(f"• {label} — {format_ranges(sp['ranges'][code])}")
+    covered = {p for rngs in sp["ranges"].values() for a, b in rngs for p in range(a, b + 1)}
     rest = [p for p in range(1, sp["n"] + 1) if p not in covered]
     if rest:
         lines.append("⚠️ Не войдут (не отмечены): стр. " + ", ".join(map(str, rest)))
@@ -368,7 +368,8 @@ async def ask_split_ranges(message, context, pending, note=""):
     example = ", ".join(f"{SCAN_TAGS[c]} {i}" for i, c in enumerate(codes, 1) if c in SCAN_TAGS)
     context.user_data["awaiting_scan_ranges"] = True
     text = (f"{note}Пришлите страницы каждого документа — например: {example}\n"
-            f"(диапазон — через дефис: АГ 1-4). В файле {sp['n']} стр.\n"
+            f"(диапазон — через дефис: АГ 1-4; страницы не подряд — через запятую: Плат 6, 8). "
+            f"В файле {sp['n']} стр.\n"
             "Метки: " + ", ".join(SCAN_TAGS[c] for c in codes if c in SCAN_TAGS))
     await message.reply_text(text, reply_markup=InlineKeyboardMarkup([
         [InlineKeyboardButton("📎 Оставить одним файлом", callback_data="scansplit:keep")],
@@ -406,6 +407,7 @@ async def start_split(message, context, chat_id, pending, codes, edit_query=None
     except Exception as e:
         logger.warning(f"Разделение {pending['num']}: страницы не определены: {e}")
     ranges = ranges_from_page_labels(labels, codes)
+    logger.info(f"Разделение {pending['num']}: модель вернула {labels} → {ranges}")
 
     pending["split"] = {"codes": codes, "src": src, "n": n, "ranges": ranges}
     context.user_data["pending_scan"] = pending
@@ -445,7 +447,7 @@ async def _split_and_upload(message, chat_id, pending):
                 pass
 
     lines = ["✅ Файл разделён, документы сохранены отдельно:"]
-    lines += [f"• {n} ({format_range(r)})" for n, r in done]
+    lines += [f"• {n} ({format_ranges(r)})" for n, r in done]
     if status:
         lines.append(f"🗂 Сканы по сделке {num}: {status}")
     await message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup([
