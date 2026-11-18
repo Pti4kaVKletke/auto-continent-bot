@@ -65,6 +65,7 @@ from bot_core import (
     typing_while,
 )
 import cb_menu
+from error_text import is_file_too_big, user_message
 import cb_service
 import cb_deals
 import cb_deal
@@ -426,7 +427,21 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     chat_id = str(update.effective_chat.id)
 
-    saved = await _save_file_locally(message, chat_id)
+    try:
+        saved = await _save_file_locally(message, chat_id)
+    except Exception as e:
+        if not is_file_too_big(e):
+            raise
+        # Больше 20 МБ: Telegram не отдаёт файл боту. Объясняем и, если знаем
+        # папку сделки, даём кнопку на неё — положить файл туда вручную.
+        kb = []
+        fid = context.user_data.get("awaiting_scan_folder_id")
+        if fid:
+            kb.append([InlineKeyboardButton("📁 Открыть папку сделки на Drive",
+                                            url=f"https://drive.google.com/drive/folders/{fid}")])
+        kb.append([InlineKeyboardButton("◀️ Меню", callback_data="menu:back")])
+        await message.reply_text(user_message(e), reply_markup=InlineKeyboardMarkup(kb))
+        return
     if not saved:
         await message.reply_text("❌ Неподдерживаемый тип файла")
         return
@@ -1058,7 +1073,7 @@ async def error_handler(update, context):
     logger.error(f"Необработанная ошибка: {context.error}", exc_info=context.error)
     if isinstance(update, Update) and update.effective_message:
         try:
-            await update.effective_message.reply_text("⚠️ Произошла ошибка, попробуйте ещё раз.")
+            await update.effective_message.reply_text(user_message(context.error))
         except Exception:
             pass
 
