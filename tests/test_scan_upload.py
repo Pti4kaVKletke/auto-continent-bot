@@ -256,3 +256,67 @@ def test_single_pdf_uploaded_as_is(monkeypatch, tmp_path):
     _run(cb_deal.begin_scan_upload(msg, ctx, "1", "110826001", None, str(f), "one.pdf"))
     _run(cb_deal.upload_scan(msg, "1", ctx.user_data["pending_scan"], "invoice"))
     assert uploads[0] == ("Платежка_110826001.pdf", b"%PDF-1.4")      # файл невалидный: загружен как есть, без пересборки
+
+
+# ───────── договор поставщика и китайские документы ─────────
+def test_supplier_contract_and_cn_docs_buttons_and_names(monkeypatch, tmp_path):
+    codes = lambda kb: [b.callback_data for row in kb.inline_keyboard for b in row]
+    assert "scantype:sup_ag" not in codes(cb_deal.scan_type_keyboard("1", False, False))
+    assert "scantype:sup_ag" in codes(cb_deal.scan_type_keyboard("1", False, True))
+    assert "scantype:cn_docs" in codes(cb_deal.scan_type_keyboard("1", False, False))
+
+    uploads = []
+    monkeypatch.setattr(cb_deal, "agent", _fake_agent(
+        {**DEAL, "car_vin": "LMGNE3S89T1004360", "deal_type": "Субагентская"}, uploads))
+    f = tmp_path / "a.pdf"
+    f.write_bytes(b"%PDF-1.4 x")
+    msg, ctx = _Msg(), SimpleNamespace(user_data={})
+    _run(cb_deal.begin_scan_upload(msg, ctx, "1", "110826001", None, str(f), "a.pdf"))
+    p = ctx.user_data["pending_scan"]
+    assert p["is_sub"] is True
+    _run(cb_deal.upload_scan(msg, "1", p, "cn_docs"))
+    async def num_ok(path):
+        return "070926001"
+    cb_deal.agent.read_contract_number = num_ok          # номер прочитан из договора
+    _run(cb_deal.upload_scan(msg, "1", p, "sup_ag"))
+    async def num_none(path):
+        return ""
+    cb_deal.agent.read_contract_number = num_none        # не прочитан → номер сделки
+    _run(cb_deal.upload_scan(msg, "1", p, "sup_ag"))
+    assert [u[0] for u in uploads] == ["Китайские_документы_004360.pdf",
+                                       "Договор_поставщика_070926001.pdf",
+                                       "Договор_поставщика_110826001.pdf"]
+    assert any("не прочитан" in t for t, _ in msg.sent)
+
+
+def test_clean_contract_number():
+    from scan_rename import clean_contract_number as c
+    assert c("№ 070926001") == "070926001" and c("12/А-5") == "12-А-5"
+    assert c("НЕТ") == "" and c("") == "" and c("x" * 40) == ""
+
+
+def test_status_subagent_requires_supplier_contract():
+    five = ["Подп_САГ_Договор_1.pdf", "Подп_ДКП_1.pdf", "Подп_Расписка_1.pdf",
+            "Подп_Акт_1.pdf", "Подп_Отчет_агента_1.pdf"]
+    # прямая сделка — как раньше
+    assert agent_mod.scan_status_text(five) == "5/5 ✓"
+    # субагентская без договора поставщика — комплект неполный
+    assert agent_mod.scan_status_text(five, sub=True) == "5/6 · нет: договор поставщика"
+    st = agent_mod.scan_status_text(five + ["Договор_поставщика_270926001.pdf"], sub=True)
+    assert st == "6/6 ✓"
+    # китайские документы и платёжка по-прежнему только «+N»
+    st = agent_mod.scan_status_text(
+        five + ["Договор_поставщика_1.pdf", "Китайские_документы_123456.pdf"], sub=True)
+    assert st == "6/6 ✓ (+1)"
+    # только договор поставщика у субагентской
+    st = agent_mod.scan_status_text(["Договор_поставщика_1.pdf"], sub=True)
+    assert st.startswith("1/6") and "договор поставщика" not in st
+    # у прямой сделки он лишний
+    assert agent_mod.scan_status_text(five + ["Договор_поставщика_1.pdf"]) == "5/5 ✓ (+1)"
+
+
+def test_status_subagent_bundle():
+    assert agent_mod.scan_status_text(["Скан_АД_1.pdf"]) == "5/5 ✓ одним файлом"
+    assert agent_mod.scan_status_text(["Скан_АД_1.pdf"], sub=True) == "5/6 · нет: договор поставщика"
+    st = agent_mod.scan_status_text(["Скан_АД_1.pdf", "Договор_поставщика_1.pdf"], sub=True)
+    assert st == "6/6 ✓ одним файлом (+1)"

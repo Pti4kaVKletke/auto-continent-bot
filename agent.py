@@ -340,6 +340,12 @@ SCAN_TYPES = [
     # (как номер ДКП): СРТС_XXXXXX, Доверенность_XXXXXX.
     ("srts",    "СРТС (Учёт КГ)",         "СРТС",              ()),
     ("poa",     "Доверенность (Учёт КГ)", "Доверенность",      ()),
+    # Субагентская сделка: агентский договор, который присылает поставщик
+    # (кнопка только у таких сделок). Не подписывается нами — в комплект не входит.
+    ("sup_ag",  "Агентский договор поставщика", "Договор_поставщика", ()),
+    # Комплект документов на машину из Китая: Китайские_документы_XXXXXX
+    # (6 знаков VIN, как СРТС и декларация).
+    ("cn_docs", "Китайские документы",    "Китайские_документы", ()),
     ("other",   "Прочее",                 "Прочее",            ()),
 ]
 
@@ -348,6 +354,18 @@ SCAN_TYPES = [
 # платёжка. Порядок задаёт и порядок перечисления недостающих.
 REQUIRED_SCANS = ("ag", "dkp", "receipt", "act", "report")
 REQUIRED_SCANS_KG = ("ag", "spec", "dkp", "receipt", "act", "report")
+# Субагентская сделка: договор поставщика влияет на цепочку сделки, поэтому
+# входит в комплект (только у таких сделок). Его присылает поставщик, нашей
+# подписи на нём нет — имя «Договор_поставщика_…» без «Подп_».
+SUB_EXTRA_SCANS = ("sup_ag",)
+# Короткие названия для строки «нет: …» (если не заданы — берётся SCAN_LABELS).
+SCAN_SHORT_LABELS = {"sup_ag": "договор поставщика"}
+
+
+def required_scans(kg: bool = False, sub: bool = False) -> tuple:
+    """Что считается комплектом: база (прямая или КГ) + у субагентских договор поставщика."""
+    base = REQUIRED_SCANS_KG if kg else REQUIRED_SCANS
+    return base + SUB_EXTRA_SCANS if sub else base
 
 SCAN_LABELS   = {code: label for code, label, _, _ in SCAN_TYPES}
 SCAN_PREFIXES = {code: prefix for code, _, prefix, _ in SCAN_TYPES}
@@ -424,6 +442,9 @@ def scan_codes_of(filename: str) -> frozenset:
     name = _normalize_scan_name(filename)
     if SCAN_BUNDLE_RE.match(name):
         return frozenset({"bundle"})
+    # Договор поставщика (субагентская сделка) без «Подп_»: нашей подписи на нём нет.
+    if name.startswith("договор поставщика"):
+        return frozenset({"sup_ag"})
     if not name.startswith("подп"):
         return frozenset()
     m = _MULTI_RE.match(name)
@@ -449,7 +470,7 @@ def is_merged_scan(filename: str) -> bool:
     return bool(SCAN_MERGED_RE.match(_normalize_scan_name(filename)))
 
 
-def scan_status_text(filenames: list, kg: bool = False) -> str:
+def scan_status_text(filenames: list, kg: bool = False, sub: bool = False) -> str:
     """
     Строка статуса сканов для журнала и карточки сделки.
 
@@ -466,20 +487,26 @@ def scan_status_text(filenames: list, kg: bool = False) -> str:
     for n in filenames:
         found |= scan_codes_of(n)
 
-    required = REQUIRED_SCANS_KG if kg else REQUIRED_SCANS
+    required = required_scans(kg, sub)
     total = len(required)
 
-    # Комплект одним PDF закрывает все позиции разом. Отмечаем это в тексте:
-    # искать внутри одного файла — не то же самое, что видеть пять отдельных.
-    if "bundle" in found:
-        extra = len([n for n in filenames if "bundle" not in scan_codes_of(n)])
-        text = f"{total}/{total} ✓ одним файлом"
-        return text + (f" (+{extra})" if extra else "")
+    # Комплект одним PDF закрывает все позиции разом (кроме договора поставщика:
+    # его присылает поставщик отдельно). Отмечаем это в тексте: искать внутри
+    # одного файла — не то же самое, что видеть пять отдельных.
+    bundled = "bundle" in found
+    if bundled:
+        found |= set(REQUIRED_SCANS_KG if kg else REQUIRED_SCANS)
+        if not (sub and "sup_ag" not in found):
+            extra = len([n for n in filenames if "bundle" not in scan_codes_of(n)])
+            text = f"{total}/{total} ✓ одним файлом"
+            return text + (f" (+{extra})" if extra else "")
 
     have    = [c for c in required if c in found]
-    missing = [SCAN_LABELS[c].replace(" (Учёт КГ)", "") for c in required if c not in found]
+    missing = [SCAN_SHORT_LABELS.get(c) or SCAN_LABELS[c].replace(" (Учёт КГ)", "")
+               for c in required if c not in found]
+    counted = set(required) | ({"bundle"} if bundled else set())
     extra   = len(filenames) - len([n for n in filenames
-                                    if scan_codes_of(n) & set(required)])
+                                    if scan_codes_of(n) & counted])
 
     text = f"{len(have)}/{total}"
     text += " ✓" if not missing else " · нет: " + ", ".join(m.lower() for m in missing)
@@ -1944,9 +1971,13 @@ class DocumentAgent:
             if scans:
                 scans_folder_id = await self.drive._get_or_create_folder("Сканы", deal_folder_id)
                 uploaded_scans = 0
+                used_names: set = set()
                 for scan in scans:
                     if Path(scan["filepath"]).exists():
-                        await self.drive.upload_file(scan["filepath"], scan["original_name"], scans_folder_id)
+                        upload_name = await self._intake_scan_name(
+                            scan, tool_input.get("data") or {}, used_names)
+                        used_names.add(upload_name)
+                        await self.drive.upload_file(scan["filepath"], upload_name, scans_folder_id)
                         uploaded_scans += 1
                     else:
                         logger.warning(f"Файл скана не найден: {scan['filepath']}")
@@ -3331,6 +3362,57 @@ class DocumentAgent:
             logger.warning(f"Сделка {contract_number}: не удалось записать сумму выдана {value}")
         return deal
 
+    async def read_contract_number(self, filepath: str) -> str:
+        """Номер из заголовка «Агентский договор № …» (договор поставщика) по первой
+        странице. Пусто — не нашли или ошибка: вызывающий возьмёт номер сделки."""
+        from scan_rename import clean_contract_number, preview_jpegs
+        try:
+            pages = await asyncio.to_thread(preview_jpegs, filepath, 1, 1200)
+            if not pages:
+                return ""
+            content = [{"type": "image", "source": {
+                "type": "base64", "media_type": "image/jpeg",
+                "data": base64.standard_b64encode(pages[0]).decode("utf-8")}},
+                {"type": "text", "text": (
+                    "Это первая страница договора. Верни ТОЛЬКО номер договора из заголовка "
+                    "(после «№», например 070926001), без слов и пояснений. "
+                    "Если номера в заголовке нет — верни НЕТ.")}]
+            resp = await self.client.messages.create(
+                model=self.model, max_tokens=30,
+                messages=[{"role": "user", "content": content}])
+            answer = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+            return clean_contract_number(answer)
+        except Exception as e:
+            logger.warning(f"Номер договора не прочитан: {e}")
+            return ""
+
+    async def _intake_scan_name(self, scan: dict, data: dict, used: set) -> str:
+        """Имя файла из «Новой сделки»: паспорт → Паспорт_Фамилия_И.О., декларация →
+        Декларация_XXXXXX (6 знаков VIN). Не уверены или ошибка — прежнее имя."""
+        from scan_rename import (classify_prompt, parse_classification,
+                                 preview_jpegs, target_name, unique_name)
+        orig = scan["original_name"]
+        try:
+            pages = await asyncio.to_thread(preview_jpegs, scan["filepath"])
+            if not pages:
+                return unique_name(orig, used)
+            content = [{"type": "image", "source": {
+                "type": "base64", "media_type": "image/jpeg",
+                "data": base64.standard_b64encode(j).decode("utf-8")}} for j in pages]
+            content.append({"type": "text", "text": classify_prompt(data)})
+            resp = await self.client.messages.create(
+                model=self.model, max_tokens=60,
+                messages=[{"role": "user", "content": content}])
+            answer = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+            kind, owner = parse_classification(answer)
+            ext = Path(orig).suffix or Path(scan["filepath"]).suffix
+            new = target_name(kind, owner, data, ext)
+            logger.info(f"Скан «{orig}»: {kind}/{owner} → {new or 'имя прежнее'}")
+            return unique_name(new or orig, used)
+        except Exception as e:
+            logger.warning(f"Скан «{orig}»: имя не определено ({e}), оставляю прежнее")
+            return unique_name(orig, used)
+
     async def classify_scan_pages(self, pdf_path: str, codes: list):
         """Для каждой страницы PDF определяет, к какому документу она относится.
 
@@ -3765,10 +3847,11 @@ class DocumentAgent:
             return ""
 
         try:
-            _kg = kg_deal.is_kg(await self.sheets.get_deal(contract_number) or {})
+            _deal = await self.sheets.get_deal(contract_number) or {}
+            _kg, _sub = kg_deal.is_kg(_deal), salon.is_subagent(_deal)
         except Exception:
-            _kg = False
-        status = scan_status_text([f.get("name", "") for f in files], kg=_kg)
+            _kg, _sub = False, False
+        status = scan_status_text([f.get("name", "") for f in files], kg=_kg, sub=_sub)
         await self.sheets.update_deal(contract_number, {"Сканы": status})
         return status
 
@@ -3802,7 +3885,8 @@ class DocumentAgent:
             folder = folder_of.get(num)
             if not folder or folder not in names_by_folder:
                 continue
-            status = scan_status_text(names_by_folder[folder], kg=kg_deal.is_kg(d))
+            status = scan_status_text(names_by_folder[folder], kg=kg_deal.is_kg(d),
+                                      sub=salon.is_subagent(d))
             statuses[num] = status
             if status != str(d.get("Сканы") or "").strip():
                 changed[num] = status

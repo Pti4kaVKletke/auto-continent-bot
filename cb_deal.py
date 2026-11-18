@@ -103,11 +103,21 @@ async def on_scantype(update, context, query, data):
                       edit_query=query)
 
 
-def scan_type_keyboard(contract_number: str, is_kg: bool):
+def scan_type_allowed(code: str, is_kg: bool, is_sub: bool = False) -> bool:
+    """Какие типы показывать: спец/СРТС/доверенность — «Учёт КГ», договор
+    поставщика — субагентские сделки; остальные — всем."""
+    if code in ("spec", "srts", "poa"):
+        return is_kg
+    if code == "sup_ag":
+        return is_sub
+    return True
+
+
+def scan_type_keyboard(contract_number: str, is_kg: bool, is_sub: bool = False):
     """Кнопки выбора типа скана (спец/СРТС/доверенность — только «Учёт КГ»)."""
     kb = [[InlineKeyboardButton(label, callback_data=f"scantype:{code}")]
           for code, label, _, _ in SCAN_TYPES
-          if is_kg or code not in ("spec", "srts", "poa")]
+          if scan_type_allowed(code, is_kg, is_sub)]
     kb.append([InlineKeyboardButton("📚 Несколько документов в одном файле",
                                     callback_data="scanmulti:open")])
     kb.append([InlineKeyboardButton("◀️ Отмена",
@@ -170,7 +180,8 @@ async def on_scanmulti(update, context, query, data):
         pending.pop("multi", None)
         await query.edit_message_text(
             f"📎 Файл получен. Что это за документ по сделке *{num}*?",
-            parse_mode="Markdown", reply_markup=scan_type_keyboard(num, is_kg))
+            parse_mode="Markdown",
+            reply_markup=scan_type_keyboard(num, is_kg, pending.get("is_sub", False)))
     elif action == "done":
         if not sel:
             await show("Отметьте хотя бы один документ.")
@@ -239,6 +250,7 @@ async def begin_scan_upload(message, context, chat_id, num, folder_id, filepath,
         is_kg = kg_deal.is_kg(deal or {})
     except Exception:
         is_kg = False
+    is_sub = salon.is_subagent(deal or {})
     is_img = is_image_name(filename)
     is_part = is_scan_part_name(filename)       # фото или PDF — к нему можно добавить ещё файлы
     pending = {
@@ -247,6 +259,7 @@ async def begin_scan_upload(message, context, chat_id, num, folder_id, filepath,
         "filepath":  filepath,
         "filename":  filename,
         "is_kg":     is_kg,
+        "is_sub":    is_sub,
         "pages":     (pages or [filepath]) if is_part else None,
         "ts":        time.time(),
     }
@@ -254,7 +267,7 @@ async def begin_scan_upload(message, context, chat_id, num, folder_id, filepath,
     # Файл уже назван по правилам («Подп_ДКП_ТС_…», «Скан_АД_…») — тип берём из
     # имени и не спрашиваем. Номер другой сделки в имени отключает автотип.
     allowed = [code for code, _, _, _ in SCAN_TYPES
-               if is_kg or code not in ("spec", "srts", "poa")]
+               if scan_type_allowed(code, is_kg, is_sub)]
     auto_code, warn = auto_scan_type(filename, num, allowed)
     if isinstance(auto_code, tuple):
         # Файл назван как общий («Подп_АГ+ДКП_…») — делим на отдельные сканы.
@@ -274,7 +287,7 @@ async def begin_scan_upload(message, context, chat_id, num, folder_id, filepath,
         text += ("\n_Если документ из нескольких файлов или фото — пришлите остальные "
                  "(фото, PDF), потом выберите тип._")
     m = await message.reply_text(text, parse_mode="Markdown",
-                                 reply_markup=scan_type_keyboard(num, is_kg))
+                                 reply_markup=scan_type_keyboard(num, is_kg, is_sub))
     pending["prompt_id"] = m.message_id
     context.user_data["pending_scan"] = pending
     return True
@@ -532,6 +545,22 @@ async def _scan_base(pending, code, ext) -> str:
         except Exception:
             _vin = ""
         base = kg_deal.drive_name(code, num, _vin, ext)[:-len(ext)]
+    elif code == "sup_ag":
+        # Договор поставщика: номер берём из самого договора (у него свой
+        # номер); не прочитался — номер нашей сделки, и говорим об этом.
+        cn = await agent.read_contract_number(pending["filepath"])
+        if cn:
+            base = f"{prefix}_{cn}"
+        else:
+            pending["note"] = ("⚠️ Номер договора в документе не прочитан — "
+                               "в имени номер нашей сделки.")
+    elif code == "cn_docs":
+        # Китайские_документы_XXXXXX — 6 знаков VIN; нет VIN — номер сделки.
+        try:
+            _vin = (await agent.sheets.get_deal(num) or {}).get("car_vin", "")
+        except Exception:
+            _vin = ""
+        base = f"{prefix}_{kg_deal.vin6(_vin) or num}"
     return base
 
 
@@ -609,6 +638,8 @@ async def upload_scan(message, chat_id, pending, code, edit_query=None, auto=Fal
             else f"✅ {label[:1].upper() + label[1:]} загружен: `{new_name}`"]
     if auto:
         text.append("🔎 Тип определён по имени файла")
+    if pending.get("note"):
+        text.append(pending["note"])
     if pages and len(pages) > 1:
         text.append(f"📄 Файлов объединено: {len(pages)}, страниц в PDF: {pdf_pages}")
     if status:
@@ -881,7 +912,8 @@ async def on_dealaction(update, context, query, data):
         # Заодно обновляем колонку «Сканы» в журнале: файлы могли положить
         # в папку и мимо бота, а колонка — только отражение папки.
         status = scan_status_text([f.get("name", "") for f in files],
-                                  kg=kg_deal.is_kg(deal or {}))
+                                  kg=kg_deal.is_kg(deal or {}),
+                                  sub=salon.is_subagent(deal or {}))
         try:
             await agent.sheets.update_deal(num, {"Сканы": status})
         except Exception as e:

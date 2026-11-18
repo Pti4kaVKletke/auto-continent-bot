@@ -489,7 +489,8 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📎 Файлов: {len(_ps['pages'])} (объединятся в один PDF). Пришлите остальные "
             f"или выберите тип документа по сделке *{_ps['num']}*:",
             parse_mode="Markdown",
-            reply_markup=cb_deal.scan_type_keyboard(_ps["num"], _ps["is_kg"]),
+            reply_markup=cb_deal.scan_type_keyboard(_ps["num"], _ps["is_kg"],
+                                                    _ps.get("is_sub", False)),
         )
         _ps["prompt_id"] = _m.message_id
         return
