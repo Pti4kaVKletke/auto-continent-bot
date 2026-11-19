@@ -33,6 +33,7 @@ import salon
 import sign_ui
 from scan_split import (format_ranges, parse_ranges, prepare_source,
                         ranges_from_page_labels, split_pdf)
+from scan_compress import compress_pdf, saved_note
 from scan_merge import _is_image, merge_parts, merged_name, plan_merge
 from scan_upload import (auto_scan_type, deal_summary, files_to_pdf, images_to_pdf,
                          is_image_name, is_scan_part_name)
@@ -334,6 +335,8 @@ async def build_merged_scan(num: str) -> dict:
                                           + ", ".join(unreadable or ["все файлы"])
                                           + ". Единый PDF не собран."}
         name = merged_name(num, plan)
+        out, _before, _after = await asyncio.to_thread(
+            compress_pdf, out, os.path.join(tmp, "merged_small.pdf"))
         link = await agent.drive.upload_file(out, name, scans_id)
         if not link:
             return {"ok": False, "error": "Не удалось загрузить единый PDF на Drive."}
@@ -464,6 +467,9 @@ async def _split_and_upload(message, chat_id, pending):
 
     lines = ["✅ Файл разделён, документы сохранены отдельно:"]
     lines += [f"• {n} ({format_ranges(r)})" for n, r in done]
+    if pending.get("saved"):
+        lines.append(saved_note(sum(x[0] for x in pending["saved"]),
+                                sum(x[1] for x in pending["saved"])))
     if status:
         lines.append(f"🗂 Сканы по сделке {num}: {status}")
     await message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup([
@@ -579,7 +585,21 @@ async def _put_scan(pending, filepath, base, ext) -> str:
         n += 1
         new_name = f"{base}_{n}{ext}"
 
-    await agent.drive.upload_file(filepath, new_name, scans_folder_id)
+    # PDF перед загрузкой ужимаем (сканы с МФУ — по несколько МБ на лист)
+    out = None
+    if ext.lower() == ".pdf":
+        out = str(Path(filepath).with_name(f"zip_{int(time.time() * 1000)}_{Path(filepath).name}"))
+        filepath, before, after = await asyncio.to_thread(compress_pdf, filepath, out)
+        if after < before:
+            pending.setdefault("saved", []).append((before, after))
+    try:
+        await agent.drive.upload_file(filepath, new_name, scans_folder_id)
+    finally:
+        if out and os.path.exists(out):
+            try:
+                os.remove(out)
+            except OSError:
+                pass
     return new_name
 
 
@@ -642,6 +662,10 @@ async def upload_scan(message, chat_id, pending, code, edit_query=None, auto=Fal
         text.append(pending["note"])
     if pages and len(pages) > 1:
         text.append(f"📄 Файлов объединено: {len(pages)}, страниц в PDF: {pdf_pages}")
+    if pending.get("saved"):
+        b = sum(x[0] for x in pending["saved"])
+        a = sum(x[1] for x in pending["saved"])
+        text.append(saved_note(b, a))
     if status:
         text.append(f"🗂 Сканы по сделке *{num}*: {status}")
     await message.reply_text(

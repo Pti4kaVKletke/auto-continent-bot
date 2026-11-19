@@ -69,6 +69,27 @@ SETTINGS: list = [
         "options_fn": lambda: _subagent_variant_options(),
     },
     {
+        "key":     "SCAN_COMPRESS",
+        "label":   "🗜 Сжатие PDF-сканов при загрузке",
+        "default": "1",
+        "storage": "db",          # применяется сразу, без передеплоя
+        "options": [
+            {"label": "Включено (меньше размер файла)",   "value": "1"},
+            {"label": "Отключено (грузить как есть)",     "value": "0"},
+        ],
+    },
+    {
+        "key":     "SCAN_COMPRESS_LEVEL",
+        "label":   "🎚 Качество сжатия сканов",
+        "default": "balanced",
+        "storage": "db",          # применяется сразу, без передеплоя
+        "options": [
+            {"label": "Бережное · 200 dpi, лучшее качество",        "value": "gentle"},
+            {"label": "Баланс · 150 dpi (рекомендуется)",           "value": "balanced"},
+            {"label": "Сильное · 120 dpi, самый маленький размер",  "value": "strong"},
+        ],
+    },
+    {
         "key":     "SCANIFY",
         "label":   "🖨️ Эффект скана на PDF (акт/расписка/отчёт + подпись входящих)",
         "default": "1",
