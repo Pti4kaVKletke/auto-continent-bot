@@ -64,7 +64,7 @@ async def on_menu(update, context, query, data):
         # С чистого листа, как новая сделка: иначе LLM подтянет продавца и
         # машину из прошлой переписки.
         salon.clear_pending(chat_id)
-        salon_ui.start_fresh_deal(chat_id)
+        salon_ui.start_fresh_deal(chat_id, context)
         dkp_only.set_pending(chat_id, variant)
         # Файлы сразу читаются как документы (без вопроса «что с ним делать»).
         context.user_data["awaiting_new_deal_docs"] = 1

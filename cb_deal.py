@@ -1345,6 +1345,7 @@ async def on_scan_route(update, context, query, data):
         # С чистого листа: без этого LLM подставляла в новую сделку продавца,
         # машину и суммы из прошлой переписки. Сам файл уже у нас (filepath).
         memory.clear_history(str(update.effective_chat.id))
+        context.user_data.pop("current_deal", None)
         await query.edit_message_text("📥 Читаю документ...")
         result = await typing_while(
             update.effective_chat.id, context,

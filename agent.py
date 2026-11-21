@@ -170,6 +170,27 @@ def _settlement_base(deal: dict) -> float:
     return money.base_from_received(received, pct, legacy)
 
 
+def _norm_cmp(v) -> str:
+    return re.sub(r"[\s\-_.,]+", "", str(v or "")).upper()
+
+
+def regen_mismatch(old: dict, data: dict) -> bool:
+    """True, если перегенерация (existing_contract_number) затёрла бы ДРУГУЮ сделку.
+
+    В журнале у сделки уже есть покупатель и VIN, а пришедшая анкета — с другим
+    покупателем И другим VIN. Настоящая правка так не выглядит (меняют одно-два
+    поля через update_deal, остальные приходят из find_deal). 21.11.2026 так
+    потерялись данные сделки 181126001: LLM взяла её номер для новой сделки.
+    """
+    if not old or not isinstance(data, dict):
+        return False
+    ob, ov = _norm_cmp(old.get("buyer_name")), _norm_cmp(old.get("car_vin"))
+    nb, nv = _norm_cmp(data.get("buyer_name")), _norm_cmp(data.get("car_vin"))
+    if not (ob and ov and nb and nv):
+        return False
+    return ob != nb and ov != nv
+
+
 def _stringify_scalars(data: dict) -> dict:
     """Числа в анкете → строки (на месте). 4533980 → "4533980", 81.4 → "81.4".
 
@@ -1800,6 +1821,19 @@ class DocumentAgent:
             if is_regen:
                 number = existing_number
                 logger.info(f"Перегенерация документов для существующей сделки {number}")
+                _cur = await self.sheets.get_deal(number)
+                _d = tool_input.get("data")
+                if _cur and regen_mismatch(_cur, _d if isinstance(_d, dict) else tool_input):
+                    logger.warning(f"Перегенерация {number} отклонена: другой покупатель и VIN")
+                    return {"error": (
+                        f"⚠️ Сделка *{number}* уже есть в журнале: "
+                        f"{_cur.get('buyer_name', '—')}, VIN {_cur.get('car_vin', '—')}. "
+                        "В присланных данных другой покупатель и другой VIN — похоже, это НОВАЯ "
+                        "сделка, а не правка этой. Я ничего не изменила. Для новой сделки вызови "
+                        "create_contract БЕЗ existing_contract_number (номер выдастся сам). Если "
+                        "действительно нужно переписать эту сделку — сначала исправь поля через "
+                        "update_deal."
+                    )}
             else:
                 number = await self.drive.get_next_contract_number(contract_date)
 

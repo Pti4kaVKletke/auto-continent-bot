@@ -44,11 +44,16 @@ NEW_DEAL_KG_TEXT = (
 )
 
 
-def start_fresh_deal(chat_id: str) -> None:
+def start_fresh_deal(chat_id: str, context=None) -> None:
     """Новая сделка начинается с чистого листа: история диалога и
     неотправленные сканы прошлой сделки забываются. Иначе LLM дополняет
     новую сделку продавцом, машиной и суммами из прошлой переписки
     (26.09.2026: прислан только паспорт — в сводке оказалась чужая Toyota)."""
+    # «Текущая сделка» (последняя открытая карточка) к новой не относится: бот
+    # добавлял «(контекст: сделка NNN)» к ответам, и LLM перегенерировала
+    # СТАРУЮ сделку вместо создания новой (21.11.2026, 181126001).
+    if context is not None:
+        context.user_data.pop("current_deal", None)
     memory.clear_history(chat_id)
     memory.clear_pending_scans(chat_id)
     kg_deal.clear_new_pending(chat_id)
@@ -187,7 +192,7 @@ async def handle_callback(update, context, data: str) -> bool:
     # ── Новая сделка ──
     if data == "nd:direct":
         salon.clear_pending(chat_id)
-        start_fresh_deal(chat_id)
+        start_fresh_deal(chat_id, context)
         context.user_data["awaiting_new_deal_docs"] = 1
         await show((NEW_DEAL_DIRECT_TEXT, _kb([[_menu_btn()]])))
         return True
@@ -212,7 +217,7 @@ async def handle_callback(update, context, data: str) -> bool:
                              [InlineKeyboardButton("◀️ Назад", callback_data="nd:sub")]])))
             return True
         salon.set_pending(chat_id, inn)
-        start_fresh_deal(chat_id)
+        start_fresh_deal(chat_id, context)
         context.user_data["awaiting_new_deal_docs"] = 1
         await show((subagent_docs_text(card), _kb([[_menu_btn()]])))
         return True

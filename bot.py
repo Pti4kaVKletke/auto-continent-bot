@@ -92,6 +92,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Доступ запрещён.")
         return
     _clear_awaiting_flags(context)
+    context.user_data.pop("current_deal", None)
     await update.message.reply_text(
         get_menu_text(),
         parse_mode="MarkdownV2",
@@ -101,6 +102,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _clear_awaiting_flags(context)
+    context.user_data.pop("current_deal", None)
     await update.message.reply_text(
         get_menu_text(),
         parse_mode="MarkdownV2",
@@ -1003,7 +1005,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Если есть открытая сделка и пользователь задал короткий вопрос — добавляем контекст
     current_deal = context.user_data.get("current_deal")
     message_to_agent = user_text
-    if current_deal and len(user_text) < 200:
+    if current_deal and len(user_text) < 200 and not context.user_data.get("awaiting_new_deal_docs"):
         # Если в тексте уже есть номер сделки (6+ цифр) — оставляем как есть
         if not re.search(r"\d{6,}", user_text):
             message_to_agent = f"{user_text} (контекст: сделка {current_deal})"
