@@ -25,6 +25,8 @@ LEVELS = {
     "strong":   (120, 60),
 }
 DEFAULT_LEVEL = "balanced"
+# уровень → максимальная длинная сторона фото, px (для JPG; ~ А4 при dpi уровня)
+IMAGE_MAX_SIDE = {"gentle": 2600, "balanced": 2000, "strong": 1600}
 DPI_MARGIN    = 50
 MIN_GAIN      = 0.10     # выигрыш меньше 10% — не стоит терять качество
 
@@ -94,6 +96,55 @@ def compress_pdf(src: str, dst: str) -> tuple:
         except OSError:
             pass
     return src, before, before
+
+
+def _level_name() -> str:
+    name = _setting("SCAN_COMPRESS_LEVEL", DEFAULT_LEVEL).strip().lower()
+    return name if name in LEVELS else DEFAULT_LEVEL
+
+
+def compress_image(src: str, dst: str) -> tuple:
+    """Уменьшает JPEG-фото (паспорт, декларация с телефона) → dst, формат остаётся JPEG.
+
+    Возвращает (путь, до, после); если выигрыша нет или файл не JPEG/упало — путь src."""
+    before = os.path.getsize(src)
+    if not _enabled() or not src.lower().endswith((".jpg", ".jpeg")):
+        return src, before, before
+    try:
+        from PIL import Image, ImageOps
+        _dpi, quality = level_params()
+        side = IMAGE_MAX_SIDE[_level_name()]
+        with Image.open(src) as im:
+            im = ImageOps.exif_transpose(im)      # поворот с телефона
+            if im.mode != "RGB":
+                im = im.convert("RGB")
+            if max(im.size) > side:
+                im.thumbnail((side, side))
+            im.save(dst, "JPEG", quality=quality, optimize=True)
+        after = os.path.getsize(dst)
+        if after <= before * (1 - MIN_GAIN):
+            return dst, before, after
+    except Exception as e:
+        logger.warning(f"Сжатие фото не удалось, грузим как есть: {e}")
+    if os.path.exists(dst):
+        try:
+            os.remove(dst)
+        except OSError:
+            pass
+    return src, before, before
+
+
+def compress_file(src: str) -> tuple:
+    """Сжимает файл по расширению (PDF или JPEG) во временный файл рядом.
+    Возвращает (путь, до, после): путь равен src, если сжатие не пригодилось."""
+    dst = os.path.join(os.path.dirname(src) or ".", f"zip_{os.path.basename(src)}")
+    low = src.lower()
+    if low.endswith(".pdf"):
+        return compress_pdf(src, dst)
+    if low.endswith((".jpg", ".jpeg")):
+        return compress_image(src, dst)
+    size = os.path.getsize(src)
+    return src, size, size
 
 
 def human_size(n: int) -> str:

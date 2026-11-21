@@ -1977,7 +1977,17 @@ class DocumentAgent:
                         upload_name = await self._intake_scan_name(
                             scan, tool_input.get("data") or {}, used_names)
                         used_names.add(upload_name)
-                        await self.drive.upload_file(scan["filepath"], upload_name, scans_folder_id)
+                        # Паспорт/декларация: сжимаем по тем же настройкам, что и сканы
+                        from scan_compress import compress_file
+                        send_path, _b, _a = await asyncio.to_thread(compress_file, scan["filepath"])
+                        try:
+                            await self.drive.upload_file(send_path, upload_name, scans_folder_id)
+                        finally:
+                            if send_path != scan["filepath"]:
+                                try:
+                                    os.remove(send_path)
+                                except OSError:
+                                    pass
                         uploaded_scans += 1
                     else:
                         logger.warning(f"Файл скана не найден: {scan['filepath']}")

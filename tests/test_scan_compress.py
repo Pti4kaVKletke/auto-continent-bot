@@ -94,3 +94,37 @@ def test_settings_registered_in_menu():
         assert keys[k]["storage"] == "db"
     values = {o["value"] for o in keys["SCAN_COMPRESS_LEVEL"]["options"]}
     assert values == set(sc.LEVELS)
+
+
+def _photo(path, side=4000):
+    from PIL import Image
+    im = Image.effect_noise((side, int(side * 0.75)), 50).convert("RGB")
+    im.save(path, "JPEG", quality=95)
+
+
+def test_compress_photo(tmp_path):
+    from PIL import Image
+    src = str(tmp_path / "p.jpg")
+    _photo(src)
+    out, before, after = sc.compress_file(src)
+    assert out != src and after < before * 0.7
+    with Image.open(out) as im:
+        assert max(im.size) <= sc.IMAGE_MAX_SIDE["balanced"]
+    assert out.endswith("zip_p.jpg")
+
+
+def test_compress_file_other_types_untouched(tmp_path):
+    src = str(tmp_path / "x.png")
+    open(src, "wb").write(b"\x89PNG not real")
+    out, before, after = sc.compress_file(src)
+    assert out == src and before == after
+
+
+def test_compress_file_pdf_and_disabled(tmp_path, monkeypatch):
+    src = str(tmp_path / "d.pdf")
+    _heavy_pdf(src, pages=1)
+    out, b, a = sc.compress_file(src)
+    assert out != src and a < b
+    monkeypatch.setenv("SCAN_COMPRESS", "0")
+    out2, b2, a2 = sc.compress_file(src)
+    assert out2 == src
